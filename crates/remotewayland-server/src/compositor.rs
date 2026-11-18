@@ -216,6 +216,7 @@ struct TrackedWindow {
     geo_offset: (i32, i32),
     announced: bool,
     latest_bgra: Option<(u32, u32, Vec<u8>)>,
+    last_sub_info: Vec<(bool, u32, u32, i32, i32)>,
 }
 
 struct TrackedPopup {
@@ -282,7 +283,7 @@ impl AppState {
                     (*ox, *oy)
                 } else {
                     let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
-                    let loc = sub_state.pending().location;
+                    let loc = sub_state.current().location;
                     (ox + loc.x, oy + loc.y)
                 };
                 if let Some((sw, sh, _)) = self.surface_buffers.get(&surf.id()) {
@@ -328,6 +329,11 @@ impl AppState {
             } => {
                 if let Some(tracked) = self.windows.get(&window_id) {
                     if let Some(toplevel) = tracked.window.toplevel() {
+                        debug!(
+                            window_id,
+                            width, height, maximized, fullscreen, activated, tiled,
+                            "ConfigureWindow -> remote toplevel"
+                        );
                         toplevel.with_pending_state(|state| {
                             state.size = Some((width as i32, height as i32).into());
                             if maximized {
@@ -597,6 +603,7 @@ impl AppState {
         };
 
         let mut composite = vec![0u8; (win_w * win_h * 4) as usize];
+        let mut sub_info = Vec::new();
 
         with_surface_tree_downward(
             root_surface,
@@ -606,10 +613,11 @@ impl AppState {
                     (*ox, *oy)
                 } else {
                     let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
-                    let loc = sub_state.pending().location;
+                    let loc = sub_state.current().location;
                     (ox + loc.x, oy + loc.y)
                 };
                 if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id()) {
+                    sub_info.push((surf == root_surface, *sw, *sh, nx, ny));
                     blit_rgba_over(&mut composite, win_w, win_h, srgba, *sw, *sh, nx, ny);
                 }
                 TraversalAction::DoChildren((nx, ny))
@@ -622,6 +630,18 @@ impl AppState {
             return;
         };
         tracked.geo_offset = (crop_x, crop_y);
+        if sub_info != tracked.last_sub_info {
+            debug!(
+                window_id,
+                win_w,
+                win_h,
+                crop_x,
+                crop_y,
+                ?sub_info,
+                "window surface tree changed"
+            );
+            tracked.last_sub_info = sub_info;
+        }
 
         if tracked
             .latest_bgra
@@ -711,7 +731,7 @@ impl AppState {
                     (*ox, *oy)
                 } else {
                     let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
-                    let loc = sub_state.pending().location;
+                    let loc = sub_state.current().location;
                     (ox + loc.x, oy + loc.y)
                 };
                 if let Some((sw, sh, sbgra)) = self.surface_buffers.get(&surf.id()) {
@@ -882,6 +902,7 @@ impl XdgShellHandler for AppState {
                 geo_offset: (0, 0),
                 announced: false,
                 latest_bgra: None,
+                last_sub_info: Vec::new(),
             },
         );
         self.focused_window_id = window_id;
@@ -933,11 +954,8 @@ impl XdgShellHandler for AppState {
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         let surf_id = surface.wl_surface().id();
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Maximized);
-        });
-        surface.send_pending_configure();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
+            debug!(window_id, "remote app requested maximize");
             let _ = self.event_tx.send(CompositorEvent::SetMaximized {
                 window_id,
                 maximized: true,

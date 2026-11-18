@@ -671,6 +671,16 @@ impl WindowHandler for ClientApp {
         }
 
         if state_changed {
+            debug!(
+                window_id,
+                new_w,
+                new_h,
+                maximized,
+                fullscreen,
+                activated,
+                tiled,
+                "host configure -> WindowConfigured"
+            );
             let _ = self.ctrl_tx.send(ControlMessage::WindowConfigured {
                 window_id,
                 width: new_w,
