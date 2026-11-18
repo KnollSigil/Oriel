@@ -379,11 +379,16 @@ async fn handle_connection(
                     Ok(CompositorEvent::ClipboardText { text }) => {
                         write_control_message(&mut send, &ControlMessage::ClipboardText { text }).await?;
                     }
+                    Ok(CompositorEvent::AppState { launch_id, name, state }) => {
+                        write_control_message(&mut send, &ControlMessage::AppState {
+                            launch_id, name, state
+                        }).await?;
+                    }
                     Ok(CompositorEvent::FrameCommitted { window_id, width, height, bgra }) => {
-                        if !video_streams.contains_key(&window_id) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = video_streams.entry(window_id) {
                             let mut stream = conn.open_uni().await.context("failed to open video uni stream")?;
                             write_stream_header(&mut stream, &StreamHeader::Video { window_id, codec: selected_codec }).await?;
-                            video_streams.insert(window_id, WindowVideoStream {
+                            e.insert(WindowVideoStream {
                                 encoder: VideoEncoder::new(),
                                 stream,
                             });
@@ -455,8 +460,11 @@ async fn handle_connection(
                             .unwrap_or_default();
                         write_control_message(&mut send, &ControlMessage::AppList { apps }).await?;
                     }
-                    Some(ControlMessage::LaunchApp { exec }) => {
-                        let _ = cmd_tx.send(CompositorCommand::LaunchApp { exec });
+                    Some(ControlMessage::LaunchApp { launch_id, name, exec }) => {
+                        let _ = cmd_tx.send(CompositorCommand::LaunchApp { launch_id, name, exec });
+                    }
+                    Some(ControlMessage::TerminateApp { launch_id, force }) => {
+                        let _ = cmd_tx.send(CompositorCommand::TerminateApp { launch_id, force });
                     }
                     Some(other) => {
                         info!(?other, "received control message");

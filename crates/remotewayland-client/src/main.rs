@@ -119,7 +119,8 @@ fn main() -> Result<()> {
                 } else {
                     Some(command.join(" "))
                 };
-                return pty::spawn_local_terminal_pty(&uri, cmd_str.as_deref());
+                pty::spawn_local_terminal_pty(&uri, cmd_str.as_deref())?;
+                return Ok(());
             }
             let (server, fingerprint, token) = parse_uri(&uri)?;
             let initial_exec = if command.is_empty() {
@@ -155,7 +156,11 @@ fn run_gui_session(
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
 
     if let Some(exec) = initial_exec {
-        let _ = ctrl_tx.send(ControlMessage::LaunchApp { exec });
+        let _ = ctrl_tx.send(ControlMessage::LaunchApp {
+            launch_id: 0,
+            name: None,
+            exec,
+        });
     }
 
     std::thread::Builder::new()

@@ -9,7 +9,8 @@ use quinn::{ClientConfig, Endpoint, TransportConfig};
 use remotewayland_proto::{
     read_audio_packet, read_control_message, read_stream_header, read_video_frame,
     write_audio_packet, write_control_message, write_stream_header, AudioPacketHeader,
-    ControlMessage, RemoteAppEntry, StreamHeader, VideoCodec, WindowId, PROTOCOL_VERSION,
+    ControlMessage, LaunchState, RemoteAppEntry, StreamHeader, VideoCodec, WindowId,
+    PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -157,6 +158,23 @@ pub async fn connect_and_auth(
     Ok((conn, send, recv))
 }
 
+/// Events sent from the QUIC client to the launcher UI.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "gtk4"), allow(dead_code))]
+pub enum LauncherNetEvent {
+    AppList(Vec<RemoteAppEntry>),
+    AppState {
+        launch_id: u64,
+        name: String,
+        state: LaunchState,
+    },
+    NetStats {
+        rtt_ms: u32,
+        congested: bool,
+    },
+    Disconnected(Option<String>),
+}
+
 /// Connect to the RemoteWayland server, verify its TLS fingerprint, and run the session loops.
 pub async fn run_client(
     server_addr: SocketAddr,
@@ -165,10 +183,32 @@ pub async fn run_client(
     enable_audio_bridge: bool,
     ui_tx: UiSender,
     mut ctrl_rx: mpsc::UnboundedReceiver<ControlMessage>,
-    app_tx: Option<mpsc::UnboundedSender<Vec<RemoteAppEntry>>>,
+    launcher_tx: Option<mpsc::UnboundedSender<LauncherNetEvent>>,
 ) -> Result<()> {
     let (conn, mut send, mut recv) =
         connect_and_auth(server_addr, fingerprint_sha256, token, enable_audio_bridge).await?;
+
+    let stats_task = launcher_tx.as_ref().map(|tx| {
+        let stats_conn = conn.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut prev_lost = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let rtt_ms = stats_conn.rtt().as_millis() as u32;
+                let lost = stats_conn.stats().path.lost_packets;
+                let loss_delta = lost.saturating_sub(prev_lost);
+                prev_lost = lost;
+                let congested = rtt_ms > 150 || loss_delta > 5;
+                if tx
+                    .send(LauncherNetEvent::NetStats { rtt_ms, congested })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
 
     // Task: forward local winit input/resize/close messages to server control stream.
     let writer_task = tokio::spawn(async move {
@@ -319,7 +359,7 @@ pub async fn run_client(
             } => {
                 let decoder = popup_decoders
                     .entry(window_id)
-                    .or_insert_with(VideoDecoder::new);
+                    .or_default();
                 match decoder.decode(width, height, is_keyframe, &bgra) {
                     Ok(frame) => {
                         let _ = ui_tx.send(ClientUiEvent::PopupFrame {
@@ -390,8 +430,21 @@ pub async fn run_client(
                 let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
             }
             ControlMessage::AppList { apps } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(apps);
+                if let Some(tx) = &launcher_tx {
+                    let _ = tx.send(LauncherNetEvent::AppList(apps));
+                }
+            }
+            ControlMessage::AppState {
+                launch_id,
+                name,
+                state,
+            } => {
+                if let Some(tx) = &launcher_tx {
+                    let _ = tx.send(LauncherNetEvent::AppState {
+                        launch_id,
+                        name,
+                        state,
+                    });
                 }
             }
             other => {
@@ -401,6 +454,12 @@ pub async fn run_client(
     }
 
     let _ = ui_tx.send(ClientUiEvent::Disconnected);
+    if let Some(tx) = &launcher_tx {
+        let _ = tx.send(LauncherNetEvent::Disconnected(None));
+    }
+    if let Some(t) = stats_task {
+        t.abort();
+    }
     writer_task.abort();
     mic_task.abort();
     uni_task.abort();

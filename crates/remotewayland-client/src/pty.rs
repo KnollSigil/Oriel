@@ -154,7 +154,7 @@ pub async fn run_pty_attach(
 }
 
 /// Spawn the user's preferred local terminal emulator attached to `remotewayland-client pty-attach`.
-pub fn spawn_local_terminal_pty(uri: &str, command: Option<&str>) -> Result<()> {
+pub fn spawn_local_terminal_pty(uri: &str, command: Option<&str>) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("failed to locate remotewayland-client binary")?;
     let mut attach_args = vec![
         "pty-attach".to_string(),
@@ -202,8 +202,8 @@ pub fn spawn_local_terminal_pty(uri: &str, command: Option<&str>) -> Result<()> 
                 proc.arg("-e").arg(&exe).args(&attach_args);
             }
         }
-        if proc.spawn().is_ok() {
-            return Ok(());
+        if let Ok(child) = proc.spawn() {
+            return Ok(child);
         }
     }
 

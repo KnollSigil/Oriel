@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -61,6 +61,14 @@ pub struct RemoteAppEntry {
     pub categories: Vec<String>,
     pub icon_mime: Option<String>,
     pub icon_data: Vec<u8>,
+}
+
+/// Lifecycle state of a launched remote application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchState {
+    Launching,
+    Running,
+    Exited(i32),
 }
 
 /// Bidirectional control-stream messages (QUIC stream 0).
@@ -207,7 +215,20 @@ pub enum ControlMessage {
     },
     /// Client -> Server: launch a remote GUI application inside the headless Wayland session.
     LaunchApp {
+        launch_id: u64,
+        name: Option<String>,
         exec: String,
+    },
+    /// Server -> Client: lifecycle state update for a launched remote application.
+    AppState {
+        launch_id: u64,
+        name: String,
+        state: LaunchState,
+    },
+    /// Client -> Server: terminate a launched remote application (`SIGTERM`, or `SIGKILL` if `force`).
+    TerminateApp {
+        launch_id: u64,
+        force: bool,
     },
 }
 

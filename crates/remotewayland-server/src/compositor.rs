@@ -4,10 +4,11 @@
 //! isolated `WAYLAND_DISPLAY` socket, tracks `xdg_toplevel` and `xdg_popup`
 //! windows, extracts committed SHM frames, and forwards input/configure events.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::unix::io::OwnedFd;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use anyhow::{Context, Result};
 use calloop::channel::{self, Channel, Sender as CalloopSender};
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, Mode, PostAction};
-use remotewayland_proto::WindowId;
+use remotewayland_proto::{LaunchState, WindowId};
 use smithay::backend::input::KeyState;
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::{PopupKind, PopupManager, Space, Window};
@@ -141,6 +142,11 @@ pub enum CompositorEvent {
     ClipboardText {
         text: String,
     },
+    AppState {
+        launch_id: u64,
+        name: String,
+        state: LaunchState,
+    },
 }
 
 /// Commands sent from the QUIC server loop to the headless compositor.
@@ -182,7 +188,17 @@ pub enum CompositorCommand {
         text: String,
     },
     LaunchApp {
+        launch_id: u64,
+        name: Option<String>,
         exec: String,
+    },
+    TerminateApp {
+        launch_id: u64,
+        force: bool,
+    },
+    AppExited {
+        launch_id: u64,
+        code: i32,
     },
     SyncWindows,
 }
@@ -209,6 +225,8 @@ impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
     }
 }
 
+const WINDOW_LAUNCH_ID_BASE: u64 = 1u64 << 62;
+
 struct TrackedWindow {
     window_id: WindowId,
     window: Window,
@@ -218,6 +236,7 @@ struct TrackedWindow {
     last_height: u32,
     geo_offset: (i32, i32),
     announced: bool,
+    has_window_entry: bool,
     latest_bgra: Option<(u32, u32, Vec<u8>)>,
     last_sub_info: Vec<(bool, u32, u32, i32, i32)>,
 }
@@ -232,10 +251,19 @@ struct TrackedPopup {
     latest_bgra: Option<(u32, u32, Vec<u8>)>,
 }
 
+struct LaunchedApp {
+    launch_id: u64,
+    name: String,
+    pgid: i32,
+    state: LaunchState,
+    linked_window_id: Option<WindowId>,
+}
+
 #[allow(dead_code)]
 struct AppState {
     display_handle: DisplayHandle,
     socket_name: OsString,
+    cmd_tx: CalloopSender<CompositorCommand>,
     compositor_state: CompositorState,
     shm_state: ShmState,
     xdg_shell_state: XdgShellState,
@@ -259,6 +287,8 @@ struct AppState {
     surface_buffers: HashMap<ObjectId, (u32, u32, Vec<u8>)>,
     windows: HashMap<WindowId, TrackedWindow>,
     popup_windows: HashMap<WindowId, TrackedPopup>,
+    launched_apps: BTreeMap<u64, LaunchedApp>,
+    next_server_launch_id: u64,
     event_tx: mpsc::UnboundedSender<CompositorEvent>,
 }
 
@@ -522,10 +552,120 @@ impl AppState {
                     (),
                 );
             }
-            CompositorCommand::LaunchApp { exec } => {
-                spawn_gui_shell(&self.socket_name, &exec);
+            CompositorCommand::LaunchApp {
+                launch_id,
+                name,
+                exec,
+            } => {
+                let id = if launch_id == 0 {
+                    let v = self.next_server_launch_id;
+                    self.next_server_launch_id += 1;
+                    v
+                } else {
+                    launch_id
+                };
+                let display_name = name
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| derive_exec_display_name(&exec));
+                match spawn_gui_shell(&self.socket_name, &exec, id, self.cmd_tx.clone()) {
+                    Ok(pgid) => {
+                        self.launched_apps.insert(
+                            id,
+                            LaunchedApp {
+                                launch_id: id,
+                                name: display_name.clone(),
+                                pgid,
+                                state: LaunchState::Launching,
+                                linked_window_id: None,
+                            },
+                        );
+                        let _ = self.event_tx.send(CompositorEvent::AppState {
+                            launch_id: id,
+                            name: display_name,
+                            state: LaunchState::Launching,
+                        });
+                    }
+                    Err(err) => {
+                        error!(error = %err, exec, "failed to launch remote application");
+                        let _ = self.event_tx.send(CompositorEvent::AppState {
+                            launch_id: id,
+                            name: display_name,
+                            state: LaunchState::Exited(1),
+                        });
+                    }
+                }
+            }
+            CompositorCommand::TerminateApp { launch_id, force } => {
+                if launch_id >= WINDOW_LAUNCH_ID_BASE {
+                    let wid = launch_id & !WINDOW_LAUNCH_ID_BASE;
+                    if let Some(tracked) = self.windows.get(&wid) {
+                        if let Some(toplevel) = tracked.window.toplevel() {
+                            toplevel.send_close();
+                        }
+                    }
+                } else if let Some(app) = self.launched_apps.get(&launch_id) {
+                    if !matches!(app.state, LaunchState::Exited(_)) && app.pgid > 0 {
+                        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+                        unsafe {
+                            libc::kill(-app.pgid, sig);
+                        }
+                    }
+                }
+            }
+            CompositorCommand::AppExited { launch_id, code } => {
+                if let Some(app) = self.launched_apps.remove(&launch_id) {
+                    let _ = self.event_tx.send(CompositorEvent::AppState {
+                        launch_id,
+                        name: app.name.clone(),
+                        state: LaunchState::Exited(code),
+                    });
+                    if let Some(wid) = app.linked_window_id {
+                        if let Some(tracked) = self.windows.get_mut(&wid) {
+                            if !tracked.has_window_entry {
+                                tracked.has_window_entry = true;
+                                let win_name = if !app.name.is_empty() {
+                                    app.name
+                                } else if !tracked.last_title.is_empty() {
+                                    tracked.last_title.clone()
+                                } else {
+                                    tracked.last_app_id.clone()
+                                };
+                                let _ = self.event_tx.send(CompositorEvent::AppState {
+                                    launch_id: WINDOW_LAUNCH_ID_BASE | wid,
+                                    name: win_name,
+                                    state: LaunchState::Running,
+                                });
+                            }
+                        }
+                    }
+                }
             }
             CompositorCommand::SyncWindows => {
+                for app in self.launched_apps.values() {
+                    if !matches!(app.state, LaunchState::Exited(_)) {
+                        let _ = self.event_tx.send(CompositorEvent::AppState {
+                            launch_id: app.launch_id,
+                            name: app.name.clone(),
+                            state: app.state,
+                        });
+                    }
+                }
+                for tracked in self.windows.values() {
+                    if tracked.announced && tracked.has_window_entry {
+                        let win_name = if !tracked.last_title.is_empty() {
+                            tracked.last_title.clone()
+                        } else if !tracked.last_app_id.is_empty() {
+                            tracked.last_app_id.clone()
+                        } else {
+                            format!("Window #{}", tracked.window_id)
+                        };
+                        let _ = self.event_tx.send(CompositorEvent::AppState {
+                            launch_id: WINDOW_LAUNCH_ID_BASE | tracked.window_id,
+                            name: win_name,
+                            state: LaunchState::Running,
+                        });
+                    }
+                }
                 for tracked in self.windows.values() {
                     if tracked.announced {
                         let _ = self.event_tx.send(CompositorEvent::WindowCreated {
@@ -666,11 +806,40 @@ impl AppState {
             tracked.last_app_id = app_id.clone();
             let _ = self.event_tx.send(CompositorEvent::WindowCreated {
                 window_id,
-                title,
-                app_id,
+                title: title.clone(),
+                app_id: app_id.clone(),
                 width: win_w,
                 height: win_h,
             });
+            let mut linked = false;
+            for app in self.launched_apps.values_mut() {
+                if app.state == LaunchState::Launching {
+                    app.state = LaunchState::Running;
+                    app.linked_window_id = Some(window_id);
+                    linked = true;
+                    let _ = self.event_tx.send(CompositorEvent::AppState {
+                        launch_id: app.launch_id,
+                        name: app.name.clone(),
+                        state: LaunchState::Running,
+                    });
+                    break;
+                }
+            }
+            if !linked {
+                tracked.has_window_entry = true;
+                let win_name = if !title.is_empty() {
+                    title
+                } else if !app_id.is_empty() {
+                    app_id
+                } else {
+                    format!("Window #{window_id}")
+                };
+                let _ = self.event_tx.send(CompositorEvent::AppState {
+                    launch_id: WINDOW_LAUNCH_ID_BASE | window_id,
+                    name: win_name,
+                    state: LaunchState::Running,
+                });
+            }
         } else if win_w != tracked.last_width || win_h != tracked.last_height {
             tracked.last_width = win_w;
             tracked.last_height = win_h;
@@ -908,6 +1077,7 @@ impl XdgShellHandler for AppState {
                 last_height: 0,
                 geo_offset: (0, 0),
                 announced: false,
+                has_window_entry: false,
                 latest_bgra: None,
                 last_sub_info: Vec::new(),
             },
@@ -930,6 +1100,13 @@ impl XdgShellHandler for AppState {
                     let _ = self
                         .event_tx
                         .send(CompositorEvent::WindowClosed { window_id });
+                    if tracked.has_window_entry {
+                        let _ = self.event_tx.send(CompositorEvent::AppState {
+                            launch_id: WINDOW_LAUNCH_ID_BASE | window_id,
+                            name: tracked.last_title,
+                            state: LaunchState::Exited(0),
+                        });
+                    }
                 }
             }
             debug!(window_id, "xdg_toplevel destroyed");
@@ -1292,11 +1469,14 @@ pub fn start_compositor(
         channel::channel();
 
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<OsString>>(1);
+    let cmd_tx_loop = cmd_tx.clone();
 
     std::thread::Builder::new()
         .name("rw-compositor".into())
         .spawn(move || {
-            if let Err(err) = run_compositor_loop(event_tx, cmd_rx, ready_tx.clone(), command) {
+            if let Err(err) =
+                run_compositor_loop(event_tx, cmd_rx, cmd_tx_loop, ready_tx.clone(), command)
+            {
                 error!(error = %err, "headless compositor exited with error");
                 let _ = ready_tx.send(Err(err));
             }
@@ -1319,6 +1499,7 @@ pub fn start_compositor(
 fn run_compositor_loop(
     event_tx: mpsc::UnboundedSender<CompositorEvent>,
     cmd_rx: Channel<CompositorCommand>,
+    cmd_tx: CalloopSender<CompositorCommand>,
     ready_tx: std::sync::mpsc::SyncSender<Result<OsString>>,
     command: Vec<String>,
 ) -> Result<()> {
@@ -1370,6 +1551,7 @@ fn run_compositor_loop(
     let mut state = AppState {
         display_handle: dh.clone(),
         socket_name: socket_name.clone(),
+        cmd_tx,
         compositor_state,
         shm_state,
         xdg_shell_state,
@@ -1391,6 +1573,8 @@ fn run_compositor_loop(
         surface_buffers: HashMap::new(),
         windows: HashMap::new(),
         popup_windows: HashMap::new(),
+        launched_apps: BTreeMap::new(),
+        next_server_launch_id: 1_000_000,
         event_tx,
     };
 
@@ -1473,15 +1657,58 @@ fn spawn_gui_command(socket_name: &OsString, command: &[String]) {
     }
 }
 
-fn spawn_gui_shell(socket_name: &OsString, exec: &str) {
+fn derive_exec_display_name(exec: &str) -> String {
+    let tokens: Vec<&str> = exec.split_whitespace().collect();
+    if let Some(first) = tokens.first() {
+        let base = std::path::Path::new(first)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first);
+        if base == "flatpak" {
+            if let Some(app_id) = tokens
+                .iter()
+                .skip(1)
+                .find(|t| !t.starts_with('-') && **t != "run")
+            {
+                return app_id.rsplit('.').next().unwrap_or(app_id).to_string();
+            }
+        }
+        return base.to_string();
+    }
+    exec.to_string()
+}
+
+fn spawn_gui_shell(
+    socket_name: &OsString,
+    exec: &str,
+    launch_id: u64,
+    cmd_tx: CalloopSender<CompositorCommand>,
+) -> Result<i32> {
     crate::audio::ensure_virtual_audio_devices();
     let mut proc = Command::new("/bin/sh");
     proc.arg("-c").arg(exec);
     apply_gui_env(&mut proc, socket_name);
-    match proc.spawn() {
-        Ok(child) => info!(pid = child.id(), exec, "launched remote application"),
-        Err(err) => error!(error = %err, exec, "failed to launch remote application"),
+    unsafe {
+        proc.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
     }
+    let mut child = proc.spawn()?;
+    let pid = child.id() as i32;
+    info!(pid, launch_id, exec, "launched remote application");
+    std::thread::Builder::new()
+        .name(format!("rw-app-wait-{launch_id}"))
+        .spawn(move || {
+            let code = child
+                .wait()
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(1);
+            let _ = cmd_tx.send(CompositorCommand::AppExited { launch_id, code });
+        })
+        .ok();
+    Ok(pid)
 }
 
 fn apply_gui_env(proc: &mut Command, socket_name: &OsString) {

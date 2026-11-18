@@ -182,7 +182,7 @@ async fn run_attach(listen: SocketAddr, host: Option<String>) -> Result<()> {
         .arg(listen.to_string())
         .stdin(Stdio::null());
     if let Some(file) = log_file {
-        let err_file = file.try_clone().unwrap_or_else(|_| file);
+        let err_file = file.try_clone().unwrap_or(file);
         cmd.stdout(Stdio::from(err_file));
         cmd.stderr(Stdio::null());
     } else {
