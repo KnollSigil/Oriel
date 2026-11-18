@@ -38,6 +38,7 @@ use smithay::wayland::compositor::{
     get_parent, with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
     CompositorState, SubsurfaceCachedState, TraversalAction,
 };
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::selection::data_device::{
     request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
@@ -51,9 +52,10 @@ use smithay::wayland::shell::xdg::{
 };
 use smithay::wayland::shm::{with_buffer_contents, ShmHandler, ShmState};
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_output,
+    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -235,6 +237,7 @@ struct AppState {
     xdg_decoration_state: XdgDecorationState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
+    cursor_shape_state: CursorShapeManagerState,
     output_manager_state: OutputManagerState,
     output: Output,
     seat: Seat<Self>,
@@ -1212,6 +1215,7 @@ impl ServerDndGrabHandler for AppState {
 }
 
 impl OutputHandler for AppState {}
+impl TabletSeatHandler for AppState {}
 
 impl XdgDecorationHandler for AppState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
@@ -1250,6 +1254,7 @@ delegate_xdg_shell!(AppState);
 delegate_xdg_decoration!(AppState);
 delegate_seat!(AppState);
 delegate_data_device!(AppState);
+delegate_cursor_shape!(AppState);
 delegate_output!(AppState);
 
 /// Start the headless Smithay Wayland compositor on a background OS thread
@@ -1304,6 +1309,7 @@ fn run_compositor_loop(
     let xdg_decoration_state = XdgDecorationState::new::<AppState>(&dh);
     let mut seat_state = SeatState::new();
     let data_device_state = DataDeviceState::new::<AppState>(&dh);
+    let cursor_shape_state = CursorShapeManagerState::new::<AppState>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<AppState>(&dh);
 
     let mut seat = seat_state.new_wl_seat(&dh, "remotewayland-seat");
@@ -1339,6 +1345,7 @@ fn run_compositor_loop(
         xdg_decoration_state,
         seat_state,
         data_device_state,
+        cursor_shape_state,
         output_manager_state,
         output,
         seat,

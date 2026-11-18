@@ -178,9 +178,12 @@ struct ClientApp {
     data_device: Option<DataDevice>,
     copy_paste_source: Option<CopyPasteSource>,
     focused_window_id: WindowId,
+    pointer_window_id: WindowId,
     last_button_serial: u32,
     last_input_serial: u32,
     pressed_keys: HashSet<u32>,
+    last_cursor: (bool, CursorIcon),
+    border_resize_active: bool,
 
     windows: HashMap<WindowId, RemoteWindow>,
     popups: HashMap<WindowId, RemotePopup>,
@@ -448,14 +451,16 @@ impl ClientApp {
                 visible,
                 shape_name,
             } => {
-                if window_id == self.focused_window_id {
-                    if let Some(tp) = &self.themed_pointer {
-                        if !visible {
-                            let _ = tp.hide_cursor();
-                        } else {
-                            let icon =
-                                shape_name.parse::<CursorIcon>().unwrap_or(CursorIcon::Default);
-                            let _ = tp.set_cursor(&self.conn, icon);
+                if window_id == self.pointer_window_id || window_id == self.focused_window_id {
+                    let icon = shape_name.parse::<CursorIcon>().unwrap_or(CursorIcon::Default);
+                    self.last_cursor = (visible, icon);
+                    if !self.border_resize_active {
+                        if let Some(tp) = &self.themed_pointer {
+                            if !visible {
+                                let _ = tp.hide_cursor();
+                            } else {
+                                let _ = tp.set_cursor(&self.conn, icon);
+                            }
                         }
                     }
                 }
@@ -887,6 +892,32 @@ impl PointerHandler for ClientApp {
             match event.kind {
                 PointerEventKind::Enter { serial } => {
                     self.last_input_serial = serial;
+                    self.pointer_window_id = window_id;
+                    self.last_cursor = (true, CursorIcon::Default);
+                    let resize_icon = self.windows.get(&window_id).and_then(|win| {
+                        (!win.maximized && !win.fullscreen && !win.tiled)
+                            .then(|| {
+                                border_resize_edge(
+                                    event.position.0,
+                                    event.position.1,
+                                    win.width,
+                                    win.height,
+                                )
+                                .map(|(_, icon)| icon)
+                            })
+                            .flatten()
+                    });
+                    if let Some(icon) = resize_icon {
+                        self.border_resize_active = true;
+                        if let Some(tp) = &self.themed_pointer {
+                            let _ = tp.set_cursor(&self.conn, icon);
+                        }
+                    } else {
+                        self.border_resize_active = false;
+                        if let Some(tp) = &self.themed_pointer {
+                            let _ = tp.set_cursor(&self.conn, self.last_cursor.1);
+                        }
+                    }
                     let _ = self.ctrl_tx.send(ControlMessage::PointerMotion {
                         window_id,
                         x: event.position.0,
@@ -894,17 +925,32 @@ impl PointerHandler for ClientApp {
                     });
                 }
                 PointerEventKind::Motion { .. } => {
-                    if let Some(win) = self.windows.get(&window_id) {
-                        if !win.maximized && !win.fullscreen && !win.tiled {
-                            if let Some((_, icon)) = border_resize_edge(
-                                event.position.0,
-                                event.position.1,
-                                win.width,
-                                win.height,
-                            ) {
-                                if let Some(tp) = &self.themed_pointer {
-                                    let _ = tp.set_cursor(&self.conn, icon);
-                                }
+                    self.pointer_window_id = window_id;
+                    let resize_icon = self.windows.get(&window_id).and_then(|win| {
+                        (!win.maximized && !win.fullscreen && !win.tiled)
+                            .then(|| {
+                                border_resize_edge(
+                                    event.position.0,
+                                    event.position.1,
+                                    win.width,
+                                    win.height,
+                                )
+                                .map(|(_, icon)| icon)
+                            })
+                            .flatten()
+                    });
+                    if let Some(icon) = resize_icon {
+                        self.border_resize_active = true;
+                        if let Some(tp) = &self.themed_pointer {
+                            let _ = tp.set_cursor(&self.conn, icon);
+                        }
+                    } else if self.border_resize_active {
+                        self.border_resize_active = false;
+                        if let Some(tp) = &self.themed_pointer {
+                            if !self.last_cursor.0 {
+                                let _ = tp.hide_cursor();
+                            } else {
+                                let _ = tp.set_cursor(&self.conn, self.last_cursor.1);
                             }
                         }
                     }
@@ -974,7 +1020,10 @@ impl PointerHandler for ClientApp {
                             .send(ControlMessage::PointerAxis { window_id, dx, dy });
                     }
                 }
-                PointerEventKind::Leave { .. } => {}
+                PointerEventKind::Leave { .. } => {
+                    self.border_resize_active = false;
+                    self.last_cursor = (true, CursorIcon::Default);
+                }
             }
         }
     }
@@ -1194,9 +1243,12 @@ pub fn run_event_loop(
         data_device: None,
         copy_paste_source: None,
         focused_window_id: 1,
+        pointer_window_id: 1,
         last_button_serial: 0,
         last_input_serial: 0,
         pressed_keys: HashSet::new(),
+        last_cursor: (true, CursorIcon::Default),
+        border_resize_active: false,
         windows: HashMap::new(),
         popups: HashMap::new(),
         surface_to_remote: HashMap::new(),
