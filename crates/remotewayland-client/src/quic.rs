@@ -9,7 +9,7 @@ use quinn::{ClientConfig, Endpoint, TransportConfig};
 use remotewayland_proto::{
     read_audio_packet, read_control_message, read_stream_header, read_video_frame,
     write_audio_packet, write_control_message, write_stream_header, AudioPacketHeader,
-    ControlMessage, StreamHeader, VideoCodec, PROTOCOL_VERSION,
+    ControlMessage, StreamHeader, VideoCodec, WindowId, PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -244,6 +244,8 @@ pub async fn run_client(
     });
 
     // Read server control events and dispatch to Wayland UI thread.
+    let mut popup_decoders: std::collections::HashMap<WindowId, VideoDecoder> =
+        std::collections::HashMap::new();
     while let Some(msg) = read_control_message(&mut recv).await? {
         match msg {
             ControlMessage::WindowCreated {
@@ -297,15 +299,22 @@ pub async fn run_client(
                 window_id,
                 width,
                 height,
+                is_keyframe,
                 bgra,
             } => {
-                if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&bgra) {
-                    let _ = ui_tx.send(ClientUiEvent::PopupFrame {
-                        window_id,
-                        width,
-                        height,
-                        bgra: decompressed,
-                    });
+                let decoder = popup_decoders
+                    .entry(window_id)
+                    .or_insert_with(VideoDecoder::new);
+                match decoder.decode(width, height, is_keyframe, &bgra) {
+                    Ok(frame) => {
+                        let _ = ui_tx.send(ClientUiEvent::PopupFrame {
+                            window_id,
+                            width: frame.width,
+                            height: frame.height,
+                            bgra: frame.bgra,
+                        });
+                    }
+                    Err(err) => warn!(window_id, error = %err, "popup decode error"),
                 }
             }
             ControlMessage::StartMove { window_id } => {
@@ -348,6 +357,7 @@ pub async fn run_client(
                 });
             }
             ControlMessage::WindowClosed { window_id } => {
+                popup_decoders.remove(&window_id);
                 let _ = ui_tx.send(ClientUiEvent::WindowClosed { window_id });
             }
             ControlMessage::CursorUpdate {

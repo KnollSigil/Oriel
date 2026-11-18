@@ -241,6 +241,7 @@ async fn handle_connection(
     }
 
     let mut video_streams: HashMap<WindowId, WindowVideoStream> = HashMap::new();
+    let mut popup_encoders: HashMap<WindowId, VideoEncoder> = HashMap::new();
     let session_start = Instant::now();
 
     // Bridge compositor events -> QUIC control/video streams and QUIC control messages -> compositor.
@@ -264,9 +265,15 @@ async fn handle_connection(
                         }).await?;
                     }
                     Ok(CompositorEvent::PopupFrame { window_id, width, height, bgra }) => {
-                        let compressed = lz4_flex::compress_prepend_size(&bgra);
+                        let enc = popup_encoders.entry(window_id).or_insert_with(VideoEncoder::new);
+                        let pts_ns = session_start.elapsed().as_nanos() as u64;
+                        let frame = enc.encode_bgra(width, height, pts_ns, &bgra);
                         write_control_message(&mut send, &ControlMessage::PopupFrame {
-                            window_id, width, height, bgra: compressed
+                            window_id,
+                            width: frame.width,
+                            height: frame.height,
+                            is_keyframe: frame.is_keyframe,
+                            bgra: frame.data,
                         }).await?;
                     }
                     Ok(CompositorEvent::StartMove { window_id }) => {
@@ -306,6 +313,7 @@ async fn handle_connection(
                         if let Some(mut vs) = video_streams.remove(&window_id) {
                             let _ = vs.stream.finish();
                         }
+                        popup_encoders.remove(&window_id);
                         write_control_message(&mut send, &ControlMessage::WindowClosed { window_id }).await?;
                     }
                     Ok(CompositorEvent::CursorUpdate { window_id, visible, shape_name }) => {

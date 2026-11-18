@@ -75,11 +75,12 @@ pub enum ControlMessage {
         width: u32,
         height: u32,
     },
-    /// Server -> Client: lossless BGRA (`Argb8888`) pixel buffer for an `xdg_popup`.
+    /// Server -> Client: lossless XOR-delta + LZ4 BGRA (`Argb8888`) pixel buffer for an `xdg_popup`.
     PopupFrame {
         window_id: WindowId,
         width: u32,
         height: u32,
+        is_keyframe: bool,
         bgra: Vec<u8>,
     },
     /// Server -> Client: remote app requested interactive window move (`xdg_toplevel.move`).
