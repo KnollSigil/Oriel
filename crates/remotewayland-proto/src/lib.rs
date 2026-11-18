@@ -23,13 +23,20 @@ pub enum VideoCodec {
 }
 
 /// Identifies the role of a newly opened unidirectional QUIC stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamHeader {
     Video {
         window_id: WindowId,
         codec: VideoCodec,
     },
     AudioPlayback,
+    AudioPlaybackApp {
+        stream_id: u32,
+        app_name: String,
+        media_name: String,
+        icon_name: String,
+        media_role: String,
+    },
     AudioCapture,
 }
 
@@ -199,6 +206,10 @@ pub enum ControlMessage {
     /// Bidirectional: UTF-8 clipboard text synchronization.
     ClipboardText {
         text: String,
+    },
+    /// Server -> Client: enable/disable host microphone capture based on remote app demand.
+    SetMicActive {
+        active: bool,
     },
     /// Server -> Client: cursor visibility or named cursor shape update.
     CursorUpdate {

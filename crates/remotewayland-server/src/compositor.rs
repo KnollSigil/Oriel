@@ -1647,7 +1647,9 @@ fn run_compositor_loop(
 }
 
 fn spawn_gui_command(socket_name: &OsString, command: &[String]) {
-    crate::audio::ensure_virtual_audio_devices();
+    if let Err(err) = crate::audio::ensure_virtual_audio_devices() {
+        tracing::warn!(error = %err, "failed to initialize isolated PipeWire audio session");
+    }
     let mut proc = Command::new(&command[0]);
     proc.args(&command[1..]);
     apply_gui_env(&mut proc, socket_name);
@@ -1684,7 +1686,9 @@ fn spawn_gui_shell(
     launch_id: u64,
     cmd_tx: CalloopSender<CompositorCommand>,
 ) -> Result<i32> {
-    crate::audio::ensure_virtual_audio_devices();
+    if let Err(err) = crate::audio::ensure_virtual_audio_devices() {
+        tracing::warn!(error = %err, "failed to initialize isolated PipeWire audio session");
+    }
     let mut proc = Command::new("/bin/sh");
     proc.arg("-c").arg(exec);
     apply_gui_env(&mut proc, socket_name);
@@ -1714,14 +1718,19 @@ fn spawn_gui_shell(
 fn apply_gui_env(proc: &mut Command, socket_name: &OsString) {
     proc.env("WAYLAND_DISPLAY", socket_name)
         .env("PULSE_SINK", crate::audio::VIRTUAL_SINK_NAME)
-        .env(
-            "PULSE_SOURCE",
-            format!("{}.monitor", crate::audio::VIRTUAL_MIC_NAME),
-        )
+        .env("PULSE_SOURCE", crate::audio::VIRTUAL_MIC_NAME)
         .env("GDK_BACKEND", "wayland")
         .env("QT_QPA_PLATFORM", "wayland")
         .env("MOZ_ENABLE_WAYLAND", "1")
         .env("SDL_VIDEODRIVER", "wayland");
+    if let Some(pw_dir) = crate::audio::isolated_pw_runtime_dir() {
+        proc.env("PIPEWIRE_RUNTIME_DIR", pw_dir)
+            .env("PULSE_RUNTIME_PATH", pw_dir.join("pulse"))
+            .env(
+                "PULSE_SERVER",
+                format!("unix:{}", pw_dir.join("pulse/native").display()),
+            );
+    }
 }
 
 fn blit_rgba_over(

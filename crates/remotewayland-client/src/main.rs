@@ -45,6 +45,10 @@ struct Cli {
     /// Session authentication token (if not using --uri).
     #[arg(long)]
     token: Option<String>,
+
+    /// Host PipeWire microphone source name or serial to use (default: system default).
+    #[arg(long)]
+    mic: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +73,10 @@ enum ClientSubcommand {
         /// Disable PipeWire audio bridging.
         #[arg(long)]
         no_audio: bool,
+
+        /// Host PipeWire microphone source name or serial to use (default: system default).
+        #[arg(long)]
+        mic: Option<String>,
 
         /// Optional remote GUI application command to launch immediately upon connecting.
         #[arg(last = true)]
@@ -110,8 +118,10 @@ fn main() -> Result<()> {
             server_bin,
             port,
             no_audio,
+            mic,
             command,
         }) => {
+            audio::set_mic_target(mic);
             let uri = ssh_bootstrap(&target, server_bin.as_deref(), port)?;
             if terminal {
                 let cmd_str = if command.is_empty() {
@@ -131,6 +141,7 @@ fn main() -> Result<()> {
             run_gui_session(server, fingerprint, token, !no_audio, initial_exec)
         }
         None => {
+            audio::set_mic_target(cli.mic);
             if let Some(uri) = cli.uri {
                 let (server, fingerprint, token) = parse_uri(&uri)?;
                 run_gui_session(server, fingerprint, token, true, None)

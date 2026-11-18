@@ -220,34 +220,9 @@ pub async fn run_client(
         }
     });
 
-    // Task: capture client microphone and send Opus packets to server.
-    let mic_conn = conn.clone();
-    let mic_task = tokio::spawn(async move {
-        match start_mic_capture() {
-            Ok(mut rx) => match mic_conn.open_uni().await {
-                Ok(mut stream) => {
-                    if let Err(err) =
-                        write_stream_header(&mut stream, &StreamHeader::AudioCapture).await
-                    {
-                        warn!(error = %err, "failed to write AudioCapture stream header");
-                        return;
-                    }
-                    while let Some(pkt) = rx.recv().await {
-                        let hdr = AudioPacketHeader {
-                            pts_ns: pkt.pts_ns,
-                            payload_len: pkt.data.len() as u32,
-                        };
-                        if let Err(err) = write_audio_packet(&mut stream, &hdr, &pkt.data).await {
-                            warn!(error = %err, "AudioCapture stream write error");
-                            break;
-                        }
-                    }
-                }
-                Err(err) => warn!(error = %err, "failed to open AudioCapture uni stream"),
-            },
-            Err(err) => warn!(error = %err, "client mic capture unavailable"),
-        }
-    });
+    // On-demand host microphone capture: only opened when a remote app requests input audio.
+    let mut active_mic: Option<(crate::audio::MicCaptureHandle, tokio::task::JoinHandle<()>)> =
+        None;
 
     // Task: accept per-window video and audio playback unidirectional streams.
     let uni_conn = conn.clone();
@@ -289,6 +264,33 @@ pub async fn run_client(
                         }
                         Err(err) => warn!(error = %err, "client audio playback unavailable"),
                     },
+                    Ok(StreamHeader::AudioPlaybackApp {
+                        stream_id,
+                        app_name,
+                        media_name,
+                        icon_name,
+                        media_role,
+                    }) => match AudioPlaybackSink::new_for_app(
+                        &app_name,
+                        &media_name,
+                        &icon_name,
+                        &media_role,
+                    ) {
+                        Ok(sink) => {
+                            info!(stream_id, %app_name, %media_name, "opened per-app host audio stream");
+                            while let Ok(Some((hdr, payload))) =
+                                read_audio_packet(&mut recv_uni).await
+                            {
+                                if let Err(err) = sink.push_audio(hdr.pts_ns, &payload) {
+                                    warn!(stream_id, error = %err, "audio playback push error");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(stream_id, %app_name, error = %err, "client per-app audio playback unavailable")
+                        }
+                    },
                     Ok(other) => {
                         info!(?other, "received unexpected uni stream");
                     }
@@ -301,7 +303,82 @@ pub async fn run_client(
     // Read server control events and dispatch to Wayland UI thread.
     let mut popup_decoders: std::collections::HashMap<WindowId, VideoDecoder> =
         std::collections::HashMap::new();
-    while let Some(msg) = read_control_message(&mut recv).await? {
+    let mut server_mic_wanted = false;
+    let mut mic_cfg_rx = crate::audio::subscribe_mic_config();
+
+    let sync_mic = |wanted: bool,
+                    cfg: &crate::audio::MicConfig,
+                    active_mic: &mut Option<(
+                        crate::audio::MicCaptureHandle,
+                        tokio::task::JoinHandle<()>,
+                    )>| {
+        let should_run = enable_audio_bridge && wanted && !cfg.muted;
+        if !should_run {
+            if let Some((handle, task)) = active_mic.take() {
+                task.abort();
+                drop(handle);
+                info!("host microphone capture deactivated");
+            }
+            return;
+        }
+        if active_mic.is_some() {
+            return;
+        }
+        match start_mic_capture(cfg.target.as_deref()) {
+            Ok((handle, mut rx)) => {
+                let mic_conn = conn.clone();
+                let task = tokio::spawn(async move {
+                    match mic_conn.open_uni().await {
+                        Ok(mut stream) => {
+                            if let Err(err) =
+                                write_stream_header(&mut stream, &StreamHeader::AudioCapture).await
+                            {
+                                warn!(error = %err, "failed to write AudioCapture stream header");
+                                return;
+                            }
+                            while let Some(pkt) = rx.recv().await {
+                                let hdr = AudioPacketHeader {
+                                    pts_ns: pkt.pts_ns,
+                                    payload_len: pkt.data.len() as u32,
+                                };
+                                if let Err(err) =
+                                    write_audio_packet(&mut stream, &hdr, &pkt.data).await
+                                {
+                                    warn!(error = %err, "AudioCapture stream write error");
+                                    break;
+                                }
+                            }
+                            let _ = stream.finish();
+                        }
+                        Err(err) => warn!(error = %err, "failed to open AudioCapture uni stream"),
+                    }
+                });
+                *active_mic = Some((handle, task));
+                info!(target = ?cfg.target, "host microphone capture activated");
+            }
+            Err(err) => warn!(error = %err, "client mic capture unavailable"),
+        }
+    };
+
+    loop {
+        let msg = tokio::select! {
+            res = read_control_message(&mut recv) => match res? {
+                Some(m) => m,
+                None => break,
+            },
+            res = mic_cfg_rx.changed() => {
+                if res.is_err() {
+                    continue;
+                }
+                let cfg = mic_cfg_rx.borrow().clone();
+                if let Some((handle, task)) = active_mic.take() {
+                    task.abort();
+                    drop(handle);
+                }
+                sync_mic(server_mic_wanted, &cfg, &mut active_mic);
+                continue;
+            }
+        };
         match msg {
             ControlMessage::WindowCreated {
                 window_id,
@@ -429,6 +506,11 @@ pub async fn run_client(
             ControlMessage::ClipboardText { text } => {
                 let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
             }
+            ControlMessage::SetMicActive { active } => {
+                server_mic_wanted = active;
+                let cfg = mic_cfg_rx.borrow().clone();
+                sync_mic(server_mic_wanted, &cfg, &mut active_mic);
+            }
             ControlMessage::AppList { apps } => {
                 if let Some(tx) = &launcher_tx {
                     let _ = tx.send(LauncherNetEvent::AppList(apps));
@@ -461,7 +543,10 @@ pub async fn run_client(
         t.abort();
     }
     writer_task.abort();
-    mic_task.abort();
+    if let Some((handle, task)) = active_mic.take() {
+        task.abort();
+        drop(handle);
+    }
     uni_task.abort();
     Ok(())
 }

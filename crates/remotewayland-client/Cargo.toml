@@ -14,6 +14,8 @@ clap.workspace = true
 gtk4 = { version = "0.9", optional = true, features = ["v4_12"] }
 libc.workspace = true
 lz4_flex.workspace = true
+opus.workspace = true
+pipewire.workspace = true
 quinn.workspace = true
 remotewayland-proto.workspace = true
 rustls.workspace = true

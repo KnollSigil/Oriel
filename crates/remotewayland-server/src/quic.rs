@@ -17,7 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-use crate::audio::{start_playback_capture, AudioMicInjector};
+use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use crate::media::VideoEncoder;
 
@@ -234,35 +234,57 @@ async fn handle_connection(
     });
 
     // Start bidirectional PipeWire <-> Opus audio bridge if requested.
-    if enable_audio_bridge {
-        let playback_conn = conn.clone();
-        tokio::spawn(async move {
-            match start_playback_capture() {
-                Ok(mut rx) => match playback_conn.open_uni().await {
-                    Ok(mut stream) => {
-                        if let Err(err) =
-                            write_stream_header(&mut stream, &StreamHeader::AudioPlayback).await
-                        {
-                            warn!(error = %err, "failed to write AudioPlayback stream header");
-                            return;
-                        }
-                        while let Some(pkt) = rx.recv().await {
-                            let hdr = AudioPacketHeader {
-                                pts_ns: pkt.pts_ns,
-                                payload_len: pkt.data.len() as u32,
+    let (mut mic_active_rx, _audio_bridge_guard) = if enable_audio_bridge {
+        let (mic_rx, guard) = match start_per_app_playback_capture() {
+            Ok(bridge) => {
+                let mut streams = bridge.streams;
+                let playback_conn = conn.clone();
+                tokio::spawn(async move {
+                    while let Some(mut app_stream) = streams.recv().await {
+                        let conn = playback_conn.clone();
+                        tokio::spawn(async move {
+                            let Ok(mut stream) = conn.open_uni().await else {
+                                warn!(
+                                    stream_id = app_stream.stream_id,
+                                    app_name = %app_stream.app_name,
+                                    "failed to open AudioPlaybackApp uni stream"
+                                );
+                                return;
                             };
-                            if let Err(err) = write_audio_packet(&mut stream, &hdr, &pkt.data).await
-                            {
-                                warn!(error = %err, "AudioPlayback stream write error");
-                                break;
+                            let header = StreamHeader::AudioPlaybackApp {
+                                stream_id: app_stream.stream_id,
+                                app_name: app_stream.app_name.clone(),
+                                media_name: app_stream.media_name.clone(),
+                                icon_name: app_stream.icon_name.clone(),
+                                media_role: app_stream.media_role.clone(),
+                            };
+                            if let Err(err) = write_stream_header(&mut stream, &header).await {
+                                warn!(error = %err, "failed to write AudioPlaybackApp stream header");
+                                return;
                             }
-                        }
+                            while let Some(pkt) = app_stream.packets.recv().await {
+                                let hdr = AudioPacketHeader {
+                                    pts_ns: pkt.pts_ns,
+                                    payload_len: pkt.data.len() as u32,
+                                };
+                                if let Err(err) =
+                                    write_audio_packet(&mut stream, &hdr, &pkt.data).await
+                                {
+                                    warn!(error = %err, "AudioPlaybackApp stream write error");
+                                    break;
+                                }
+                            }
+                            let _ = stream.finish();
+                        });
                     }
-                    Err(err) => warn!(error = %err, "failed to open AudioPlayback uni stream"),
-                },
-                Err(err) => warn!(error = %err, "server audio capture unavailable"),
+                });
+                (Some(bridge.mic_active), Some(bridge.guard))
             }
-        });
+            Err(err) => {
+                warn!(error = %err, "server audio capture unavailable");
+                (None, None)
+            }
+        };
 
         let mic_conn = conn.clone();
         tokio::spawn(async move {
@@ -288,7 +310,10 @@ async fn handle_connection(
                 });
             }
         });
-    }
+        (mic_rx, guard)
+    } else {
+        (None, None)
+    };
 
     struct WindowVideoStream {
         encoder: VideoEncoder,
@@ -302,6 +327,14 @@ async fn handle_connection(
     // Bridge compositor events -> QUIC control/video streams and QUIC control messages -> compositor.
     loop {
         tokio::select! {
+            Some(active) = async {
+                match mic_active_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                write_control_message(&mut send, &ControlMessage::SetMicActive { active }).await?;
+            }
             ev = ev_rx.recv() => {
                 match ev {
                     Ok(CompositorEvent::WindowCreated { window_id, title, app_id, width, height }) => {

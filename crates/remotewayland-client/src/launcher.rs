@@ -443,7 +443,73 @@ mod gtk4_ui {
             .build();
         let term_btn = gtk4::Button::with_label("New Terminal");
         term_btn.set_sensitive(false);
+
+        // Host microphone selector + mute control (live-switches PipeWire source).
+        let mic_sources: Rc<RefCell<Vec<crate::audio::HostMicSource>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let updating_mics = Rc::new(std::cell::Cell::new(false));
+        let mic_dropdown = gtk4::DropDown::from_strings(&["Mic: Off (Muted)", "Mic: System Default"]);
+        mic_dropdown.set_tooltip_text(Some("Select or mute host microphone for remote apps"));
+
+        let populate_mics = {
+            let mic_sources = Rc::clone(&mic_sources);
+            let updating_mics = Rc::clone(&updating_mics);
+            move |dropdown: &gtk4::DropDown| {
+                updating_mics.set(true);
+                let cfg = crate::audio::subscribe_mic_config().borrow().clone();
+                let list = crate::audio::list_host_mic_sources();
+                let mut labels: Vec<String> = Vec::with_capacity(list.len() + 2);
+                labels.push("Mic: Off (Muted)".to_string());
+                labels.push("Mic: System Default".to_string());
+                let mut selected_idx = if cfg.muted { 0u32 } else { 1u32 };
+                for (i, src) in list.iter().enumerate() {
+                    labels.push(format!("Mic: {}", src.description));
+                    if !cfg.muted && cfg.target.as_deref() == Some(src.node_name.as_str()) {
+                        selected_idx = (i + 2) as u32;
+                    }
+                }
+                *mic_sources.borrow_mut() = list;
+                let str_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let model = gtk4::StringList::new(&str_refs);
+                dropdown.set_model(Some(&model));
+                dropdown.set_selected(selected_idx);
+                updating_mics.set(false);
+            }
+        };
+        populate_mics(&mic_dropdown);
+
+        mic_dropdown.connect_selected_notify({
+            let mic_sources = Rc::clone(&mic_sources);
+            let updating_mics = Rc::clone(&updating_mics);
+            move |dd| {
+                if updating_mics.get() {
+                    return;
+                }
+                let idx = dd.selected();
+                if idx == 0 {
+                    crate::audio::set_mic_muted(true);
+                } else if idx == 1 {
+                    crate::audio::set_mic_muted(false);
+                    crate::audio::set_mic_target(None);
+                } else if let Some(src) = mic_sources.borrow().get((idx - 2) as usize) {
+                    crate::audio::set_mic_muted(false);
+                    crate::audio::set_mic_target(Some(src.node_name.clone()));
+                }
+            }
+        });
+
+        let mic_refresh_btn = gtk4::Button::with_label("↻");
+        mic_refresh_btn.set_tooltip_text(Some("Refresh host microphones"));
+        mic_refresh_btn.connect_clicked({
+            let mic_dropdown = mic_dropdown.clone();
+            move |_| {
+                populate_mics(&mic_dropdown);
+            }
+        });
+
         top_bar.append(&search_entry);
+        top_bar.append(&mic_dropdown);
+        top_bar.append(&mic_refresh_btn);
         top_bar.append(&term_btn);
         right_pane.append(&top_bar);
 
