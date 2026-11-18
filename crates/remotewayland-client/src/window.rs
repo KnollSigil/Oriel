@@ -1,7 +1,7 @@
 //! Native Wayland rootless multi-window & unbounded `xdg_popup` presenter
 //! built on `smithay-client-toolkit` (`sctk`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::OwnedFd;
@@ -180,6 +180,7 @@ struct ClientApp {
     focused_window_id: WindowId,
     last_button_serial: u32,
     last_input_serial: u32,
+    pressed_keys: HashSet<u32>,
 
     windows: HashMap<WindowId, RemoteWindow>,
     popups: HashMap<WindowId, RemotePopup>,
@@ -807,9 +808,21 @@ impl KeyboardHandler for ClientApp {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: u32,
     ) {
+        let window_id = self
+            .surface_to_remote
+            .get(&surface.id().protocol_id())
+            .copied()
+            .unwrap_or(self.focused_window_id);
+        for keycode in self.pressed_keys.drain() {
+            let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
+                window_id,
+                keycode,
+                pressed: false,
+            });
+        }
     }
 
     fn press_key(
@@ -821,6 +834,7 @@ impl KeyboardHandler for ClientApp {
         event: KeyEvent,
     ) {
         self.last_input_serial = serial;
+        self.pressed_keys.insert(event.raw_code);
         let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
             window_id: self.focused_window_id,
             keycode: event.raw_code,
@@ -837,6 +851,7 @@ impl KeyboardHandler for ClientApp {
         event: KeyEvent,
     ) {
         self.last_input_serial = serial;
+        self.pressed_keys.remove(&event.raw_code);
         let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
             window_id: self.focused_window_id,
             keycode: event.raw_code,
@@ -1181,6 +1196,7 @@ pub fn run_event_loop(
         focused_window_id: 1,
         last_button_serial: 0,
         last_input_serial: 0,
+        pressed_keys: HashSet::new(),
         windows: HashMap::new(),
         popups: HashMap::new(),
         surface_to_remote: HashMap::new(),
