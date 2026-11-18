@@ -5,23 +5,19 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 ## Architecture
 
 - **`remotewayland-proto`**: Shared wire protocol, stream framing, and ephemeral TLS/token handshake types.
-- **`remotewayland-server`**: Headless Wayland compositor (`smithay`), GStreamer video/audio encoder, isolated PipeWire virtual sink/source bridge, and QUIC server.
-- **`remotewayland-client`**: Rootless multi-window client (`winit` + `wgpu`) for Wayland and X11, GStreamer decoder, and local PipeWire bridge.
+- **`remotewayland-server`**: Headless Wayland compositor (`smithay`), pure-Rust XOR-delta + LZ4 video encoder, isolated PipeWire/PulseAudio virtual sink/source bridge, and QUIC server.
+- **`remotewayland-client`**: Rootless multi-window & unbounded `xdg_popup` Wayland client (`smithay-client-toolkit`), pure-Rust LZ4 delta decoder, and local PipeWire/PulseAudio bridge.
 
 ## System Dependencies
 
 ### Fedora / RHEL
 ```bash
-sudo dnf install gstreamer1-devel gstreamer1-plugins-base-devel \
-  gstreamer1-plugins-good gstreamer1-plugins-bad-free \
-  pipewire-devel wayland-devel libxkbcommon-devel libdrm-devel mesa-libgbm-devel
+sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-utils
 ```
 
 ### Ubuntu / Debian
 ```bash
-sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
-  libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev
+sudo apt install libwayland-dev libxkbcommon-dev pulseaudio-utils
 ```
 
 ## Building

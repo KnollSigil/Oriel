@@ -16,6 +16,7 @@ pub type WindowId = u64;
 /// Supported video codecs negotiated between server and client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCodec {
+    Lz4Delta,
     H264,
     Hevc,
     Av1,

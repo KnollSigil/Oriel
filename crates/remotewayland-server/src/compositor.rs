@@ -29,6 +29,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat;
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
 use smithay::utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
@@ -39,8 +40,8 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::selection::data_device::{
-    request_data_device_client_selection, set_data_device_selection, ClientDndGrabHandler,
-    DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
+    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
 use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
@@ -128,7 +129,7 @@ pub enum CompositorEvent {
         window_id: WindowId,
         width: u32,
         height: u32,
-        rgba: Vec<u8>,
+        bgra: Vec<u8>,
     },
     CursorUpdate {
         window_id: WindowId,
@@ -212,7 +213,7 @@ struct TrackedWindow {
     last_height: u32,
     geo_offset: (i32, i32),
     announced: bool,
-    latest_rgba: Option<(u32, u32, Vec<u8>)>,
+    latest_bgra: Option<(u32, u32, Vec<u8>)>,
 }
 
 struct TrackedPopup {
@@ -242,6 +243,7 @@ struct AppState {
     next_window_id: WindowId,
     focused_window_id: WindowId,
     clipboard_text: Option<String>,
+    pending_clipboard_mime: Option<String>,
     start_time: Instant,
     /// Map from `WlSurface::id().protocol_id()` -> WindowId (for toplevels & popups).
     surface_to_window: HashMap<u32, WindowId>,
@@ -489,14 +491,20 @@ impl AppState {
                 }
             }
             CompositorCommand::SetClipboardText { text } => {
+                if self.clipboard_text.as_deref() == Some(text.as_str()) {
+                    return;
+                }
                 self.clipboard_text = Some(text);
                 set_data_device_selection(
                     &self.display_handle,
                     &self.seat,
                     vec![
                         "text/plain;charset=utf-8".to_string(),
-                        "text/plain".to_string(),
+                        "text/plain;charset=UTF-8".to_string(),
                         "UTF8_STRING".to_string(),
+                        "text/plain".to_string(),
+                        "STRING".to_string(),
+                        "TEXT".to_string(),
                     ],
                     (),
                 );
@@ -511,12 +519,12 @@ impl AppState {
                             width: tracked.last_width,
                             height: tracked.last_height,
                         });
-                        if let Some((w, h, rgba)) = &tracked.latest_rgba {
+                        if let Some((w, h, bgra)) = &tracked.latest_bgra {
                             let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
                                 window_id: tracked.window_id,
                                 width: *w,
                                 height: *h,
-                                rgba: rgba.clone(),
+                                bgra: bgra.clone(),
                             });
                         }
                     }
@@ -613,9 +621,9 @@ impl AppState {
         tracked.geo_offset = (crop_x, crop_y);
 
         if tracked
-            .latest_rgba
+            .latest_bgra
             .as_ref()
-            .is_some_and(|(lw, lh, lrgba)| *lw == win_w && *lh == win_h && lrgba == &composite)
+            .is_some_and(|(lw, lh, lbgra)| *lw == win_w && *lh == win_h && lbgra == &composite)
         {
             return;
         }
@@ -644,12 +652,12 @@ impl AppState {
             });
         }
 
-        tracked.latest_rgba = Some((win_w, win_h, composite.clone()));
+        tracked.latest_bgra = Some((win_w, win_h, composite.clone()));
         let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
             window_id,
             width: win_w,
             height: win_h,
-            rgba: composite,
+            bgra: composite,
         });
     }
 
@@ -691,7 +699,7 @@ impl AppState {
             _ => (0, 0, surf_w, surf_h),
         };
 
-        let mut rgba = vec![0u8; (pop_w * pop_h * 4) as usize];
+        let mut bgra = vec![0u8; (pop_w * pop_h * 4) as usize];
         with_surface_tree_downward(
             &root_surface,
             (-crop_x, -crop_y),
@@ -703,23 +711,14 @@ impl AppState {
                     let loc = sub_state.pending().location;
                     (ox + loc.x, oy + loc.y)
                 };
-                if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id().protocol_id()) {
-                    blit_rgba_over(&mut rgba, pop_w, pop_h, srgba, *sw, *sh, nx, ny);
+                if let Some((sw, sh, sbgra)) = self.surface_buffers.get(&surf.id().protocol_id()) {
+                    blit_rgba_over(&mut bgra, pop_w, pop_h, sbgra, *sw, *sh, nx, ny);
                 }
                 TraversalAction::DoChildren((nx, ny))
             },
             |_, _, _| {},
             |_, _, _| true,
         );
-
-        // Convert RGBA -> BGRA (Wayland Argb8888 little-endian) for direct SlotPool presentation.
-        let mut bgra = vec![0u8; rgba.len()];
-        for (src, dst) in rgba.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
-            dst[0] = src[2];
-            dst[1] = src[1];
-            dst[2] = src[0];
-            dst[3] = src[3];
-        }
 
         let Some(popup) = self.popup_windows.get_mut(&window_id) else {
             return;
@@ -800,32 +799,30 @@ impl CompositorHandler for AppState {
                 let width = spec.width.max(0) as u32;
                 let height = spec.height.max(0) as u32;
                 let stride = spec.stride.max(0) as usize;
-                let mut rgba = vec![0u8; (width * height * 4) as usize];
+                let opaque = spec.format == wl_shm::Format::Xrgb8888;
+                let mut bgra = vec![0u8; (width * height * 4) as usize];
                 let src = unsafe { std::slice::from_raw_parts(ptr, len) };
                 for y in 0..(height as usize) {
                     let row_start = spec.offset.max(0) as usize + y * stride;
-                    for x in 0..(width as usize) {
-                        let idx = row_start + x * 4;
-                        if idx + 4 <= src.len() {
-                            let b = src[idx];
-                            let g = src[idx + 1];
-                            let r = src[idx + 2];
-                            let a = src[idx + 3];
-                            let dst_idx = (y * width as usize + x) * 4;
-                            rgba[dst_idx] = r;
-                            rgba[dst_idx + 1] = g;
-                            rgba[dst_idx + 2] = b;
-                            rgba[dst_idx + 3] = a;
+                    let row_bytes = (width as usize) * 4;
+                    let dst_start = y * row_bytes;
+                    if row_start + row_bytes <= src.len() {
+                        bgra[dst_start..dst_start + row_bytes]
+                            .copy_from_slice(&src[row_start..row_start + row_bytes]);
+                        if opaque {
+                            for px in bgra[dst_start..dst_start + row_bytes].chunks_exact_mut(4) {
+                                px[3] = 0xFF;
+                            }
                         }
                     }
                 }
-                (width, height, rgba)
+                (width, height, bgra)
             });
 
-            if let Ok((w, h, rgba)) = extracted {
+            if let Ok((w, h, bgra)) = extracted {
                 if w > 0 && h > 0 {
                     self.surface_buffers
-                        .insert(surface.id().protocol_id(), (w, h, rgba));
+                        .insert(surface.id().protocol_id(), (w, h, bgra));
                 }
             }
             buffer.release();
@@ -867,6 +864,7 @@ impl XdgShellHandler for AppState {
         });
         surface.send_configure();
 
+        let wl_surface = surface.wl_surface().clone();
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window.clone(), (0, 0), false);
         self.surface_to_window.insert(surf_id, window_id);
@@ -881,9 +879,14 @@ impl XdgShellHandler for AppState {
                 last_height: 0,
                 geo_offset: (0, 0),
                 announced: false,
-                latest_rgba: None,
+                latest_bgra: None,
             },
         );
+        self.focused_window_id = window_id;
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, Some(wl_surface), serial);
+        }
         debug!(window_id, surf_id, "new xdg_toplevel registered");
     }
 
@@ -1103,7 +1106,11 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        let dh = &self.display_handle;
+        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client);
+    }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         let (visible, shape_name) = match image {
             CursorImageStatus::Hidden => (false, String::new()),
@@ -1125,32 +1132,30 @@ impl SelectionHandler for AppState {
         &mut self,
         ty: SelectionTarget,
         source: Option<SelectionSource>,
-        seat: Seat<Self>,
+        _seat: Seat<Self>,
     ) {
         if ty != SelectionTarget::Clipboard {
             return;
         }
+        // Remote client now owns or cleared the selection, so invalidate cached host text.
+        self.clipboard_text = None;
         if let Some(src) = source {
             let mime_types = src.mime_types();
-            let preferred = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"]
-                .into_iter()
-                .find(|m| mime_types.iter().any(|t| t == m));
+            let preferred = [
+                "text/plain;charset=utf-8",
+                "text/plain;charset=UTF-8",
+                "UTF8_STRING",
+                "text/plain",
+                "STRING",
+                "TEXT",
+            ]
+            .into_iter()
+            .find(|m| mime_types.iter().any(|t| t == m));
             if let Some(mime) = preferred {
-                let (read_pipe, write_pipe) = match std::os::unix::net::UnixStream::pair() {
-                    Ok(pair) => pair,
-                    Err(_) => return,
-                };
-                let write_fd: OwnedFd = write_pipe.into();
-                if request_data_device_client_selection(&seat, mime.to_string(), write_fd).is_ok() {
-                    let event_tx = self.event_tx.clone();
-                    std::thread::spawn(move || {
-                        let mut file = std::fs::File::from(OwnedFd::from(read_pipe));
-                        let mut text = String::new();
-                        if file.read_to_string(&mut text).is_ok() && !text.is_empty() {
-                            let _ = event_tx.send(CompositorEvent::ClipboardText { text });
-                        }
-                    });
-                }
+                // Note: Smithay invokes `SelectionHandler::new_selection` BEFORE storing the new
+                // `OfferReplySource::Client(source)` into `SeatData::set_clipboard_selection`.
+                // Defer `request_data_device_client_selection` until right after dispatch finishes.
+                self.pending_clipboard_mime = Some(mime.to_string());
             }
         }
     }
@@ -1170,6 +1175,28 @@ impl SelectionHandler for AppState {
                     let _ = file.write_all(text.as_bytes());
                 });
             }
+        }
+    }
+}
+
+impl AppState {
+    fn poll_pending_clipboard(&mut self) {
+        let Some(mime) = self.pending_clipboard_mime.take() else {
+            return;
+        };
+        let Ok((mut read_pipe, write_pipe)) = std::io::pipe() else {
+            return;
+        };
+        let write_fd: OwnedFd = write_pipe.into();
+        if request_data_device_client_selection(&self.seat, mime, write_fd).is_ok() {
+            let _ = self.display_handle.flush_clients();
+            let event_tx = self.event_tx.clone();
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                if read_pipe.read_to_string(&mut text).is_ok() && !text.is_empty() {
+                    let _ = event_tx.send(CompositorEvent::ClipboardText { text });
+                }
+            });
         }
     }
 }
@@ -1321,6 +1348,7 @@ fn run_compositor_loop(
         next_window_id: 1,
         focused_window_id: 1,
         clipboard_text: None,
+        pending_clipboard_mime: None,
         start_time: Instant::now(),
         surface_to_window: HashMap::new(),
         surface_buffers: HashMap::new(),
@@ -1356,6 +1384,7 @@ fn run_compositor_loop(
                         warn!(error = %err, "Wayland dispatch_clients error");
                     }
                 }
+                state.poll_pending_clipboard();
                 Ok(PostAction::Continue)
             },
         )

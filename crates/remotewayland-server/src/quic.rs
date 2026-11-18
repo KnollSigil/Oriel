@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use quinn::{Endpoint, ServerConfig, TransportConfig};
+use quinn::{Endpoint, SendStream, ServerConfig, TransportConfig};
 use remotewayland_proto::{
     read_audio_packet, read_control_message, read_stream_header, write_audio_packet,
     write_control_message, write_stream_header, write_video_frame, AudioPacketHeader,
@@ -128,7 +128,7 @@ async fn handle_connection(
                     &ControlMessage::AuthResponse {
                         accepted: false,
                         reason: Some(format!("unsupported protocol version {protocol_version}")),
-                        selected_codec: VideoCodec::H264,
+                        selected_codec: VideoCodec::Lz4Delta,
                     },
                 )
                 .await?;
@@ -141,7 +141,7 @@ async fn handle_connection(
                     &ControlMessage::AuthResponse {
                         accepted: false,
                         reason: Some("invalid session token".into()),
-                        selected_codec: VideoCodec::H264,
+                        selected_codec: VideoCodec::Lz4Delta,
                     },
                 )
                 .await?;
@@ -151,7 +151,7 @@ async fn handle_connection(
             let selected_codec = supported_codecs
                 .first()
                 .copied()
-                .unwrap_or(VideoCodec::H264);
+                .unwrap_or(VideoCodec::Lz4Delta);
 
             write_control_message(
                 &mut send,
@@ -219,7 +219,7 @@ async fn handle_connection(
                                 while let Ok(Some((hdr, payload))) =
                                     read_audio_packet(&mut recv_uni).await
                                 {
-                                    if let Err(err) = injector.push_opus(hdr.pts_ns, &payload) {
+                                    if let Err(err) = injector.push_audio(hdr.pts_ns, &payload) {
                                         warn!(error = %err, "server mic push error");
                                         break;
                                     }
@@ -235,7 +235,12 @@ async fn handle_connection(
         });
     }
 
-    let mut encoders: HashMap<WindowId, VideoEncoder> = HashMap::new();
+    struct WindowVideoStream {
+        encoder: VideoEncoder,
+        stream: SendStream,
+    }
+
+    let mut video_streams: HashMap<WindowId, WindowVideoStream> = HashMap::new();
     let session_start = Instant::now();
 
     // Bridge compositor events -> QUIC control/video streams and QUIC control messages -> compositor.
@@ -259,8 +264,9 @@ async fn handle_connection(
                         }).await?;
                     }
                     Ok(CompositorEvent::PopupFrame { window_id, width, height, bgra }) => {
+                        let compressed = lz4_flex::compress_prepend_size(&bgra);
                         write_control_message(&mut send, &ControlMessage::PopupFrame {
-                            window_id, width, height, bgra
+                            window_id, width, height, bgra: compressed
                         }).await?;
                     }
                     Ok(CompositorEvent::StartMove { window_id }) => {
@@ -297,7 +303,9 @@ async fn handle_connection(
                         }).await?;
                     }
                     Ok(CompositorEvent::WindowClosed { window_id }) => {
-                        encoders.remove(&window_id);
+                        if let Some(mut vs) = video_streams.remove(&window_id) {
+                            let _ = vs.stream.finish();
+                        }
                         write_control_message(&mut send, &ControlMessage::WindowClosed { window_id }).await?;
                     }
                     Ok(CompositorEvent::CursorUpdate { window_id, visible, shape_name }) => {
@@ -308,40 +316,27 @@ async fn handle_connection(
                     Ok(CompositorEvent::ClipboardText { text }) => {
                         write_control_message(&mut send, &ControlMessage::ClipboardText { text }).await?;
                     }
-                    Ok(CompositorEvent::FrameCommitted { window_id, width, height, rgba }) => {
-                        if !encoders.contains_key(&window_id) {
-                            match VideoEncoder::new(selected_codec, width, height) {
-                                Ok((encoder, mut frame_rx)) => {
-                                    let mut stream = conn.open_uni().await.context("failed to open video uni stream")?;
-                                    write_stream_header(&mut stream, &StreamHeader::Video { window_id, codec: selected_codec }).await?;
-                                    tokio::spawn(async move {
-                                        while let Some(frame) = frame_rx.recv().await {
-                                            let hdr = VideoFrameHeader {
-                                                pts_ns: frame.pts_ns,
-                                                width: frame.width,
-                                                height: frame.height,
-                                                is_keyframe: frame.is_keyframe,
-                                                payload_len: frame.data.len() as u32,
-                                            };
-                                            if let Err(err) = write_video_frame(&mut stream, &hdr, &frame.data).await {
-                                                warn!(window_id, error = %err, "failed to write video frame");
-                                                break;
-                                            }
-                                        }
-                                        let _ = stream.finish();
-                                    });
-                                    encoders.insert(window_id, encoder);
-                                }
-                                Err(err) => {
-                                    warn!(window_id, error = %err, "failed to create VideoEncoder");
-                                    continue;
-                                }
-                            }
+                    Ok(CompositorEvent::FrameCommitted { window_id, width, height, bgra }) => {
+                        if !video_streams.contains_key(&window_id) {
+                            let mut stream = conn.open_uni().await.context("failed to open video uni stream")?;
+                            write_stream_header(&mut stream, &StreamHeader::Video { window_id, codec: selected_codec }).await?;
+                            video_streams.insert(window_id, WindowVideoStream {
+                                encoder: VideoEncoder::new(),
+                                stream,
+                            });
                         }
-                        if let Some(encoder) = encoders.get_mut(&window_id) {
+                        if let Some(vs) = video_streams.get_mut(&window_id) {
                             let pts_ns = session_start.elapsed().as_nanos() as u64;
-                            if let Err(err) = encoder.push_rgba(width, height, pts_ns, &rgba) {
-                                warn!(window_id, error = %err, "video encode push error");
+                            let frame = vs.encoder.encode_bgra(width, height, pts_ns, &bgra);
+                            let hdr = VideoFrameHeader {
+                                pts_ns: frame.pts_ns,
+                                width: frame.width,
+                                height: frame.height,
+                                is_keyframe: frame.is_keyframe,
+                                payload_len: frame.data.len() as u32,
+                            };
+                            if let Err(err) = write_video_frame(&mut vs.stream, &hdr, &frame.data).await {
+                                warn!(window_id, error = %err, "failed to write video frame");
                             }
                         }
                     }

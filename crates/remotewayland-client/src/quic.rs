@@ -128,7 +128,7 @@ pub async fn run_client(
         &ControlMessage::AuthRequest {
             protocol_version: PROTOCOL_VERSION,
             token,
-            supported_codecs: vec![VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1],
+            supported_codecs: vec![VideoCodec::Lz4Delta],
             enable_audio_bridge: true,
         },
     )
@@ -202,20 +202,14 @@ pub async fn run_client(
             let tx = uni_tx.clone();
             tokio::spawn(async move {
                 match read_stream_header(&mut recv_uni).await {
-                    Ok(StreamHeader::Video { window_id, codec }) => {
-                        let (mut decoder, frame_rx) = match VideoDecoder::new(codec) {
-                            Ok(pair) => pair,
-                            Err(err) => {
-                                warn!(window_id, error = %err, "failed to create VideoDecoder");
-                                return;
-                            }
-                        };
-                        let spawn_pull = |mut rx: tokio::sync::mpsc::UnboundedReceiver<
-                            crate::media::DecodedFrame,
-                        >,
-                                          tx: UiSender| {
-                            tokio::spawn(async move {
-                                while let Some(frame) = rx.recv().await {
+                    Ok(StreamHeader::Video {
+                        window_id,
+                        codec: _,
+                    }) => {
+                        let mut decoder = VideoDecoder::new();
+                        while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
+                            match decoder.decode(hdr.width, hdr.height, hdr.is_keyframe, &payload) {
+                                Ok(frame) => {
                                     let _ = tx.send(ClientUiEvent::FrameDecoded {
                                         window_id,
                                         width: frame.width,
@@ -223,23 +217,7 @@ pub async fn run_client(
                                         bgra: frame.bgra,
                                     });
                                 }
-                            });
-                        };
-                        spawn_pull(frame_rx, tx.clone());
-
-                        let mut last_dims = (0u32, 0u32);
-                        while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
-                            if last_dims.0 != 0
-                                && (hdr.width != last_dims.0 || hdr.height != last_dims.1)
-                            {
-                                if let Ok((new_dec, new_rx)) = VideoDecoder::new(codec) {
-                                    decoder = new_dec;
-                                    spawn_pull(new_rx, tx.clone());
-                                }
-                            }
-                            last_dims = (hdr.width, hdr.height);
-                            if let Err(err) = decoder.push_encoded(hdr.pts_ns, &payload) {
-                                warn!(window_id, error = %err, "video decode push error");
+                                Err(err) => warn!(window_id, error = %err, "video decode error"),
                             }
                         }
                     }
@@ -248,7 +226,7 @@ pub async fn run_client(
                             while let Ok(Some((hdr, payload))) =
                                 read_audio_packet(&mut recv_uni).await
                             {
-                                if let Err(err) = sink.push_opus(hdr.pts_ns, &payload) {
+                                if let Err(err) = sink.push_audio(hdr.pts_ns, &payload) {
                                     warn!(error = %err, "audio playback push error");
                                     break;
                                 }
@@ -321,12 +299,14 @@ pub async fn run_client(
                 height,
                 bgra,
             } => {
-                let _ = ui_tx.send(ClientUiEvent::PopupFrame {
-                    window_id,
-                    width,
-                    height,
-                    bgra,
-                });
+                if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&bgra) {
+                    let _ = ui_tx.send(ClientUiEvent::PopupFrame {
+                        window_id,
+                        width,
+                        height,
+                        bgra: decompressed,
+                    });
+                }
             }
             ControlMessage::StartMove { window_id } => {
                 let _ = ui_tx.send(ClientUiEvent::StartMove { window_id });

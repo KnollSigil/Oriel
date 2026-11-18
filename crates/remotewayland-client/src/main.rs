@@ -44,8 +44,6 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
-    media::init_gstreamer()?;
-
     let cli = Cli::parse();
     let (server, fingerprint, token) = if let Some(uri) = cli.uri {
         parse_uri(&uri)?

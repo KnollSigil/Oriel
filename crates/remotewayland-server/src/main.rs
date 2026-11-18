@@ -37,7 +37,6 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    media::init_gstreamer()?;
     let token = cli.token.unwrap_or_else(generate_ephemeral_token);
     let creds = quic::generate_ephemeral_credentials(token)?;
 

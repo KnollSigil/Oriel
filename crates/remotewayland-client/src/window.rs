@@ -2,6 +2,9 @@
 //! built on `smithay-client-toolkit` (`sctk`).
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::unix::io::OwnedFd;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -11,8 +14,15 @@ use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm, delegate_xdg_popup, delegate_xdg_shell, delegate_xdg_window,
+    data_device_manager::{
+        data_device::{DataDevice, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        data_source::{CopyPasteSource, DataSourceHandler},
+        DataDeviceManagerState, WritePipe,
+    },
+    delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
+    delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_popup,
+    delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -38,7 +48,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
+        wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
+        wl_surface,
+    },
     Connection, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::xdg::shell::client::{
@@ -153,6 +167,7 @@ struct ClientApp {
     compositor_state: CompositorState,
     xdg_shell: XdgShell,
     shm: Shm,
+    data_device_manager_state: Option<DataDeviceManagerState>,
     pool: SlotPool,
     conn: Connection,
     qh: QueueHandle<Self>,
@@ -160,15 +175,17 @@ struct ClientApp {
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     themed_pointer: Option<ThemedPointer>,
+    data_device: Option<DataDevice>,
+    copy_paste_source: Option<CopyPasteSource>,
     focused_window_id: WindowId,
     last_button_serial: u32,
+    last_input_serial: u32,
 
     windows: HashMap<WindowId, RemoteWindow>,
     popups: HashMap<WindowId, RemotePopup>,
     surface_to_remote: HashMap<u32, WindowId>,
 
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
-    clipboard: Option<arboard::Clipboard>,
     last_clipboard: String,
     exit: bool,
 }
@@ -420,7 +437,7 @@ impl ClientApp {
                             width,
                             height,
                             &bgra,
-                            wl_shm::Format::Xrgb8888,
+                            wl_shm::Format::Argb8888,
                         );
                     }
                 }
@@ -443,10 +460,17 @@ impl ClientApp {
                 }
             }
             ClientUiEvent::ClipboardText { text } => {
-                if text != self.last_clipboard {
-                    self.last_clipboard = text.clone();
-                    if let Some(cb) = self.clipboard.as_mut() {
-                        let _ = cb.set_text(text);
+                if !text.is_empty()
+                    && (self.copy_paste_source.is_none() || text != self.last_clipboard)
+                {
+                    self.last_clipboard = text;
+                    if let (Some(mgr), Some(data_device)) =
+                        (&self.data_device_manager_state, &self.data_device)
+                    {
+                        let source =
+                            mgr.create_copy_paste_source(&self.qh, SUPPORTED_TEXT_MIMES.to_vec());
+                        source.set_selection(data_device, self.last_input_serial);
+                        self.copy_paste_source = Some(source);
                     }
                 }
             }
@@ -455,6 +479,7 @@ impl ClientApp {
                 self.exit = true;
             }
         }
+        let _ = self.conn.flush();
     }
 }
 
@@ -624,7 +649,7 @@ impl WindowHandler for ClientApp {
                 fw,
                 fh,
                 &bgra,
-                wl_shm::Format::Xrgb8888,
+                wl_shm::Format::Argb8888,
             );
         } else if first {
             let blank = vec![0u8; (new_w * new_h * 4) as usize];
@@ -635,7 +660,7 @@ impl WindowHandler for ClientApp {
                 new_w,
                 new_h,
                 &blank,
-                wl_shm::Format::Xrgb8888,
+                wl_shm::Format::Argb8888,
             );
         }
 
@@ -715,6 +740,11 @@ impl SeatHandler for ClientApp {
         if self.seat.is_none() {
             self.seat = Some(seat.clone());
         }
+        if self.data_device.is_none() {
+            if let Some(mgr) = &self.data_device_manager_state {
+                self.data_device = Some(mgr.get_data_device(qh, &seat));
+            }
+        }
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             if let Ok(kbd) = self.seat_state.get_keyboard(qh, &seat, None) {
                 self.keyboard = Some(kbd);
@@ -761,21 +791,14 @@ impl KeyboardHandler for ClientApp {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
-        _: u32,
+        serial: u32,
         _: &[u32],
         _: &[Keysym],
     ) {
+        self.last_input_serial = serial;
         let surf_id = surface.id().protocol_id();
         if let Some(&window_id) = self.surface_to_remote.get(&surf_id) {
             self.focused_window_id = window_id;
-            if let Some(cb) = self.clipboard.as_mut() {
-                if let Ok(text) = cb.get_text() {
-                    if !text.is_empty() && text != self.last_clipboard {
-                        self.last_clipboard = text.clone();
-                        let _ = self.ctrl_tx.send(ControlMessage::ClipboardText { text });
-                    }
-                }
-            }
         }
     }
 
@@ -794,9 +817,10 @@ impl KeyboardHandler for ClientApp {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: u32,
+        serial: u32,
         event: KeyEvent,
     ) {
+        self.last_input_serial = serial;
         let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
             window_id: self.focused_window_id,
             keycode: event.raw_code,
@@ -809,9 +833,10 @@ impl KeyboardHandler for ClientApp {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: u32,
+        serial: u32,
         event: KeyEvent,
     ) {
+        self.last_input_serial = serial;
         let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
             window_id: self.focused_window_id,
             keycode: event.raw_code,
@@ -845,7 +870,15 @@ impl PointerHandler for ClientApp {
                 continue;
             };
             match event.kind {
-                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                PointerEventKind::Enter { serial } => {
+                    self.last_input_serial = serial;
+                    let _ = self.ctrl_tx.send(ControlMessage::PointerMotion {
+                        window_id,
+                        x: event.position.0,
+                        y: event.position.1,
+                    });
+                }
+                PointerEventKind::Motion { .. } => {
                     if let Some(win) = self.windows.get(&window_id) {
                         if !win.maximized && !win.fullscreen && !win.tiled {
                             if let Some((_, icon)) = border_resize_edge(
@@ -868,6 +901,7 @@ impl PointerHandler for ClientApp {
                 }
                 PointerEventKind::Press { button, serial, .. } => {
                     self.last_button_serial = serial;
+                    self.last_input_serial = serial;
                     self.focused_window_id = window_id;
                     if button == BTN_LEFT {
                         if let (Some(seat), Some(win)) = (&self.seat, self.windows.get(&window_id))
@@ -896,7 +930,8 @@ impl PointerHandler for ClientApp {
                         pressed: true,
                     });
                 }
-                PointerEventKind::Release { button, .. } => {
+                PointerEventKind::Release { button, serial, .. } => {
+                    self.last_input_serial = serial;
                     let _ = self.ctrl_tx.send(ControlMessage::PointerButton {
                         window_id,
                         button,
@@ -936,6 +971,140 @@ impl ShmHandler for ClientApp {
     }
 }
 
+const SUPPORTED_TEXT_MIMES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain;charset=UTF-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+    "TEXT",
+];
+
+impl DataDeviceHandler for ClientApp {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataDevice,
+        _: f64,
+        _: f64,
+        _: &wl_surface::WlSurface,
+    ) {
+    }
+
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, wl_data_device: &WlDataDevice) {
+        // Ignore selection echo when our own CopyPasteSource is active.
+        if self.copy_paste_source.is_some() {
+            return;
+        }
+        let Some(data_device) = &self.data_device else {
+            return;
+        };
+        if data_device.inner() != wl_data_device {
+            return;
+        }
+        let Some(offer) = data_device.data().selection_offer() else {
+            return;
+        };
+        let mime = offer.with_mime_types(|mimes| {
+            SUPPORTED_TEXT_MIMES
+                .iter()
+                .find(|&&want| mimes.iter().any(|m| m == want))
+                .map(|&s| s.to_string())
+        });
+        let Some(mime) = mime else {
+            return;
+        };
+        let Ok(read_pipe) = offer.receive(mime) else {
+            return;
+        };
+        let _ = self.conn.flush();
+        let ctrl_tx = self.ctrl_tx.clone();
+        std::thread::spawn(move || {
+            let mut file = File::from(OwnedFd::from(read_pipe));
+            let mut text = String::new();
+            if file.read_to_string(&mut text).is_ok() && !text.is_empty() {
+                let _ = ctrl_tx.send(ControlMessage::ClipboardText { text });
+            }
+        });
+    }
+
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+impl DataOfferHandler for ClientApp {
+    fn source_actions(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+
+    fn selected_action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+}
+
+impl DataSourceHandler for ClientApp {
+    fn accept_mime(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &WlDataSource,
+        _: Option<String>,
+    ) {
+    }
+
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &WlDataSource,
+        mime: String,
+        write_pipe: WritePipe,
+    ) {
+        if self
+            .copy_paste_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+            && SUPPORTED_TEXT_MIMES.contains(&mime.as_str())
+        {
+            let text = self.last_clipboard.clone();
+            std::thread::spawn(move || {
+                let mut file = File::from(OwnedFd::from(write_pipe));
+                let _ = file.write_all(text.as_bytes());
+            });
+        }
+    }
+
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        if self
+            .copy_paste_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            self.copy_paste_source = None;
+        } else {
+            source.destroy();
+        }
+    }
+
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
+}
+
 impl ProvidesRegistryState for ClientApp {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -949,6 +1118,7 @@ delegate_shm!(ClientApp);
 delegate_seat!(ClientApp);
 delegate_keyboard!(ClientApp);
 delegate_pointer!(ClientApp);
+delegate_data_device!(ClientApp);
 delegate_xdg_shell!(ClientApp);
 delegate_xdg_window!(ClientApp);
 delegate_xdg_popup!(ClientApp);
@@ -989,6 +1159,7 @@ pub fn run_event_loop(
         CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
     let xdg_shell = XdgShell::bind(&globals, &qh).context("xdg_wm_base not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
+    let data_device_manager_state = DataDeviceManagerState::bind(&globals, &qh).ok();
     let pool = SlotPool::new(1920 * 1080 * 4, &shm).context("failed to create SlotPool")?;
 
     let mut app = ClientApp {
@@ -998,19 +1169,22 @@ pub fn run_event_loop(
         compositor_state,
         xdg_shell,
         shm,
+        data_device_manager_state,
         pool,
         conn,
         qh,
         seat: None,
         keyboard: None,
         themed_pointer: None,
+        data_device: None,
+        copy_paste_source: None,
         focused_window_id: 1,
         last_button_serial: 0,
+        last_input_serial: 0,
         windows: HashMap::new(),
         popups: HashMap::new(),
         surface_to_remote: HashMap::new(),
         ctrl_tx,
-        clipboard: arboard::Clipboard::new().ok(),
         last_clipboard: String::new(),
         exit: false,
     };

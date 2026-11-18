@@ -6,11 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-arboard.workspace = true
 clap.workspace = true
-gstreamer.workspace = true
-gstreamer-app.workspace = true
-gstreamer-video.workspace = true
+lz4_flex.workspace = true
 quinn.workspace = true
 remotewayland-proto.workspace = true
 rustls.workspace = true
