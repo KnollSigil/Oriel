@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::OwnedFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use remotewayland_proto::{ControlMessage, WindowId};
@@ -151,6 +151,7 @@ struct RemoteWindow {
     activated: bool,
     tiled: bool,
     pending_frame: Option<(u32, u32, Vec<u8>)>,
+    pending_resize_prev: Option<((u32, u32), Instant)>,
 }
 
 struct RemotePopup {
@@ -182,6 +183,7 @@ struct ClientApp {
     last_button_serial: u32,
     last_input_serial: u32,
     pressed_keys: HashSet<u32>,
+    pressed_buttons: HashSet<u32>,
     last_cursor: (bool, CursorIcon),
     border_resize_active: bool,
 
@@ -195,6 +197,16 @@ struct ClientApp {
 }
 
 impl ClientApp {
+    fn release_pressed_buttons(&mut self, window_id: WindowId) {
+        for button in self.pressed_buttons.drain() {
+            let _ = self.ctrl_tx.send(ControlMessage::PointerButton {
+                window_id,
+                button,
+                pressed: false,
+            });
+        }
+    }
+
     fn handle_ui_event(&mut self, event: ClientUiEvent) {
         match event {
             ClientUiEvent::WindowCreated {
@@ -237,6 +249,7 @@ impl ClientApp {
                         activated: true,
                         tiled: false,
                         pending_frame: None,
+                        pending_resize_prev: None,
                     },
                 );
             }
@@ -352,11 +365,13 @@ impl ClientApp {
                 }
             }
             ClientUiEvent::StartMove { window_id } => {
+                self.release_pressed_buttons(window_id);
                 if let (Some(seat), Some(win)) = (&self.seat, self.windows.get(&window_id)) {
                     win.window.move_(seat, self.last_button_serial);
                 }
             }
             ClientUiEvent::StartResize { window_id, edge } => {
+                self.release_pressed_buttons(window_id);
                 if let (Some(seat), Some(win)) = (&self.seat, self.windows.get(&window_id)) {
                     if let WEnum::Value(resize_edge) = WEnum::from(edge) {
                         win.window
@@ -434,6 +449,18 @@ impl ClientApp {
                     if !win.configured {
                         win.pending_frame = Some((width, height, bgra));
                     } else {
+                        if let Some((prev_size, since)) = win.pending_resize_prev {
+                            if (width, height) == prev_size
+                                && (width, height) != (win.width, win.height)
+                                && since.elapsed() < Duration::from_millis(250)
+                            {
+                                return;
+                            }
+                            win.pending_resize_prev = None;
+                        }
+                        win.window
+                            .xdg_surface()
+                            .set_window_geometry(0, 0, width as i32, height as i32);
                         let surf = win.window.wl_surface().clone();
                         draw_shm_surface(
                             &mut self.pool,
@@ -630,8 +657,9 @@ impl WindowHandler for ClientApp {
         let activated = configure.is_activated();
         let tiled = configure.is_tiled();
 
-        let state_changed = new_w != win.width
-            || new_h != win.height
+        let old_size = (win.width, win.height);
+        let size_changed = new_w != win.width || new_h != win.height;
+        let state_changed = size_changed
             || maximized != win.maximized
             || fullscreen != win.fullscreen
             || activated != win.activated
@@ -646,8 +674,14 @@ impl WindowHandler for ClientApp {
 
         let first = !win.configured;
         win.configured = true;
+        if !first && size_changed {
+            win.pending_resize_prev = Some((old_size, Instant::now()));
+        }
 
         if let Some((fw, fh, bgra)) = win.pending_frame.take() {
+            win.window
+                .xdg_surface()
+                .set_window_geometry(0, 0, fw as i32, fh as i32);
             let surf = win.window.wl_surface().clone();
             draw_shm_surface(
                 &mut self.pool,
@@ -990,6 +1024,7 @@ impl PointerHandler for ClientApp {
                             }
                         }
                     }
+                    self.pressed_buttons.insert(button);
                     let _ = self.ctrl_tx.send(ControlMessage::PointerMotion {
                         window_id,
                         x: event.position.0,
@@ -1003,6 +1038,7 @@ impl PointerHandler for ClientApp {
                 }
                 PointerEventKind::Release { button, serial, .. } => {
                     self.last_input_serial = serial;
+                    self.pressed_buttons.remove(&button);
                     let _ = self.ctrl_tx.send(ControlMessage::PointerButton {
                         window_id,
                         button,
@@ -1033,6 +1069,7 @@ impl PointerHandler for ClientApp {
                 PointerEventKind::Leave { .. } => {
                     self.border_resize_active = false;
                     self.last_cursor = (true, CursorIcon::Default);
+                    self.release_pressed_buttons(window_id);
                 }
             }
         }
@@ -1257,6 +1294,7 @@ pub fn run_event_loop(
         last_button_serial: 0,
         last_input_serial: 0,
         pressed_keys: HashSet::new(),
+        pressed_buttons: HashSet::new(),
         last_cursor: (true, CursorIcon::Default),
         border_resize_active: false,
         windows: HashMap::new(),
