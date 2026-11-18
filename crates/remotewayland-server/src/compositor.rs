@@ -31,7 +31,7 @@ use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, Resource};
+use smithay::reexports::wayland_server::{backend::ObjectId, Client, Display, DisplayHandle, Resource};
 use smithay::utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -245,10 +245,10 @@ struct AppState {
     clipboard_text: Option<String>,
     pending_clipboard_mime: Option<String>,
     start_time: Instant,
-    /// Map from `WlSurface::id().protocol_id()` -> WindowId (for toplevels & popups).
-    surface_to_window: HashMap<u32, WindowId>,
-    /// Cached RGBA buffer per `WlSurface::id().protocol_id()` for surface-tree compositing.
-    surface_buffers: HashMap<u32, (u32, u32, Vec<u8>)>,
+    /// Map from `WlSurface::id()` (`ObjectId`, unique across clients) -> WindowId (for toplevels & popups).
+    surface_to_window: HashMap<ObjectId, WindowId>,
+    /// Cached RGBA buffer per `WlSurface::id()` for surface-tree compositing.
+    surface_buffers: HashMap<ObjectId, (u32, u32, Vec<u8>)>,
     windows: HashMap<WindowId, TrackedWindow>,
     popup_windows: HashMap<WindowId, TrackedPopup>,
     event_tx: mpsc::UnboundedSender<CompositorEvent>,
@@ -282,7 +282,7 @@ impl AppState {
                     let loc = sub_state.pending().location;
                     (ox + loc.x, oy + loc.y)
                 };
-                if let Some((sw, sh, _)) = self.surface_buffers.get(&surf.id().protocol_id()) {
+                if let Some((sw, sh, _)) = self.surface_buffers.get(&surf.id()) {
                     let lx = ix - nx;
                     let ly = iy - ny;
                     if lx >= 0 && lx < *sw as i32 && ly >= 0 && ly < *sh as i32 {
@@ -554,7 +554,7 @@ impl AppState {
     }
 
     fn recomposite_window(&mut self, window_id: WindowId, root_surface: &WlSurface) {
-        let root_id = root_surface.id().protocol_id();
+        let root_id = root_surface.id();
         let Some((surf_w, surf_h, _)) = self.surface_buffers.get(&root_id) else {
             return;
         };
@@ -606,7 +606,7 @@ impl AppState {
                     let loc = sub_state.pending().location;
                     (ox + loc.x, oy + loc.y)
                 };
-                if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id().protocol_id()) {
+                if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id()) {
                     blit_rgba_over(&mut composite, win_w, win_h, srgba, *sw, *sh, nx, ny);
                 }
                 TraversalAction::DoChildren((nx, ny))
@@ -666,7 +666,7 @@ impl AppState {
             return;
         };
         let root_surface = popup.surface.wl_surface().clone();
-        let root_id = root_surface.id().protocol_id();
+        let root_id = root_surface.id();
         let Some((surf_w, surf_h, _)) = self.surface_buffers.get(&root_id) else {
             return;
         };
@@ -711,7 +711,7 @@ impl AppState {
                     let loc = sub_state.pending().location;
                     (ox + loc.x, oy + loc.y)
                 };
-                if let Some((sw, sh, sbgra)) = self.surface_buffers.get(&surf.id().protocol_id()) {
+                if let Some((sw, sh, sbgra)) = self.surface_buffers.get(&surf.id()) {
                     blit_rgba_over(&mut bgra, pop_w, pop_h, sbgra, *sw, *sh, nx, ny);
                 }
                 TraversalAction::DoChildren((nx, ny))
@@ -774,7 +774,7 @@ impl CompositorHandler for AppState {
 
         let mut cur = surface.clone();
         let window_id = loop {
-            let key = cur.id().protocol_id();
+            let key = cur.id();
             if let Some(&wid) = self.surface_to_window.get(&key) {
                 break wid;
             }
@@ -821,8 +821,7 @@ impl CompositorHandler for AppState {
 
             if let Ok((w, h, bgra)) = extracted {
                 if w > 0 && h > 0 {
-                    self.surface_buffers
-                        .insert(surface.id().protocol_id(), (w, h, bgra));
+                    self.surface_buffers.insert(surface.id(), (w, h, bgra));
                 }
             }
             buffer.release();
@@ -857,7 +856,7 @@ impl XdgShellHandler for AppState {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window_id = self.alloc_window_id();
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
@@ -867,7 +866,7 @@ impl XdgShellHandler for AppState {
         let wl_surface = surface.wl_surface().clone();
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window.clone(), (0, 0), false);
-        self.surface_to_window.insert(surf_id, window_id);
+        self.surface_to_window.insert(surf_id.clone(), window_id);
         self.windows.insert(
             window_id,
             TrackedWindow {
@@ -887,11 +886,11 @@ impl XdgShellHandler for AppState {
             let serial = SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, Some(wl_surface), serial);
         }
-        debug!(window_id, surf_id, "new xdg_toplevel registered");
+        debug!(window_id, ?surf_id, "new xdg_toplevel registered");
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         self.surface_buffers.remove(&surf_id);
         if let Some(window_id) = self.surface_to_window.remove(&surf_id) {
             if let Some(tracked) = self.windows.remove(&window_id) {
@@ -907,7 +906,7 @@ impl XdgShellHandler for AppState {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
             let _ = self.event_tx.send(CompositorEvent::StartMove { window_id });
         }
@@ -920,7 +919,7 @@ impl XdgShellHandler for AppState {
         _serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
             let _ = self.event_tx.send(CompositorEvent::StartResize {
                 window_id,
@@ -930,7 +929,7 @@ impl XdgShellHandler for AppState {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
         });
@@ -944,7 +943,7 @@ impl XdgShellHandler for AppState {
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Maximized);
         });
@@ -958,7 +957,7 @@ impl XdgShellHandler for AppState {
     }
 
     fn minimize_request(&mut self, surface: ToplevelSurface) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
             let _ = self
                 .event_tx
@@ -971,7 +970,7 @@ impl XdgShellHandler for AppState {
         surface: ToplevelSurface,
         _output: Option<wl_output::WlOutput>,
     ) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
         });
@@ -985,7 +984,7 @@ impl XdgShellHandler for AppState {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
         });
@@ -1005,7 +1004,7 @@ impl XdgShellHandler for AppState {
         _serial: Serial,
         location: Point<i32, Logical>,
     ) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
             let (gx, gy) = self
                 .windows
@@ -1022,11 +1021,11 @@ impl XdgShellHandler for AppState {
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         let window_id = self.alloc_window_id();
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
 
         let parent_id = surface
             .get_parent_surface()
-            .and_then(|p| self.surface_to_window.get(&p.id().protocol_id()).copied())
+            .and_then(|p| self.surface_to_window.get(&p.id()).copied())
             .unwrap_or(1);
 
         let geo = positioner.get_geometry();
@@ -1036,7 +1035,7 @@ impl XdgShellHandler for AppState {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface.clone()));
         let _ = surface.send_configure();
 
-        self.surface_to_window.insert(surf_id, window_id);
+        self.surface_to_window.insert(surf_id.clone(), window_id);
         self.popup_windows.insert(
             window_id,
             TrackedPopup {
@@ -1052,7 +1051,7 @@ impl XdgShellHandler for AppState {
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         self.surface_buffers.remove(&surf_id);
         if let Some(window_id) = self.surface_to_window.remove(&surf_id) {
             if let Some(popup) = self.popup_windows.remove(&window_id) {
@@ -1079,7 +1078,7 @@ impl XdgShellHandler for AppState {
         });
         surface.send_repositioned(token);
 
-        let surf_id = surface.wl_surface().id().protocol_id();
+        let surf_id = surface.wl_surface().id();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
             if let Some(popup) = self.popup_windows.get_mut(&window_id) {
                 popup.geo = geo;
@@ -1228,7 +1227,7 @@ impl XdgDecorationHandler for AppState {
         });
         toplevel.send_pending_configure();
 
-        let surf_id = toplevel.wl_surface().id().protocol_id();
+        let surf_id = toplevel.wl_surface().id();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
             let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
                 window_id,
