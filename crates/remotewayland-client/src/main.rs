@@ -1,27 +1,35 @@
 //! RemoteWayland client entrypoint.
 //!
-//! Connects to a RemoteWayland server over QUIC, renders rootless remote windows
-//! and native `xdg_popup`s via `smithay-client-toolkit`, decodes video via GStreamer,
-//! and bridges local PipeWire audio.
+//! Connects to a RemoteWayland server over QUIC (directly or SSH-bootstrapped),
+//! renders rootless remote windows & native `xdg_popup`s via `smithay-client-toolkit`,
+//! bridges local PipeWire audio, and supports remote PTYs + GTK4 launcher.
 
 mod audio;
+mod hosts;
+mod launcher;
 mod media;
+mod pty;
 mod quic;
 mod window;
 
 use std::net::SocketAddr;
 
-use anyhow::{bail, Context, Result};
-use clap::Parser;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use remotewayland_proto::ControlMessage;
 use tokio::sync::mpsc;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
+use crate::hosts::{parse_uri, ssh_bootstrap};
 use crate::window::ClientUiEvent;
 
 #[derive(Debug, Parser)]
 #[command(name = "remotewayland-client", about = "RemoteWayland client")]
 struct Cli {
+    #[command(subcommand)]
+    subcommand: Option<ClientSubcommand>,
+
     /// Connection URI printed by remotewayland-server (remotewayland://host:port?fp=...&token=...).
     #[arg(long)]
     uri: Option<String>,
@@ -39,25 +47,116 @@ struct Cli {
     token: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum ClientSubcommand {
+    /// Connect to a remote host or local user via SSH (`ssh <target> remotewayland-server attach`).
+    Connect {
+        /// SSH target (`user@host`, `otheruser@localhost`, etc.).
+        target: String,
+
+        /// Open a remote terminal (PTY over QUIC, no Wayland/PipeWire needed) instead of GUI session.
+        #[arg(long)]
+        terminal: bool,
+
+        /// Remote path to `remotewayland-server` binary.
+        #[arg(long)]
+        server_bin: Option<String>,
+
+        /// Remote QUIC UDP port to bind if starting a new server daemon.
+        #[arg(long, default_value_t = 7443)]
+        port: u16,
+
+        /// Disable PipeWire audio bridging.
+        #[arg(long)]
+        no_audio: bool,
+
+        /// Optional remote GUI application command to launch immediately upon connecting.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+
+    /// Attach current terminal's stdin/stdout to a remote PTY over QUIC.
+    PtyAttach {
+        /// Connection URI printed by remotewayland-server.
+        #[arg(long)]
+        uri: String,
+
+        /// Optional command to run instead of interactive `$SHELL`.
+        #[arg(long)]
+        command: Option<String>,
+    },
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
     let cli = Cli::parse();
-    let (server, fingerprint, token) = if let Some(uri) = cli.uri {
-        parse_uri(&uri)?
-    } else {
-        (
-            cli.server.context("--server or --uri is required")?,
-            cli.fingerprint
-                .context("--fingerprint or --uri is required")?,
-            cli.token.context("--token or --uri is required")?,
-        )
-    };
 
+    match cli.subcommand {
+        Some(ClientSubcommand::PtyAttach { uri, command }) => {
+            let (server, fingerprint, token) = parse_uri(&uri)?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            let code = rt.block_on(pty::run_pty_attach(server, fingerprint, token, command))?;
+            std::process::exit(code);
+        }
+        Some(ClientSubcommand::Connect {
+            target,
+            terminal,
+            server_bin,
+            port,
+            no_audio,
+            command,
+        }) => {
+            let uri = ssh_bootstrap(&target, server_bin.as_deref(), port)?;
+            if terminal {
+                let cmd_str = if command.is_empty() {
+                    None
+                } else {
+                    Some(command.join(" "))
+                };
+                return pty::spawn_local_terminal_pty(&uri, cmd_str.as_deref());
+            }
+            let (server, fingerprint, token) = parse_uri(&uri)?;
+            let initial_exec = if command.is_empty() {
+                None
+            } else {
+                Some(command.join(" "))
+            };
+            run_gui_session(server, fingerprint, token, !no_audio, initial_exec)
+        }
+        None => {
+            if let Some(uri) = cli.uri {
+                let (server, fingerprint, token) = parse_uri(&uri)?;
+                run_gui_session(server, fingerprint, token, true, None)
+            } else if let (Some(server), Some(fp), Some(token)) =
+                (cli.server, cli.fingerprint, cli.token)
+            {
+                run_gui_session(server, fp, token, true, None)
+            } else {
+                launcher::run_launcher()
+            }
+        }
+    }
+}
+
+fn run_gui_session(
+    server: SocketAddr,
+    fingerprint: String,
+    token: String,
+    enable_audio: bool,
+    initial_exec: Option<String>,
+) -> Result<()> {
     let (ui_tx, ui_rx) = window::create_ui_channel();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+
+    if let Some(exec) = initial_exec {
+        let _ = ctrl_tx.send(ControlMessage::LaunchApp { exec });
+    }
 
     std::thread::Builder::new()
         .name("rw-client-net".into())
@@ -67,8 +166,16 @@ fn main() -> Result<()> {
                 .build()
                 .expect("failed to build tokio runtime");
             rt.block_on(async move {
-                if let Err(err) =
-                    quic::run_client(server, fingerprint, token, ui_tx.clone(), ctrl_rx).await
+                if let Err(err) = quic::run_client(
+                    server,
+                    fingerprint,
+                    token,
+                    enable_audio,
+                    ui_tx.clone(),
+                    ctrl_rx,
+                    None,
+                )
+                .await
                 {
                     error!(error = %err, "QUIC client exited with error");
                     let _ = ui_tx.send(ClientUiEvent::Disconnected);
@@ -78,31 +185,4 @@ fn main() -> Result<()> {
         .context("failed to spawn client network thread")?;
 
     window::run_event_loop(ui_rx, ctrl_tx)
-}
-
-fn parse_uri(uri: &str) -> Result<(SocketAddr, String, String)> {
-    let rest = uri
-        .strip_prefix("remotewayland://")
-        .context("URI must start with remotewayland://")?;
-    let (addr_str, query) = rest
-        .split_once('?')
-        .context("URI must include ?fp=...&token=...")?;
-    let addr: SocketAddr = addr_str.parse().context("invalid server socket address")?;
-
-    let mut fp = None;
-    let mut token = None;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            match k {
-                "fp" => fp = Some(v.to_string()),
-                "token" => token = Some(v.to_string()),
-                _ => {}
-            }
-        }
-    }
-
-    match (fp, token) {
-        (Some(fp), Some(token)) => Ok((addr, fp, token)),
-        _ => bail!("URI missing fp or token query parameter"),
-    }
 }

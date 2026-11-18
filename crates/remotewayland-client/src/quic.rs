@@ -9,7 +9,7 @@ use quinn::{ClientConfig, Endpoint, TransportConfig};
 use remotewayland_proto::{
     read_audio_packet, read_control_message, read_stream_header, read_video_frame,
     write_audio_packet, write_control_message, write_stream_header, AudioPacketHeader,
-    ControlMessage, StreamHeader, VideoCodec, WindowId, PROTOCOL_VERSION,
+    ControlMessage, RemoteAppEntry, StreamHeader, VideoCodec, WindowId, PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -87,14 +87,13 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-/// Connect to the RemoteWayland server, verify its TLS fingerprint, and run the session loops.
-pub async fn run_client(
+/// Establish a pinned QUIC connection and perform the `AuthRequest`/`AuthResponse` handshake.
+pub async fn connect_and_auth(
     server_addr: SocketAddr,
     fingerprint_sha256: String,
     token: String,
-    ui_tx: UiSender,
-    mut ctrl_rx: mpsc::UnboundedReceiver<ControlMessage>,
-) -> Result<()> {
+    enable_audio_bridge: bool,
+) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream)> {
     let verifier = Arc::new(PinnedCertVerifier::new(fingerprint_sha256));
     let mut rustls_config = rustls::ClientConfig::builder()
         .dangerous()
@@ -129,7 +128,7 @@ pub async fn run_client(
             protocol_version: PROTOCOL_VERSION,
             token,
             supported_codecs: vec![VideoCodec::Lz4Delta],
-            enable_audio_bridge: true,
+            enable_audio_bridge,
         },
     )
     .await?;
@@ -154,6 +153,22 @@ pub async fn run_client(
         }
         other => bail!("unexpected auth response: {other:?}"),
     }
+
+    Ok((conn, send, recv))
+}
+
+/// Connect to the RemoteWayland server, verify its TLS fingerprint, and run the session loops.
+pub async fn run_client(
+    server_addr: SocketAddr,
+    fingerprint_sha256: String,
+    token: String,
+    enable_audio_bridge: bool,
+    ui_tx: UiSender,
+    mut ctrl_rx: mpsc::UnboundedReceiver<ControlMessage>,
+    app_tx: Option<mpsc::UnboundedSender<Vec<RemoteAppEntry>>>,
+) -> Result<()> {
+    let (conn, mut send, mut recv) =
+        connect_and_auth(server_addr, fingerprint_sha256, token, enable_audio_bridge).await?;
 
     // Task: forward local winit input/resize/close messages to server control stream.
     let writer_task = tokio::spawn(async move {
@@ -373,6 +388,11 @@ pub async fn run_client(
             }
             ControlMessage::ClipboardText { text } => {
                 let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
+            }
+            ControlMessage::AppList { apps } => {
+                if let Some(tx) = &app_tx {
+                    let _ = tx.send(apps);
+                }
             }
             other => {
                 info!(?other, "received control event from server");

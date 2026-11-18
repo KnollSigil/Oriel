@@ -33,6 +33,36 @@ pub enum StreamHeader {
     AudioCapture,
 }
 
+/// Identifies the role of a newly opened secondary bidirectional QUIC stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BidiStreamHeader {
+    /// Remote PTY terminal session (zero Wayland/PipeWire required on server).
+    Pty {
+        cols: u16,
+        rows: u16,
+        command: Option<String>,
+    },
+}
+
+/// Framed messages exchanged over a bidirectional PTY QUIC stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PtyMessage {
+    Data(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+    Exit(i32),
+}
+
+/// Metadata + optional icon bytes for a discovered remote `.desktop` application.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAppEntry {
+    pub id: String,
+    pub name: String,
+    pub exec: String,
+    pub categories: Vec<String>,
+    pub icon_mime: Option<String>,
+    pub icon_data: Vec<u8>,
+}
+
 /// Bidirectional control-stream messages (QUIC stream 0).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
@@ -168,6 +198,17 @@ pub enum ControlMessage {
         visible: bool,
         shape_name: String,
     },
+
+    /// Client -> Server: request list of discovered `.desktop` applications.
+    ListApps,
+    /// Server -> Client: list of discovered `.desktop` applications with optional icons.
+    AppList {
+        apps: Vec<RemoteAppEntry>,
+    },
+    /// Client -> Server: launch a remote GUI application inside the headless Wayland session.
+    LaunchApp {
+        exec: String,
+    },
 }
 
 /// Header preceding each encoded video access unit on a per-window video stream.
@@ -241,6 +282,62 @@ pub async fn read_stream_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
     bincode::deserialize(&buf).context("failed to deserialize StreamHeader")
+}
+
+/// Write a `BidiStreamHeader` at the start of a secondary bidirectional QUIC stream.
+pub async fn write_bidi_stream_header<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    header: &BidiStreamHeader,
+) -> Result<()> {
+    let encoded = bincode::serialize(header).context("failed to serialize BidiStreamHeader")?;
+    let len = u32::try_from(encoded.len()).context("bidi stream header length overflow")?;
+    writer.write_u32(len).await?;
+    writer.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Read a `BidiStreamHeader` from the start of a secondary bidirectional QUIC stream.
+pub async fn read_bidi_stream_header<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<BidiStreamHeader> {
+    let len = reader.read_u32().await? as usize;
+    if len > 16 * 1024 {
+        bail!("bidi stream header too large: {len}");
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    bincode::deserialize(&buf).context("failed to deserialize BidiStreamHeader")
+}
+
+/// Write a length-prefixed `PtyMessage` to a PTY QUIC stream.
+pub async fn write_pty_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    msg: &PtyMessage,
+) -> Result<()> {
+    let encoded = bincode::serialize(msg).context("failed to serialize PtyMessage")?;
+    if encoded.len() > MAX_CONTROL_FRAME_BYTES {
+        bail!("pty message exceeds max frame size: {}", encoded.len());
+    }
+    let len = u32::try_from(encoded.len()).context("pty frame length overflow")?;
+    writer.write_u32(len).await?;
+    writer.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed `PtyMessage` from a PTY QUIC stream.
+pub async fn read_pty_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<PtyMessage>> {
+    let len = match reader.read_u32().await {
+        Ok(len) => len as usize,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if len > MAX_CONTROL_FRAME_BYTES {
+        bail!("incoming pty message exceeds max frame size: {len}");
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    let msg = bincode::deserialize(&buf).context("failed to deserialize PtyMessage")?;
+    Ok(Some(msg))
 }
 
 /// Write a `VideoFrameHeader` followed by its encoded payload bytes.

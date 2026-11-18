@@ -1,16 +1,17 @@
 //! QUIC server transport and ephemeral TLS/token authentication.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use quinn::{Endpoint, SendStream, ServerConfig, TransportConfig};
 use remotewayland_proto::{
-    read_audio_packet, read_control_message, read_stream_header, write_audio_packet,
-    write_control_message, write_stream_header, write_video_frame, AudioPacketHeader,
-    ControlMessage, StreamHeader, VideoCodec, VideoFrameHeader, WindowId, PROTOCOL_VERSION,
+    read_audio_packet, read_bidi_stream_header, read_control_message, read_stream_header,
+    write_audio_packet, write_control_message, write_stream_header, write_video_frame,
+    AudioPacketHeader, BidiStreamHeader, ControlMessage, StreamHeader, VideoCodec,
+    VideoFrameHeader, WindowId, PROTOCOL_VERSION,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{broadcast, mpsc};
@@ -20,15 +21,24 @@ use crate::audio::{start_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use crate::media::VideoEncoder;
 
-/// Holds the ephemeral TLS certificate fingerprint and session token.
+/// Holds the ephemeral TLS certificate fingerprint and valid session tokens.
 pub struct EphemeralCredentials {
     pub server_config: ServerConfig,
     pub cert_sha256_hex: String,
-    pub token: String,
+    pub valid_tokens: Arc<Mutex<HashSet<String>>>,
+}
+
+impl EphemeralCredentials {
+    /// Add a newly minted session token to the accepted set.
+    pub fn add_token(&self, token: String) {
+        if let Ok(mut set) = self.valid_tokens.lock() {
+            set.insert(token);
+        }
+    }
 }
 
 /// Generate a self-signed TLS 1.3 certificate and ephemeral session token.
-pub fn generate_ephemeral_credentials(token: String) -> Result<EphemeralCredentials> {
+pub fn generate_ephemeral_credentials(initial_token: String) -> Result<EphemeralCredentials> {
     let cert = rcgen::generate_simple_self_signed(vec!["remotewayland.local".to_string()])
         .context("failed to generate self-signed TLS certificate")?;
     let cert_der = CertificateDer::from(cert.cert);
@@ -50,10 +60,13 @@ pub fn generate_ephemeral_credentials(token: String) -> Result<EphemeralCredenti
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     server_config.transport_config(Arc::new(transport));
 
+    let mut tokens = HashSet::new();
+    tokens.insert(initial_token);
+
     Ok(EphemeralCredentials {
         server_config,
         cert_sha256_hex,
-        token,
+        valid_tokens: Arc::new(Mutex::new(tokens)),
     })
 }
 
@@ -63,15 +76,29 @@ pub async fn run_server(
     creds: EphemeralCredentials,
     comp_handle: CompositorHandle,
     mut event_rx: mpsc::UnboundedReceiver<CompositorEvent>,
+    bound_addr_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    quiet: bool,
 ) -> Result<()> {
     let endpoint = Endpoint::server(creds.server_config, listen_addr)
         .with_context(|| format!("failed to bind QUIC endpoint on {listen_addr}"))?;
+    let actual_addr = endpoint.local_addr().unwrap_or(listen_addr);
+    if let Some(tx) = bound_addr_tx {
+        let _ = tx.send(actual_addr);
+    }
 
-    info!(%listen_addr, cert_sha256 = %creds.cert_sha256_hex, "RemoteWayland server listening");
-    println!(
-        "remotewayland://{}?fp={}&token={}",
-        listen_addr, creds.cert_sha256_hex, creds.token
-    );
+    info!(%actual_addr, cert_sha256 = %creds.cert_sha256_hex, "RemoteWayland server listening");
+    if !quiet {
+        let first_token = creds
+            .valid_tokens
+            .lock()
+            .ok()
+            .and_then(|s| s.iter().next().cloned())
+            .unwrap_or_default();
+        println!(
+            "remotewayland://{}?fp={}&token={}",
+            actual_addr, creds.cert_sha256_hex, first_token
+        );
+    }
 
     let (bcast_tx, _) = broadcast::channel::<CompositorEvent>(256);
     let bcast_tx_clone = bcast_tx.clone();
@@ -81,13 +108,13 @@ pub async fn run_server(
         }
     });
 
-    let expected_token = Arc::new(creds.token);
+    let valid_tokens = Arc::clone(&creds.valid_tokens);
     while let Some(incoming) = endpoint.accept().await {
-        let token = Arc::clone(&expected_token);
+        let tokens = Arc::clone(&valid_tokens);
         let cmd_tx = comp_handle.cmd_tx.clone();
         let ev_rx = bcast_tx.subscribe();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(incoming, &token, cmd_tx, ev_rx).await {
+            if let Err(err) = handle_connection(incoming, tokens, cmd_tx, ev_rx).await {
                 warn!(error = %err, "client connection ended with error");
             }
         });
@@ -98,7 +125,7 @@ pub async fn run_server(
 
 async fn handle_connection(
     incoming: quinn::Incoming,
-    expected_token: &str,
+    valid_tokens: Arc<Mutex<HashSet<String>>>,
     cmd_tx: calloop::channel::Sender<CompositorCommand>,
     mut ev_rx: broadcast::Receiver<CompositorEvent>,
 ) -> Result<()> {
@@ -135,7 +162,11 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            if token != expected_token {
+            let token_valid = valid_tokens
+                .lock()
+                .map(|s| s.contains(&token))
+                .unwrap_or(false);
+            if !token_valid {
                 write_control_message(
                     &mut send,
                     &ControlMessage::AuthResponse {
@@ -177,6 +208,30 @@ async fn handle_connection(
             return Ok(());
         }
     };
+
+    // Accept secondary bidirectional QUIC streams (e.g., remote PTYs).
+    let bidi_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Ok((send_bi, mut recv_bi)) = bidi_conn.accept_bi().await {
+            tokio::spawn(async move {
+                match read_bidi_stream_header(&mut recv_bi).await {
+                    Ok(BidiStreamHeader::Pty {
+                        cols,
+                        rows,
+                        command,
+                    }) => {
+                        if let Err(err) =
+                            crate::pty::handle_pty_stream(send_bi, recv_bi, cols, rows, command)
+                                .await
+                        {
+                            warn!(error = %err, "PTY stream error");
+                        }
+                    }
+                    Err(err) => warn!(error = %err, "failed to read BidiStreamHeader"),
+                }
+            });
+        }
+    });
 
     // Start bidirectional PipeWire <-> Opus audio bridge if requested.
     if enable_audio_bridge {
@@ -393,6 +448,15 @@ async fn handle_connection(
                     }
                     Some(ControlMessage::KeyEvent { window_id, keycode, pressed }) => {
                         let _ = cmd_tx.send(CompositorCommand::KeyEvent { window_id, keycode, pressed });
+                    }
+                    Some(ControlMessage::ListApps) => {
+                        let apps = tokio::task::spawn_blocking(crate::apps::discover_apps)
+                            .await
+                            .unwrap_or_default();
+                        write_control_message(&mut send, &ControlMessage::AppList { apps }).await?;
+                    }
+                    Some(ControlMessage::LaunchApp { exec }) => {
+                        let _ = cmd_tx.send(CompositorCommand::LaunchApp { exec });
                     }
                     Some(other) => {
                         info!(?other, "received control message");

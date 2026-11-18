@@ -181,6 +181,9 @@ pub enum CompositorCommand {
     SetClipboardText {
         text: String,
     },
+    LaunchApp {
+        exec: String,
+    },
     SyncWindows,
 }
 
@@ -232,6 +235,7 @@ struct TrackedPopup {
 #[allow(dead_code)]
 struct AppState {
     display_handle: DisplayHandle,
+    socket_name: OsString,
     compositor_state: CompositorState,
     shm_state: ShmState,
     xdg_shell_state: XdgShellState,
@@ -517,6 +521,9 @@ impl AppState {
                     ],
                     (),
                 );
+            }
+            CompositorCommand::LaunchApp { exec } => {
+                spawn_gui_shell(&self.socket_name, &exec);
             }
             CompositorCommand::SyncWindows => {
                 for tracked in self.windows.values() {
@@ -1355,8 +1362,14 @@ fn run_compositor_loop(
     let mut space = Space::default();
     space.map_output(&output, (0, 0));
 
+    let socket_source =
+        ListeningSocketSource::new_auto().context("failed to bind Wayland listening socket")?;
+    let socket_name = socket_source.socket_name().to_os_string();
+    info!(?socket_name, "headless Wayland compositor listening");
+
     let mut state = AppState {
         display_handle: dh.clone(),
+        socket_name: socket_name.clone(),
         compositor_state,
         shm_state,
         xdg_shell_state,
@@ -1380,11 +1393,6 @@ fn run_compositor_loop(
         popup_windows: HashMap::new(),
         event_tx,
     };
-
-    let socket_source =
-        ListeningSocketSource::new_auto().context("failed to bind Wayland listening socket")?;
-    let socket_name = socket_source.socket_name().to_os_string();
-    info!(?socket_name, "headless Wayland compositor listening");
 
     event_loop
         .handle()
@@ -1426,23 +1434,7 @@ fn run_compositor_loop(
     let _ = ready_tx.send(Ok(socket_name.clone()));
 
     if !command.is_empty() {
-        crate::audio::ensure_virtual_audio_devices();
-        let mut proc = Command::new(&command[0]);
-        proc.args(&command[1..])
-            .env("WAYLAND_DISPLAY", &socket_name)
-            .env("PULSE_SINK", crate::audio::VIRTUAL_SINK_NAME)
-            .env(
-                "PULSE_SOURCE",
-                format!("{}.monitor", crate::audio::VIRTUAL_MIC_NAME),
-            )
-            .env("GDK_BACKEND", "wayland")
-            .env("QT_QPA_PLATFORM", "wayland")
-            .env("MOZ_ENABLE_WAYLAND", "1")
-            .env("SDL_VIDEODRIVER", "wayland");
-        match proc.spawn() {
-            Ok(child) => info!(pid = child.id(), cmd = ?command, "launched target application"),
-            Err(err) => error!(error = %err, cmd = ?command, "failed to launch target application"),
-        }
+        spawn_gui_command(&socket_name, &command);
     }
 
     loop {
@@ -1468,6 +1460,41 @@ fn run_compositor_loop(
         state.display_handle.flush_clients()?;
         state.popups.cleanup();
     }
+}
+
+fn spawn_gui_command(socket_name: &OsString, command: &[String]) {
+    crate::audio::ensure_virtual_audio_devices();
+    let mut proc = Command::new(&command[0]);
+    proc.args(&command[1..]);
+    apply_gui_env(&mut proc, socket_name);
+    match proc.spawn() {
+        Ok(child) => info!(pid = child.id(), cmd = ?command, "launched target application"),
+        Err(err) => error!(error = %err, cmd = ?command, "failed to launch target application"),
+    }
+}
+
+fn spawn_gui_shell(socket_name: &OsString, exec: &str) {
+    crate::audio::ensure_virtual_audio_devices();
+    let mut proc = Command::new("/bin/sh");
+    proc.arg("-c").arg(exec);
+    apply_gui_env(&mut proc, socket_name);
+    match proc.spawn() {
+        Ok(child) => info!(pid = child.id(), exec, "launched remote application"),
+        Err(err) => error!(error = %err, exec, "failed to launch remote application"),
+    }
+}
+
+fn apply_gui_env(proc: &mut Command, socket_name: &OsString) {
+    proc.env("WAYLAND_DISPLAY", socket_name)
+        .env("PULSE_SINK", crate::audio::VIRTUAL_SINK_NAME)
+        .env(
+            "PULSE_SOURCE",
+            format!("{}.monitor", crate::audio::VIRTUAL_MIC_NAME),
+        )
+        .env("GDK_BACKEND", "wayland")
+        .env("QT_QPA_PLATFORM", "wayland")
+        .env("MOZ_ENABLE_WAYLAND", "1")
+        .env("SDL_VIDEODRIVER", "wayland");
 }
 
 fn blit_rgba_over(
