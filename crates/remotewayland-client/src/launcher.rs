@@ -22,7 +22,7 @@ mod cli_ui {
     use tokio::sync::mpsc;
 
     use crate::hosts::{load_hosts, parse_uri, save_hosts, ssh_bootstrap, HostProfile};
-    use crate::pty::spawn_local_terminal_pty;
+    use crate::pty::{pty_tunnel_socket_path, spawn_local_terminal_pty_socket};
     use crate::quic::{self, LauncherNetEvent};
     use crate::window::{self, ClientUiEvent};
 
@@ -74,12 +74,14 @@ mod cli_ui {
             target.port,
         )?;
         let (server, fp, token) = parse_uri(&uri)?;
+        let pty_sock = pty_tunnel_socket_path(&target.ssh_target)?;
 
         let (ui_tx, ui_rx) = window::create_ui_channel();
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         let (net_tx, mut net_rx) = mpsc::unbounded_channel::<LauncherNetEvent>();
 
         let ui_tx_net = ui_tx.clone();
+        let pty_sock_net = pty_sock.clone();
         std::thread::Builder::new()
             .name("rw-client-net".into())
             .spawn(move || {
@@ -96,6 +98,7 @@ mod cli_ui {
                         ui_tx_net.clone(),
                         ctrl_rx,
                         Some(net_tx),
+                        Some(pty_sock_net),
                     )
                     .await
                     {
@@ -145,7 +148,7 @@ mod cli_ui {
             }
             match cmd.trim() {
                 "t" => {
-                    if let Err(err) = spawn_local_terminal_pty(&uri, None) {
+                    if let Err(err) = spawn_local_terminal_pty_socket(&pty_sock, None, None) {
                         eprintln!("Failed to open remote terminal: {err}");
                     }
                 }
@@ -209,18 +212,20 @@ mod cli_ui {
 mod gtk4_ui {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::process::Child;
     use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     use anyhow::Result;
     use gtk4::gdk_pixbuf::PixbufLoader;
     use gtk4::glib;
     use gtk4::prelude::*;
-    use remotewayland_proto::{ControlMessage, LaunchState, RemoteAppEntry};
+    use remotewayland_proto::{ControlMessage, LaunchState, RemoteAppEntry, PTY_LAUNCH_ID_BASE};
     use tokio::sync::mpsc;
 
     use crate::hosts::{load_hosts, parse_uri, save_hosts, ssh_bootstrap, HostProfile};
-    use crate::pty::spawn_local_terminal_pty;
+    use crate::pty::{pty_tunnel_socket_path, spawn_local_terminal_pty_socket};
     use crate::quic::{self, LauncherNetEvent};
     use crate::window::{self, ClientUiEvent};
 
@@ -242,7 +247,7 @@ mod gtk4_ui {
     struct HostSession {
         status: ConnStatus,
         error: Option<String>,
-        uri: Option<String>,
+        pty_socket: Option<PathBuf>,
         ctrl_tx: Option<mpsc::UnboundedSender<ControlMessage>>,
         ui_tx: Option<window::UiSender>,
         net_rx: Option<mpsc::UnboundedReceiver<LauncherNetEvent>>,
@@ -251,10 +256,13 @@ mod gtk4_ui {
         programs: Vec<TrackedProgram>,
         rtt_ms: Option<u32>,
         congested: bool,
+        auto_reconnect: bool,
+        reconnect_at: Option<Instant>,
+        reconnect_backoff_secs: u64,
     }
 
     struct ConnectResult {
-        uri: String,
+        pty_socket: PathBuf,
         ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
         ui_tx: window::UiSender,
         net_rx: mpsc::UnboundedReceiver<LauncherNetEvent>,
@@ -751,6 +759,24 @@ mod gtk4_ui {
                     lbl.set_hexpand(true);
                     row.append(&lbl);
 
+                    if (prog.launch_id & PTY_LAUNCH_ID_BASE) != 0
+                        && prog.name.ends_with("(detached)")
+                    {
+                        if let Some(sock_path) = sess.pty_socket.clone() {
+                            let pty_id = prog.launch_id & !PTY_LAUNCH_ID_BASE;
+                            let reattach_btn = gtk4::Button::with_label("↩");
+                            reattach_btn.set_tooltip_text(Some("Reattach detached terminal"));
+                            reattach_btn.connect_clicked(move |_| {
+                                let _ = spawn_local_terminal_pty_socket(
+                                    &sock_path,
+                                    Some(pty_id),
+                                    None,
+                                );
+                            });
+                            row.append(&reattach_btn);
+                        }
+                    }
+
                     let kill_label = if prog.term_sent { "Kill" } else { "×" };
                     let kill_btn = gtk4::Button::with_label(kill_label);
                     let target_c = target.clone();
@@ -906,26 +932,36 @@ mod gtk4_ui {
             })
         };
 
-        let start_connect: Rc<dyn Fn(HostProfile)> = {
+        let start_connect_inner: Rc<dyn Fn(HostProfile, bool)> = {
             let state = Rc::clone(&state);
             let refresh_status_bar = Rc::clone(&refresh_status_bar);
-            Rc::new(move |profile: HostProfile| {
+            Rc::new(move |profile: HostProfile, is_auto_reconnect: bool| {
                 let target = profile.ssh_target.clone();
                 {
                     let mut st = state.borrow_mut();
-                    st.active_target = Some(target.clone());
-                    if let Some(existing) = st.sessions.get(&target) {
+                    if !is_auto_reconnect {
+                        st.active_target = Some(target.clone());
+                    }
+                    let (prev_backoff, prev_auto) = if let Some(existing) = st.sessions.get(&target)
+                    {
                         if existing.status != ConnStatus::Disconnected {
                             return;
                         }
-                    }
+                        (existing.reconnect_backoff_secs, existing.auto_reconnect)
+                    } else {
+                        (2, false)
+                    };
                     let (tx, rx) = std::sync::mpsc::channel::<Result<ConnectResult, String>>();
                     st.sessions.insert(
                         target.clone(),
                         HostSession {
                             status: ConnStatus::Connecting,
-                            error: None,
-                            uri: None,
+                            error: if is_auto_reconnect {
+                                Some("Reconnecting…".to_string())
+                            } else {
+                                None
+                            },
+                            pty_socket: None,
                             ctrl_tx: None,
                             ui_tx: None,
                             net_rx: None,
@@ -934,6 +970,9 @@ mod gtk4_ui {
                             programs: Vec::new(),
                             rtt_ms: None,
                             congested: false,
+                            auto_reconnect: if is_auto_reconnect { prev_auto } else { false },
+                            reconnect_at: None,
+                            reconnect_backoff_secs: if is_auto_reconnect { prev_backoff } else { 2 },
                         },
                     );
 
@@ -945,11 +984,13 @@ mod gtk4_ui {
                                 profile.port,
                             )?;
                             let (server, fp, token) = parse_uri(&uri)?;
+                            let pty_socket = pty_tunnel_socket_path(&profile.ssh_target)?;
                             let (ui_tx, ui_rx) = window::create_ui_channel();
                             let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
                             let (net_tx, net_rx) = mpsc::unbounded_channel();
 
                             let ui_tx_net = ui_tx.clone();
+                            let pty_sock_net = pty_socket.clone();
                             std::thread::spawn(move || {
                                 let rt = tokio::runtime::Builder::new_multi_thread()
                                     .enable_all()
@@ -964,6 +1005,7 @@ mod gtk4_ui {
                                         ui_tx_net.clone(),
                                         ctrl_rx,
                                         Some(net_tx.clone()),
+                                        Some(pty_sock_net),
                                     )
                                     .await
                                     {
@@ -983,7 +1025,7 @@ mod gtk4_ui {
 
                             let _ = ctrl_tx.send(ControlMessage::ListApps);
                             Ok(ConnectResult {
-                                uri,
+                                pty_socket,
                                 ctrl_tx,
                                 ui_tx,
                                 net_rx,
@@ -994,6 +1036,11 @@ mod gtk4_ui {
                 }
                 refresh_status_bar();
             })
+        };
+
+        let start_connect: Rc<dyn Fn(HostProfile)> = {
+            let inner = Rc::clone(&start_connect_inner);
+            Rc::new(move |profile: HostProfile| inner(profile, false))
         };
 
         let rebuild_sidebar: Rc<dyn Fn()> = {
@@ -1049,7 +1096,13 @@ mod gtk4_ui {
                     dc_btn.set_focus_on_click(false);
                     dc_btn.add_css_class("compact-btn");
                     dc_btn.set_tooltip_text(Some("Disconnect"));
-                    dc_btn.set_sensitive(status != ConnStatus::Disconnected);
+                    let dc_enabled = {
+                        let st = state_cb.borrow();
+                        st.sessions
+                            .get(&profile.ssh_target)
+                            .is_some_and(|s| s.status != ConnStatus::Disconnected || s.auto_reconnect)
+                    };
+                    dc_btn.set_sensitive(dc_enabled);
                     let dc_target = profile.ssh_target.clone();
                     let state_dc = Rc::clone(&state_cb);
                     let self_ref_dc = Rc::clone(&self_ref_clone);
@@ -1063,6 +1116,10 @@ mod gtk4_ui {
                                     let _ = tx.send(ClientUiEvent::Disconnected);
                                 }
                                 sess.status = ConnStatus::Disconnected;
+                                sess.auto_reconnect = false;
+                                sess.reconnect_at = None;
+                                sess.reconnect_backoff_secs = 2;
+                                sess.error = None;
                                 sess.ctrl_tx = None;
                                 sess.net_rx = None;
                                 sess.connect_rx = None;
@@ -1388,19 +1445,10 @@ mod gtk4_ui {
             move |_| {
                 {
                     let mut st = state.borrow_mut();
-                    let launch_id = st.next_launch_id;
-                    st.next_launch_id += 1;
                     if let Some(sess) = st.active_session_mut() {
-                        if let Some(uri) = sess.uri.clone() {
-                            if let Ok(child) = spawn_local_terminal_pty(&uri, None) {
-                                sess.programs.push(TrackedProgram {
-                                    launch_id,
-                                    name: "Terminal (PTY)".to_string(),
-                                    state: LaunchState::Running,
-                                    term_sent: false,
-                                    pty_child: Some(child),
-                                });
-                            }
+                        if let Some(sock_path) = sess.pty_socket.clone() {
+                            // Server PtyManager announces this persistent PTY via AppState.
+                            let _ = spawn_local_terminal_pty_socket(&sock_path, None, None);
                         }
                     }
                 }
@@ -1523,23 +1571,27 @@ mod gtk4_ui {
             }
         });
 
-        // Periodic 50ms poll for SSH connect results, QUIC LauncherNetEvents, and PTY exits
+        // Periodic 50ms poll for SSH connect results, QUIC LauncherNetEvents, auto-reconnect, and PTY exits
         glib::timeout_add_local(std::time::Duration::from_millis(50), {
             let state = Rc::clone(&state);
             let rebuild_sidebar = Rc::clone(&rebuild_sidebar);
             let rebuild_grid = Rc::clone(&rebuild_grid);
             let refresh_net_status = Rc::clone(&refresh_net_status);
             let refresh_programs_ui = Rc::clone(&refresh_programs_ui);
+            let start_connect_inner = Rc::clone(&start_connect_inner);
 
             move || {
                 let mut sidebar_dirty = false;
                 let mut grid_dirty = false;
                 let mut net_dirty = false;
                 let mut programs_dirty = false;
+                let mut profiles_to_reconnect: Vec<HostProfile> = Vec::new();
 
                 {
                     let mut st = state.borrow_mut();
                     let active_key = st.active_target.clone();
+                    let hosts_copy = st.hosts.clone();
+                    let now = Instant::now();
                     for (key, sess) in st.sessions.iter_mut() {
                         let is_active = active_key.as_deref() == Some(key.as_str());
 
@@ -1547,7 +1599,11 @@ mod gtk4_ui {
                             match rx.try_recv() {
                                 Ok(Ok(res)) => {
                                     sess.status = ConnStatus::Connected;
-                                    sess.uri = Some(res.uri);
+                                    sess.error = None;
+                                    sess.auto_reconnect = true;
+                                    sess.reconnect_at = None;
+                                    sess.reconnect_backoff_secs = 2;
+                                    sess.pty_socket = Some(res.pty_socket);
                                     sess.ctrl_tx = Some(res.ctrl_tx);
                                     sess.ui_tx = Some(res.ui_tx);
                                     sess.net_rx = Some(res.net_rx);
@@ -1559,7 +1615,14 @@ mod gtk4_ui {
                                 }
                                 Ok(Err(err)) => {
                                     sess.status = ConnStatus::Disconnected;
-                                    sess.error = Some(err);
+                                    if sess.auto_reconnect {
+                                        let delay = sess.reconnect_backoff_secs;
+                                        sess.reconnect_at = Some(now + Duration::from_secs(delay));
+                                        sess.reconnect_backoff_secs = (delay * 2).min(15);
+                                        sess.error = Some(format!("Reconnecting in {delay}s…"));
+                                    } else {
+                                        sess.error = Some(err);
+                                    }
                                     sidebar_dirty = true;
                                     if is_active {
                                         net_dirty = true;
@@ -1570,6 +1633,12 @@ mod gtk4_ui {
                                 }
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                                     sess.status = ConnStatus::Disconnected;
+                                    if sess.auto_reconnect {
+                                        let delay = sess.reconnect_backoff_secs;
+                                        sess.reconnect_at = Some(now + Duration::from_secs(delay));
+                                        sess.reconnect_backoff_secs = (delay * 2).min(15);
+                                        sess.error = Some(format!("Reconnecting in {delay}s…"));
+                                    }
                                     sidebar_dirty = true;
                                     if is_active {
                                         net_dirty = true;
@@ -1599,6 +1668,7 @@ mod gtk4_ui {
                                             .iter_mut()
                                             .find(|p| p.launch_id == launch_id)
                                         {
+                                            p.name = name;
                                             p.state = new_state;
                                         } else {
                                             sess.programs.push(TrackedProgram {
@@ -1622,11 +1692,20 @@ mod gtk4_ui {
                                     }
                                     LauncherNetEvent::Disconnected(err) => {
                                         sess.status = ConnStatus::Disconnected;
-                                        sess.error = err;
                                         sess.ctrl_tx = None;
                                         sess.rtt_ms = None;
                                         sess.congested = false;
                                         sess.programs.clear();
+                                        if sess.auto_reconnect {
+                                            let delay = sess.reconnect_backoff_secs;
+                                            sess.reconnect_at =
+                                                Some(now + Duration::from_secs(delay));
+                                            sess.reconnect_backoff_secs = (delay * 2).min(15);
+                                            sess.error =
+                                                Some(format!("Reconnecting in {delay}s…"));
+                                        } else {
+                                            sess.error = err;
+                                        }
                                         sidebar_dirty = true;
                                         if is_active {
                                             net_dirty = true;
@@ -1634,6 +1713,19 @@ mod gtk4_ui {
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        if sess.auto_reconnect
+                            && sess.status == ConnStatus::Disconnected
+                            && sess.connect_rx.is_none()
+                            && sess.reconnect_at.is_some_and(|t| now >= t)
+                        {
+                            sess.reconnect_at = None;
+                            if let Some(profile) =
+                                hosts_copy.iter().find(|h| h.ssh_target == *key).cloned()
+                            {
+                                profiles_to_reconnect.push(profile);
                             }
                         }
 
@@ -1649,6 +1741,11 @@ mod gtk4_ui {
                             programs_dirty = true;
                         }
                     }
+                }
+
+                for profile in profiles_to_reconnect {
+                    start_connect_inner(profile, true);
+                    sidebar_dirty = true;
                 }
 
                 if sidebar_dirty {

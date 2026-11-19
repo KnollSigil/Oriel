@@ -1,9 +1,11 @@
 //! Server-side isolated PipeWire + Opus audio bridge.
 //!
-//! Spawns a private, session-scoped `pipewire` + `wireplumber` + `pipewire-pulse`
-//! stack under `$XDG_RUNTIME_DIR/remotewayland-pw-<pid>` so remote GUI applications
-//! never touch the host user's desktop audio. Exposes native `pipewire-rs` virtual
-//! `Audio/Sink` and `Audio/Source` nodes compressed with 48kHz Opus.
+//! Spawns a private, session-scoped `pipewire` + virtual-only `wireplumber` +
+//! `pipewire-pulse` stack directly inside the isolated session `XDG_RUNTIME_DIR`
+//! so remote GUI applications (including Flatpaks) never touch the host user's
+//! desktop audio or physical ALSA/Bluetooth/camera hardware. Exposes native
+//! `pipewire-rs` virtual `Audio/Sink` and `Audio/Source` nodes compressed with
+//! 48kHz Opus.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -41,10 +43,27 @@ fn shared_mic_ringbuf() -> &'static Arc<Mutex<VecDeque<u8>>> {
 
 struct IsolatedPwEnv {
     runtime_dir: PathBuf,
-    _daemons: Mutex<Vec<Child>>,
+    daemons: Mutex<Vec<Child>>,
 }
 
 static ISOLATED_PW: OnceLock<std::result::Result<IsolatedPwEnv, String>> = OnceLock::new();
+
+/// Virtual-only WirePlumber 0.5 profile override: disables ALSA, Bluetooth,
+/// V4L2/libcamera, D-Bus device reservation, portal permissionstore, and
+/// persistent state files so the private session never touches host hardware.
+const WIREPLUMBER_VIRTUAL_CONF: &str = r#"wireplumber.profiles = {
+  main = {
+    inherits = [ base, mixin.systemwide-session, mixin.stateless ]
+    metadata.sm-settings = required
+    metadata.sm-objects = required
+    policy.standard = required
+    hardware.audio = disabled
+    hardware.bluetooth = disabled
+    hardware.video-capture = disabled
+    support.dbus = disabled
+  }
+}
+"#;
 
 /// Returns the isolated `PIPEWIRE_RUNTIME_DIR` path once initialized.
 pub fn isolated_pw_runtime_dir() -> Option<&'static Path> {
@@ -54,7 +73,8 @@ pub fn isolated_pw_runtime_dir() -> Option<&'static Path> {
         .map(|env| env.runtime_dir.as_path())
 }
 
-/// Ensures the isolated private PipeWire + WirePlumber + pipewire-pulse stack is running.
+/// Ensures the isolated private PipeWire + WirePlumber + pipewire-pulse stack is running
+/// inside the current isolated session `XDG_RUNTIME_DIR`.
 pub fn ensure_virtual_audio_devices() -> Result<()> {
     let res = ISOLATED_PW.get_or_init(init_isolated_pipewire);
     match res {
@@ -63,47 +83,83 @@ pub fn ensure_virtual_audio_devices() -> Result<()> {
     }
 }
 
-fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let runtime_dir = base.join(format!("remotewayland-pw-{}", std::process::id()));
-    let pulse_dir = runtime_dir.join("pulse");
+/// Terminate the isolated PipeWire/WirePlumber/pipewire-pulse child daemons on shutdown.
+pub fn shutdown_isolated_pipewire() {
+    if let Some(Ok(env)) = ISOLATED_PW.get() {
+        if let Ok(mut guard) = env.daemons.lock() {
+            for child in guard.iter_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            guard.clear();
+        }
+    }
+}
 
-    std::fs::create_dir_all(&pulse_dir)
+fn spawn_audio_daemon(
+    bin: &str,
+    runtime_dir: &Path,
+    pulse_dir: &Path,
+    wp_config_dir: Option<&Path>,
+) -> std::result::Result<Child, String> {
+    let mut cmd = Command::new(bin);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+        .env("PULSE_RUNTIME_PATH", pulse_dir)
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env_remove("DISPLAY")
+        .env_remove("XAUTHORITY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(wp_dir) = wp_config_dir {
+        cmd.env("WIREPLUMBER_CONFIG_DIR", wp_dir);
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn isolated {bin}: {e}"))
+}
+
+fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| "XDG_RUNTIME_DIR is not set for isolated PipeWire session".to_string())?;
+    let pulse_dir = runtime_dir.join("pulse");
+    let wp_config_dir = runtime_dir.join("wireplumber");
+    let wp_conf_d = wp_config_dir.join("wireplumber.conf.d");
+
+    crate::session::create_private_dir(&pulse_dir)
         .map_err(|e| format!("failed to create {}: {e}", pulse_dir.display()))?;
+    crate::session::create_private_dir(&wp_conf_d)
+        .map_err(|e| format!("failed to create {}: {e}", wp_conf_d.display()))?;
+
+    let wp_conf_path = wp_conf_d.join("99-remotewayland-virtual.conf");
+    std::fs::write(&wp_conf_path, WIREPLUMBER_VIRTUAL_CONF)
+        .map_err(|e| format!("failed to write {}: {e}", wp_conf_path.display()))?;
 
     // Point this process's libpipewire client connections at the isolated daemon.
     std::env::set_var("PIPEWIRE_RUNTIME_DIR", &runtime_dir);
     std::env::set_var("PULSE_RUNTIME_PATH", &pulse_dir);
 
     let mut daemons = Vec::new();
-    for bin in ["pipewire", "wireplumber", "pipewire-pulse"] {
-        let mut cmd = Command::new(bin);
-        cmd.env("PIPEWIRE_RUNTIME_DIR", &runtime_dir)
-            .env("PULSE_RUNTIME_PATH", &pulse_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to spawn isolated {bin}: {e}"))?;
-        daemons.push(child);
-    }
 
+    // 1. Start PipeWire first and wait for `pipewire-0` before launching
+    //    WirePlumber and pipewire-pulse to avoid startup races.
+    let mut pw_child = spawn_audio_daemon("pipewire", &runtime_dir, &pulse_dir, None)?;
     let pw_socket = runtime_dir.join("pipewire-0");
     let deadline = Instant::now() + Duration::from_secs(3);
     while !pw_socket.exists() {
+        if let Ok(Some(status)) = pw_child.try_wait() {
+            return Err(format!("isolated pipewire exited prematurely with {status}"));
+        }
         if Instant::now() >= deadline {
-            for child in &mut daemons {
-                let _ = child.kill();
-            }
+            let _ = pw_child.kill();
+            let _ = pw_child.wait();
             return Err(format!(
                 "timed out waiting for isolated PipeWire socket at {}",
                 pw_socket.display()
@@ -111,15 +167,45 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    daemons.push(pw_child);
+
+    // 2. Start virtual-only WirePlumber and pipewire-pulse.
+    match spawn_audio_daemon("wireplumber", &runtime_dir, &pulse_dir, Some(&wp_config_dir)) {
+        Ok(child) => daemons.push(child),
+        Err(err) => {
+            for child in &mut daemons {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+    }
+    match spawn_audio_daemon("pipewire-pulse", &runtime_dir, &pulse_dir, None) {
+        Ok(child) => daemons.push(child),
+        Err(err) => {
+            for child in &mut daemons {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+    }
+
+    // Best-effort wait for PulseAudio compat socket so apps launched immediately see it.
+    let pulse_socket = pulse_dir.join("native");
+    let pulse_deadline = Instant::now() + Duration::from_secs(2);
+    while !pulse_socket.exists() && Instant::now() < pulse_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     tracing::info!(
         runtime_dir = %runtime_dir.display(),
-        "isolated PipeWire + WirePlumber + pipewire-pulse session started"
+        "isolated virtual-only PipeWire + WirePlumber + pipewire-pulse session started"
     );
 
     Ok(IsolatedPwEnv {
         runtime_dir,
-        _daemons: Mutex::new(daemons),
+        daemons: Mutex::new(daemons),
     })
 }
 

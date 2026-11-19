@@ -1,6 +1,9 @@
 //! QUIC client transport with SHA-256 certificate fingerprint pinning.
 
+use std::fs::{self, Permissions};
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,7 +109,10 @@ pub async fn connect_and_auth(
         .context("failed to create QUIC client crypto config")?;
     let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
     let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.keep_alive_interval(Some(Duration::from_secs(3)));
+    if let Ok(idle) = Duration::from_secs(10).try_into() {
+        transport.max_idle_timeout(Some(idle));
+    }
     client_config.transport_config(Arc::new(transport));
 
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -184,9 +190,51 @@ pub async fn run_client(
     ui_tx: UiSender,
     mut ctrl_rx: mpsc::UnboundedReceiver<ControlMessage>,
     launcher_tx: Option<mpsc::UnboundedSender<LauncherNetEvent>>,
+    pty_socket_path: Option<PathBuf>,
 ) -> Result<()> {
     let (conn, mut send, mut recv) =
         connect_and_auth(server_addr, fingerprint_sha256, token, enable_audio_bridge).await?;
+
+    // Optional local 0600 Unix socket that tunnels `remotewayland-client pty-attach --socket <path>`
+    // directly over multiplexed QUIC bidirectional streams on this authenticated connection.
+    let pty_tunnel_task = if let Some(sock_path) = pty_socket_path.clone() {
+        let _ = fs::remove_file(&sock_path);
+        match tokio::net::UnixListener::bind(&sock_path) {
+            Ok(listener) => {
+                if let Err(err) = fs::set_permissions(&sock_path, Permissions::from_mode(0o600)) {
+                    warn!(path = %sock_path.display(), error = %err, "failed to chmod 0600 PTY tunnel socket");
+                }
+                info!(path = %sock_path.display(), "local PTY Unix tunnel listening (mode 0600)");
+                let tunnel_conn = conn.clone();
+                Some(tokio::spawn(async move {
+                    while let Ok((unix_stream, _)) = listener.accept().await {
+                        let c = tunnel_conn.clone();
+                        tokio::spawn(async move {
+                            let Ok((mut quic_send, mut quic_recv)) = c.open_bi().await else {
+                                warn!("failed to open QUIC bidi stream for tunneled PTY");
+                                return;
+                            };
+                            let (mut unix_read, mut unix_write) = unix_stream.into_split();
+                            let up = tokio::spawn(async move {
+                                let _ = tokio::io::copy(&mut unix_read, &mut quic_send).await;
+                                let _ = quic_send.finish();
+                            });
+                            let down = tokio::spawn(async move {
+                                let _ = tokio::io::copy(&mut quic_recv, &mut unix_write).await;
+                            });
+                            let _ = tokio::join!(up, down);
+                        });
+                    }
+                }))
+            }
+            Err(err) => {
+                warn!(path = %sock_path.display(), error = %err, "failed to bind local PTY tunnel socket");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let stats_task = launcher_tx.as_ref().map(|tx| {
         let stats_conn = conn.clone();
@@ -211,6 +259,7 @@ pub async fn run_client(
     });
 
     // Task: forward local winit input/resize/close messages to server control stream.
+    let (ctrl_closed_tx, mut ctrl_closed_rx) = tokio::sync::oneshot::channel::<()>();
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = ctrl_rx.recv().await {
             if let Err(err) = write_control_message(&mut send, &msg).await {
@@ -218,6 +267,7 @@ pub async fn run_client(
                 break;
             }
         }
+        let _ = ctrl_closed_tx.send(());
     });
 
     // On-demand host microphone capture: only opened when a remote app requests input audio.
@@ -362,6 +412,7 @@ pub async fn run_client(
 
     loop {
         let msg = tokio::select! {
+            _ = &mut ctrl_closed_rx => break,
             res = read_control_message(&mut recv) => match res? {
                 Some(m) => m,
                 None => break,
@@ -535,9 +586,16 @@ pub async fn run_client(
         }
     }
 
+    conn.close(0u32.into(), b"client disconnect");
     let _ = ui_tx.send(ClientUiEvent::Disconnected);
     if let Some(tx) = &launcher_tx {
         let _ = tx.send(LauncherNetEvent::Disconnected(None));
+    }
+    if let Some(t) = pty_tunnel_task {
+        t.abort();
+    }
+    if let Some(sock_path) = pty_socket_path {
+        let _ = fs::remove_file(&sock_path);
     }
     if let Some(t) = stats_task {
         t.abort();

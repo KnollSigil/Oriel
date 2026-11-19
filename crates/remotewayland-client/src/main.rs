@@ -83,11 +83,19 @@ enum ClientSubcommand {
         command: Vec<String>,
     },
 
-    /// Attach current terminal's stdin/stdout to a remote PTY over QUIC.
+    /// Attach current terminal's stdin/stdout to a remote PTY over a local Unix tunnel or QUIC.
     PtyAttach {
-        /// Connection URI printed by remotewayland-server.
+        /// Local Unix socket path exposed by a connected RemoteWayland client session.
         #[arg(long)]
-        uri: String,
+        socket: Option<std::path::PathBuf>,
+
+        /// Connection URI printed by remotewayland-server (direct QUIC mode if --socket is omitted).
+        #[arg(long)]
+        uri: Option<String>,
+
+        /// Reattach to an existing persistent server PTY by ID instead of starting a new shell.
+        #[arg(long)]
+        pty_id: Option<u64>,
 
         /// Optional command to run instead of interactive `$SHELL`.
         #[arg(long)]
@@ -103,13 +111,30 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
-        Some(ClientSubcommand::PtyAttach { uri, command }) => {
-            let (server, fingerprint, token) = parse_uri(&uri)?;
+        Some(ClientSubcommand::PtyAttach {
+            socket,
+            uri,
+            pty_id,
+            command,
+        }) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("failed to build tokio runtime")?;
-            let code = rt.block_on(pty::run_pty_attach(server, fingerprint, token, command))?;
+            let code = if let Some(sock_path) = socket {
+                rt.block_on(pty::run_pty_attach_socket(&sock_path, pty_id, command))?
+            } else if let Some(uri) = uri {
+                let (server, fingerprint, token) = parse_uri(&uri)?;
+                rt.block_on(pty::run_pty_attach(
+                    server,
+                    fingerprint,
+                    token,
+                    pty_id,
+                    command,
+                ))?
+            } else {
+                anyhow::bail!("pty-attach requires either --socket <path> or --uri <uri>");
+            };
             std::process::exit(code);
         }
         Some(ClientSubcommand::Connect {
@@ -138,17 +163,18 @@ fn main() -> Result<()> {
             } else {
                 Some(command.join(" "))
             };
-            run_gui_session(server, fingerprint, token, !no_audio, initial_exec)
+            let pty_sock = pty::pty_tunnel_socket_path(&target).ok();
+            run_gui_session(server, fingerprint, token, !no_audio, initial_exec, pty_sock)
         }
         None => {
             audio::set_mic_target(cli.mic);
             if let Some(uri) = cli.uri {
                 let (server, fingerprint, token) = parse_uri(&uri)?;
-                run_gui_session(server, fingerprint, token, true, None)
+                run_gui_session(server, fingerprint, token, true, None, None)
             } else if let (Some(server), Some(fp), Some(token)) =
                 (cli.server, cli.fingerprint, cli.token)
             {
-                run_gui_session(server, fp, token, true, None)
+                run_gui_session(server, fp, token, true, None, None)
             } else {
                 launcher::run_launcher()
             }
@@ -162,6 +188,7 @@ fn run_gui_session(
     token: String,
     enable_audio: bool,
     initial_exec: Option<String>,
+    pty_socket_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let (ui_tx, ui_rx) = window::create_ui_channel();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
@@ -190,6 +217,7 @@ fn run_gui_session(
                     ui_tx.clone(),
                     ctrl_rx,
                     None,
+                    pty_socket_path,
                 )
                 .await
                 {

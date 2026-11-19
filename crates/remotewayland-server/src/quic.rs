@@ -1,6 +1,6 @@
 //! QUIC server transport and ephemeral TLS/token authentication.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use remotewayland_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_stream_header,
     write_audio_packet, write_control_message, write_stream_header, write_video_frame,
     AudioPacketHeader, BidiStreamHeader, ControlMessage, StreamHeader, VideoCodec,
-    VideoFrameHeader, WindowId, PROTOCOL_VERSION,
+    VideoFrameHeader, WindowId, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{broadcast, mpsc};
@@ -21,24 +21,39 @@ use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use crate::media::VideoEncoder;
 
-/// Holds the ephemeral TLS certificate fingerprint and valid session tokens.
+/// Holds the ephemeral TLS certificate fingerprint and single-use expiring session tokens.
 pub struct EphemeralCredentials {
     pub server_config: ServerConfig,
     pub cert_sha256_hex: String,
-    pub valid_tokens: Arc<Mutex<HashSet<String>>>,
+    pub valid_tokens: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl EphemeralCredentials {
-    /// Add a newly minted session token to the accepted set.
-    pub fn add_token(&self, token: String) {
-        if let Ok(mut set) = self.valid_tokens.lock() {
-            set.insert(token);
+    /// Add a newly minted single-use session token with the given TTL.
+    pub fn add_token(&self, token: String, ttl: Duration) {
+        let now = Instant::now();
+        if let Ok(mut map) = self.valid_tokens.lock() {
+            map.retain(|_, exp| *exp > now);
+            map.insert(token, now + ttl);
         }
     }
 }
 
+/// Consume a single-use session token, returning `true` only if it existed and was not expired.
+fn consume_token(valid_tokens: &Mutex<HashMap<String, Instant>>, token: &str) -> bool {
+    let now = Instant::now();
+    let Ok(mut map) = valid_tokens.lock() else {
+        return false;
+    };
+    map.retain(|_, exp| *exp > now);
+    map.remove(token).is_some_and(|exp| exp > now)
+}
+
 /// Generate a self-signed TLS 1.3 certificate and ephemeral session token.
-pub fn generate_ephemeral_credentials(initial_token: String) -> Result<EphemeralCredentials> {
+pub fn generate_ephemeral_credentials(
+    initial_token: String,
+    initial_ttl: Duration,
+) -> Result<EphemeralCredentials> {
     let cert = rcgen::generate_simple_self_signed(vec!["remotewayland.local".to_string()])
         .context("failed to generate self-signed TLS certificate")?;
     let cert_der = CertificateDer::from(cert.cert);
@@ -57,11 +72,14 @@ pub fn generate_ephemeral_credentials(initial_token: String) -> Result<Ephemeral
         .context("failed to create QUIC server crypto config")?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
     let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.keep_alive_interval(Some(Duration::from_secs(3)));
+    if let Ok(idle) = Duration::from_secs(10).try_into() {
+        transport.max_idle_timeout(Some(idle));
+    }
     server_config.transport_config(Arc::new(transport));
 
-    let mut tokens = HashSet::new();
-    tokens.insert(initial_token);
+    let mut tokens = HashMap::new();
+    tokens.insert(initial_token, Instant::now() + initial_ttl);
 
     Ok(EphemeralCredentials {
         server_config,
@@ -92,7 +110,7 @@ pub async fn run_server(
             .valid_tokens
             .lock()
             .ok()
-            .and_then(|s| s.iter().next().cloned())
+            .and_then(|m| m.keys().next().cloned())
             .unwrap_or_default();
         println!(
             "remotewayland://{}?fp={}&token={}",
@@ -108,13 +126,15 @@ pub async fn run_server(
         }
     });
 
+    let pty_mgr = crate::pty::PtyManager::new(bcast_tx.clone());
     let valid_tokens = Arc::clone(&creds.valid_tokens);
     while let Some(incoming) = endpoint.accept().await {
         let tokens = Arc::clone(&valid_tokens);
         let cmd_tx = comp_handle.cmd_tx.clone();
         let ev_rx = bcast_tx.subscribe();
+        let pty = Arc::clone(&pty_mgr);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(incoming, tokens, cmd_tx, ev_rx).await {
+            if let Err(err) = handle_connection(incoming, tokens, cmd_tx, ev_rx, pty).await {
                 warn!(error = %err, "client connection ended with error");
             }
         });
@@ -125,9 +145,10 @@ pub async fn run_server(
 
 async fn handle_connection(
     incoming: quinn::Incoming,
-    valid_tokens: Arc<Mutex<HashSet<String>>>,
+    valid_tokens: Arc<Mutex<HashMap<String, Instant>>>,
     cmd_tx: calloop::channel::Sender<CompositorCommand>,
     mut ev_rx: broadcast::Receiver<CompositorEvent>,
+    pty_mgr: Arc<crate::pty::PtyManager>,
 ) -> Result<()> {
     let conn = incoming.await.context("QUIC handshake failed")?;
     let remote = conn.remote_address();
@@ -162,16 +183,13 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            let token_valid = valid_tokens
-                .lock()
-                .map(|s| s.contains(&token))
-                .unwrap_or(false);
+            let token_valid = consume_token(&valid_tokens, &token);
             if !token_valid {
                 write_control_message(
                     &mut send,
                     &ControlMessage::AuthResponse {
                         accepted: false,
-                        reason: Some("invalid session token".into()),
+                        reason: Some("invalid or expired session token".into()),
                         selected_codec: VideoCodec::Lz4Delta,
                     },
                 )
@@ -201,6 +219,7 @@ async fn handle_connection(
                 "client authenticated; starting compositor/media loop"
             );
             let _ = cmd_tx.send(CompositorCommand::SyncWindows);
+            pty_mgr.sync_states();
             (selected_codec, enable_audio_bridge)
         }
         other => {
@@ -209,20 +228,32 @@ async fn handle_connection(
         }
     };
 
-    // Accept secondary bidirectional QUIC streams (e.g., remote PTYs).
+    // Accept secondary bidirectional QUIC streams (e.g., persistent remote PTYs).
     let bidi_conn = conn.clone();
+    let bidi_pty = Arc::clone(&pty_mgr);
     tokio::spawn(async move {
         while let Ok((send_bi, mut recv_bi)) = bidi_conn.accept_bi().await {
+            let pty = Arc::clone(&bidi_pty);
             tokio::spawn(async move {
                 match read_bidi_stream_header(&mut recv_bi).await {
                     Ok(BidiStreamHeader::Pty {
+                        pty_id,
+                        resume_offset,
                         cols,
                         rows,
                         command,
                     }) => {
-                        if let Err(err) =
-                            crate::pty::handle_pty_stream(send_bi, recv_bi, cols, rows, command)
-                                .await
+                        if let Err(err) = pty
+                            .handle_pty_stream(
+                                send_bi,
+                                recv_bi,
+                                pty_id,
+                                resume_offset,
+                                cols,
+                                rows,
+                                command,
+                            )
+                            .await
                         {
                             warn!(error = %err, "PTY stream error");
                         }
@@ -497,7 +528,11 @@ async fn handle_connection(
                         let _ = cmd_tx.send(CompositorCommand::LaunchApp { launch_id, name, exec });
                     }
                     Some(ControlMessage::TerminateApp { launch_id, force }) => {
-                        let _ = cmd_tx.send(CompositorCommand::TerminateApp { launch_id, force });
+                        if (launch_id & PTY_LAUNCH_ID_BASE) != 0 {
+                            pty_mgr.terminate(launch_id & !PTY_LAUNCH_ID_BASE, force);
+                        } else {
+                            let _ = cmd_tx.send(CompositorCommand::TerminateApp { launch_id, force });
+                        }
                     }
                     Some(other) => {
                         info!(?other, "received control message");
@@ -520,4 +555,28 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_use_and_expiring_tokens() {
+        let map = Mutex::new(HashMap::new());
+        {
+            let mut guard = map.lock().unwrap();
+            guard.insert("valid".to_string(), Instant::now() + Duration::from_secs(60));
+            guard.insert("expired".to_string(), Instant::now() - Duration::from_secs(1));
+        }
+
+        // First use of valid token succeeds; second use fails (single-use).
+        assert!(consume_token(&map, "valid"));
+        assert!(!consume_token(&map, "valid"));
+
+        // Expired token is rejected and pruned.
+        assert!(!consume_token(&map, "expired"));
+        assert!(!consume_token(&map, "nonexistent"));
+        assert!(map.lock().unwrap().is_empty());
+    }
 }

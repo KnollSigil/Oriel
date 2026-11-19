@@ -1,6 +1,7 @@
 //! RemoteWayland server entrypoint.
 //!
-//! Launches an isolated headless Wayland session + optional PipeWire audio bridge
+//! Launches an isolated headless Wayland session + private D-Bus + virtual-only
+//! PipeWire/WirePlumber audio bridge inside a private session `XDG_RUNTIME_DIR`
 //! and streams rootless windows, audio, and remote PTYs over QUIC.
 
 mod apps;
@@ -9,21 +10,30 @@ mod compositor;
 mod media;
 mod pty;
 mod quic;
+mod session;
 
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// TTL for single-use tokens minted via `attach` / control socket.
+const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(60);
+/// TTL for single-use token printed on stdout in interactive foreground mode.
+const FOREGROUND_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Parser)]
 #[command(name = "remotewayland-server", about = "RemoteWayland headless app & PTY server")]
@@ -35,7 +45,7 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:7443")]
     listen: SocketAddr,
 
-    /// Ephemeral session token (auto-generated if omitted).
+    /// Ephemeral session token (auto-generated via CSPRNG if omitted).
     #[arg(long)]
     token: Option<String>,
 
@@ -73,25 +83,58 @@ struct ControlSockInfo {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Validate host XDG_RUNTIME_DIR up front (strict 0700 owned by current UID, no /tmp fallback).
+    let host_runtime_dir = session::validate_host_runtime_dir()?;
+
     if let Some(ServerSubcommand::Attach { listen, host }) = cli.subcommand {
-        return run_attach(listen, host).await;
+        return run_attach(&host_runtime_dir, listen, host).await;
     }
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
-    let token = cli.token.unwrap_or_else(generate_ephemeral_token);
-    let creds = Arc::new(quic::generate_ephemeral_credentials(token)?);
+    // Capture control socket path in the host XDG_RUNTIME_DIR before switching
+    // the server process to its isolated session XDG_RUNTIME_DIR.
+    let control_sock = session::control_socket_path(&host_runtime_dir);
+
+    let mut session_guard = session::SessionGuard::init(&host_runtime_dir)?;
+
+    // Start the isolated virtual-only PipeWire + WirePlumber + pipewire-pulse stack eagerly
+    // so GUI apps, Flatpaks, and remote PTYs immediately see live audio sockets.
+    if let Err(err) = audio::ensure_virtual_audio_devices() {
+        warn!(error = %err, "isolated PipeWire audio session unavailable at startup");
+    }
+
+    let token = match cli.token {
+        Some(t) => t,
+        None => generate_ephemeral_token()?,
+    };
+    let initial_ttl = if cli.daemon {
+        ATTACH_TOKEN_TTL
+    } else {
+        FOREGROUND_TOKEN_TTL
+    };
+    let creds = Arc::new(quic::generate_ephemeral_credentials(token, initial_ttl)?);
 
     let (comp_handle, event_rx) = compositor::start_compositor(cli.command)?;
-    info!(socket = ?comp_handle.socket_name, "headless Wayland compositor ready");
+    info!(
+        socket = ?comp_handle.socket_name,
+        session_dir = %session_guard.runtime_dir().display(),
+        "headless Wayland compositor ready"
+    );
+    session_guard.set_wayland_socket_and_start_portal(&comp_handle.socket_name);
 
+    let owns_control_sock = Arc::new(AtomicBool::new(false));
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
     let sock_creds = Arc::clone(&creds);
+    let sock_path_task = control_sock.clone();
+    let owns_flag = Arc::clone(&owns_control_sock);
     tokio::spawn(async move {
         if let Ok(actual_addr) = bound_rx.await {
-            if let Err(err) = run_control_socket(actual_addr.port(), sock_creds).await {
+            if let Err(err) =
+                run_control_socket(&sock_path_task, actual_addr.port(), sock_creds, owns_flag).await
+            {
                 warn!(error = %err, "control Unix socket failed");
             }
         }
@@ -103,52 +146,65 @@ async fn main() -> Result<()> {
         valid_tokens: Arc::clone(&creds.valid_tokens),
     };
 
-    quic::run_server(
-        cli.listen,
-        server_creds,
-        comp_handle,
-        event_rx,
-        Some(bound_tx),
-        cli.daemon,
-    )
-    .await
-}
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
 
-fn control_socket_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("remotewayland.sock")
-    } else {
-        let uid = unsafe { libc::geteuid() };
-        PathBuf::from(format!("/tmp/remotewayland-{uid}.sock"))
+    let server_res = tokio::select! {
+        res = quic::run_server(
+            cli.listen,
+            server_creds,
+            comp_handle,
+            event_rx,
+            Some(bound_tx),
+            cli.daemon,
+        ) => res,
+        _ = sigterm.recv() => {
+            info!("received SIGTERM; shutting down isolated session");
+            Ok(())
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT; shutting down isolated session");
+            Ok(())
+        }
+    };
+
+    if owns_control_sock.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_file(&control_sock);
     }
+    drop(session_guard);
+
+    server_res
 }
 
-fn daemon_log_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("remotewayland-server.log")
-    } else {
-        let uid = unsafe { libc::geteuid() };
-        PathBuf::from(format!("/tmp/remotewayland-server-{uid}.log"))
-    }
-}
-
-async fn run_control_socket(port: u16, creds: Arc<quic::EphemeralCredentials>) -> Result<()> {
-    let sock_path = control_socket_path();
+async fn run_control_socket(
+    sock_path: &Path,
+    port: u16,
+    creds: Arc<quic::EphemeralCredentials>,
+    owns_control_sock: Arc<AtomicBool>,
+) -> Result<()> {
     if sock_path.exists() {
-        if UnixStream::connect(&sock_path).await.is_ok() {
+        if UnixStream::connect(sock_path).await.is_ok() {
             return Ok(());
         }
-        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(sock_path);
     }
 
-    let listener = UnixListener::bind(&sock_path)
+    let listener = UnixListener::bind(sock_path)
         .with_context(|| format!("failed to bind control socket {}", sock_path.display()))?;
-    info!(path = %sock_path.display(), "control Unix socket listening");
+    session::set_mode(sock_path, 0o600)?;
+    owns_control_sock.store(true, Ordering::SeqCst);
+    info!(path = %sock_path.display(), "control Unix socket listening (mode 0600)");
 
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let token = generate_ephemeral_token();
-        creds.add_token(token.clone());
+        let token = match generate_ephemeral_token() {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(error = %err, "failed to generate CSPRNG session token");
+                continue;
+            }
+        };
+        creds.add_token(token.clone(), ATTACH_TOKEN_TTL);
         let info = ControlSockInfo {
             port,
             fp: creds.cert_sha256_hex.clone(),
@@ -161,8 +217,12 @@ async fn run_control_socket(port: u16, creds: Arc<quic::EphemeralCredentials>) -
     }
 }
 
-async fn run_attach(listen: SocketAddr, host: Option<String>) -> Result<()> {
-    let sock_path = control_socket_path();
+async fn run_attach(
+    host_runtime_dir: &Path,
+    listen: SocketAddr,
+    host: Option<String>,
+) -> Result<()> {
+    let sock_path = session::control_socket_path(host_runtime_dir);
     if let Ok(info) = query_control_socket(&sock_path).await {
         print_attach_uri(&host, listen, &info);
         return Ok(());
@@ -170,11 +230,14 @@ async fn run_attach(listen: SocketAddr, host: Option<String>) -> Result<()> {
 
     let _ = std::fs::remove_file(&sock_path);
     let exe = std::env::current_exe().context("failed to locate remotewayland-server binary")?;
+    let log_path = session::daemon_log_path(host_runtime_dir);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(daemon_log_path())
+        .mode(0o600)
+        .open(&log_path)
         .ok();
+    let _ = session::set_mode(&log_path, 0o600);
 
     let mut cmd = Command::new(exe);
     cmd.arg("--daemon")
@@ -194,9 +257,10 @@ async fn run_attach(listen: SocketAddr, host: Option<String>) -> Result<()> {
             Ok(())
         });
     }
-    cmd.spawn().context("failed to spawn remotewayland-server daemon")?;
+    cmd.spawn()
+        .context("failed to spawn remotewayland-server daemon")?;
 
-    for _ in 0..60 {
+    for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if let Ok(info) = query_control_socket(&sock_path).await {
             print_attach_uri(&host, listen, &info);
@@ -218,20 +282,54 @@ async fn query_control_socket(path: &Path) -> Result<ControlSockInfo> {
 }
 
 fn print_attach_uri(host: &Option<String>, listen: SocketAddr, info: &ControlSockInfo) {
-    let host_str = host
-        .clone()
-        .unwrap_or_else(|| listen.ip().to_string());
+    let host_str = host.clone().unwrap_or_else(|| listen.ip().to_string());
     println!(
         "remotewayland://{}:{}?fp={}&token={}",
         host_str, info.port, info.fp, info.token
     );
 }
 
-fn generate_ephemeral_token() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    format!("rw-{nanos:x}-{pid:x}")
+/// Generate a 256-bit cryptographically random session token via `getrandom(2)`.
+fn generate_ephemeral_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let ret = unsafe {
+            libc::getrandom(
+                bytes[filled..].as_mut_ptr().cast::<libc::c_void>(),
+                bytes.len() - filled,
+                0,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err).context("getrandom(2) failed while generating session token");
+        }
+        filled += ret as usize;
+    }
+
+    let mut hex = String::with_capacity(3 + bytes.len() * 2);
+    hex.push_str("rw-");
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csprng_tokens_have_256_bits_and_are_unique() {
+        let t1 = generate_ephemeral_token().unwrap();
+        let t2 = generate_ephemeral_token().unwrap();
+        assert!(t1.starts_with("rw-"));
+        assert_eq!(t1.len(), 3 + 64);
+        assert_ne!(t1, t2);
+    }
 }

@@ -1716,21 +1716,7 @@ fn spawn_gui_shell(
 }
 
 fn apply_gui_env(proc: &mut Command, socket_name: &OsString) {
-    proc.env("WAYLAND_DISPLAY", socket_name)
-        .env("PULSE_SINK", crate::audio::VIRTUAL_SINK_NAME)
-        .env("PULSE_SOURCE", crate::audio::VIRTUAL_MIC_NAME)
-        .env("GDK_BACKEND", "wayland")
-        .env("QT_QPA_PLATFORM", "wayland")
-        .env("MOZ_ENABLE_WAYLAND", "1")
-        .env("SDL_VIDEODRIVER", "wayland");
-    if let Some(pw_dir) = crate::audio::isolated_pw_runtime_dir() {
-        proc.env("PIPEWIRE_RUNTIME_DIR", pw_dir)
-            .env("PULSE_RUNTIME_PATH", pw_dir.join("pulse"))
-            .env(
-                "PULSE_SERVER",
-                format!("unix:{}", pw_dir.join("pulse/native").display()),
-            );
-    }
+    crate::session::apply_session_env(proc, Some(socket_name.as_os_str()));
 }
 
 fn blit_rgba_over(

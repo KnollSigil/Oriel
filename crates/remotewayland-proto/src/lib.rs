@@ -40,11 +40,21 @@ pub enum StreamHeader {
     AudioCapture,
 }
 
+/// High-bit tag applied to `launch_id` values representing server-managed persistent PTYs.
+/// Disjoint from `WINDOW_LAUNCH_ID_BASE` (`1 << 62`) used for GUI windows.
+pub const PTY_LAUNCH_ID_BASE: u64 = 1u64 << 61;
+
 /// Identifies the role of a newly opened secondary bidirectional QUIC stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BidiStreamHeader {
     /// Remote PTY terminal session (zero Wayland/PipeWire required on server).
     Pty {
+        /// If `Some(id)`, reattach to an existing persistent server PTY;
+        /// if `None`, spawn a new persistent PTY.
+        pty_id: Option<u64>,
+        /// Byte offset already received by the client; on reattach the server
+        /// replays any buffered output produced after this offset.
+        resume_offset: u64,
         cols: u16,
         rows: u16,
         command: Option<String>,
@@ -54,8 +64,17 @@ pub enum BidiStreamHeader {
 /// Framed messages exchanged over a bidirectional PTY QUIC stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PtyMessage {
+    /// Sent by the server immediately upon creating or reattaching to a PTY,
+    /// carrying the current byte offset so future reconnects stay exact.
+    Attached { pty_id: u64, stream_offset: u64 },
+    /// Historical buffered output replayed on reattach (already accounted for in `stream_offset`).
+    Replay(Vec<u8>),
+    /// Sent by the server when a reattach is rejected because another terminal is already attached.
+    Busy,
     Data(Vec<u8>),
     Resize { cols: u16, rows: u16 },
+    /// Sent by the client on intentional close (e.g., terminal tab closed via SIGHUP).
+    Close,
     Exit(i32),
 }
 
