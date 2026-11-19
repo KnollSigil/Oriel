@@ -226,7 +226,10 @@ mod gtk4_ui {
     use tokio::sync::mpsc;
 
     use crate::hosts::{load_hosts, parse_uri, save_hosts, ssh_bootstrap, HostProfile};
-    use crate::pty::{pty_tunnel_socket_path, spawn_local_terminal_pty_socket};
+    use crate::pty::{
+        available_local_terminals, pty_tunnel_socket_path, spawn_local_terminal_pty_socket,
+        spawn_local_terminal_pty_socket_with_terminal, terminal_basename,
+    };
     use crate::quic::{self, LauncherNetEvent};
     use crate::window::{self, ClientUiEvent};
 
@@ -353,6 +356,36 @@ mod gtk4_ui {
                 min-height: 18px;
                 min-width: 18px;
                 padding: 1px 4px;
+            }
+            .rw-split-btn > button {
+                border-top-right-radius: 0;
+                border-bottom-right-radius: 0;
+                border-right: none;
+                margin-right: 0;
+            }
+            .rw-split-btn > menubutton > button {
+                border-top-left-radius: 0;
+                border-bottom-left-radius: 0;
+                border-left: 1px solid alpha(currentColor, 0.18);
+                margin-left: 0;
+                padding-left: 5px;
+                padding-right: 5px;
+                min-width: 22px;
+            }
+            /* Breeze GTK4 doesn't highlight keyboard-focused PopoverMenu items with :focus-visible,
+               so target :focus/:selected explicitly on our terminal selector popover. */
+            popover.rw-term-popover modelbutton:focus,
+            popover.rw-term-popover modelbutton:selected {
+                background-color: alpha(@theme_selected_bg_color, 0.25);
+                outline: 2px solid @theme_selected_bg_color;
+                outline-offset: -2px;
+            }
+            /* Use :focus-visible inside Settings so mouse clicks don't leave a sticky focus ring. */
+            popover.rw-settings-popover checkbutton:focus-visible,
+            popover.rw-settings-popover button:focus-visible {
+                outline: 2px solid @theme_selected_bg_color;
+                outline-offset: 1px;
+                border-radius: 4px;
             }
             ",
         );
@@ -674,76 +707,200 @@ mod gtk4_ui {
             .placeholder_text("Type to search apps or enter command, then press Enter…")
             .hexpand(true)
             .build();
+        // Split "New Terminal" button (AdwSplitButton-style): primary click uses the default
+        // terminal emulator; narrow arrow half opens a native PopoverMenu to pick any installed emulator.
+        let term_split = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        term_split.add_css_class("linked");
+        term_split.add_css_class("rw-split-btn");
+        term_split.set_sensitive(false);
+
         let term_btn = gtk4::Button::with_label("New Terminal");
-        term_btn.set_sensitive(false);
+        term_btn.set_tooltip_text(Some("Open remote terminal in the default terminal emulator"));
 
-        // Host microphone selector + mute control (live-switches PipeWire source).
-        let mic_sources: Rc<RefCell<Vec<crate::audio::HostMicSource>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let term_menu = gio::Menu::new();
+        let term_popover = gtk4::PopoverMenu::from_model(Some(&term_menu));
+        term_popover.add_css_class("rw-term-popover");
+
+        let term_menu_btn = gtk4::MenuButton::builder()
+            .icon_name("pan-down-symbolic")
+            .tooltip_text("Choose terminal emulator for remote PTY")
+            .popover(&term_popover)
+            .build();
+
+        term_split.append(&term_btn);
+        term_split.append(&term_menu_btn);
+
+        // Host microphone selector + mute control inside the Settings popover
+        // (live-switches PipeWire source). Uses an inline radio list (`CheckButton` group)
+        // instead of a nested combobox/dropdown popup so GTK4 Wayland autohide grabs are
+        // never disrupted and switching microphones takes a single click or keypress.
+        let mic_list_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         let updating_mics = Rc::new(std::cell::Cell::new(false));
-        let mic_dropdown = gtk4::DropDown::from_strings(&["Mic: Off (Muted)", "Mic: System Default"]);
-        mic_dropdown.set_tooltip_text(Some("Select or mute host microphone for remote apps"));
+        let active_mic_btn: Rc<RefCell<Option<gtk4::CheckButton>>> = Rc::new(RefCell::new(None));
 
-        let populate_mics = {
-            let mic_sources = Rc::clone(&mic_sources);
+        let populate_mics: Rc<dyn Fn()> = Rc::new({
+            let mic_list_box = mic_list_box.clone();
             let updating_mics = Rc::clone(&updating_mics);
-            move |dropdown: &gtk4::DropDown| {
+            let active_mic_btn = Rc::clone(&active_mic_btn);
+            move || {
                 updating_mics.set(true);
+                while let Some(child) = mic_list_box.first_child() {
+                    mic_list_box.remove(&child);
+                }
+                *active_mic_btn.borrow_mut() = None;
+
                 let cfg = crate::audio::subscribe_mic_config().borrow().clone();
                 let list = crate::audio::list_host_mic_sources();
-                let mut labels: Vec<String> = Vec::with_capacity(list.len() + 2);
-                labels.push("Mic: Off (Muted)".to_string());
-                labels.push("Mic: System Default".to_string());
-                let mut selected_idx = if cfg.muted { 0u32 } else { 1u32 };
-                for (i, src) in list.iter().enumerate() {
-                    labels.push(format!("Mic: {}", src.description));
-                    if !cfg.muted && cfg.target.as_deref() == Some(src.node_name.as_str()) {
-                        selected_idx = (i + 2) as u32;
+
+                let mut entries: Vec<(Option<String>, bool, String)> =
+                    Vec::with_capacity(list.len() + 2);
+                // (target_node_name, is_muted, display_label)
+                entries.push((None, true, "Off (Muted)".to_string()));
+                entries.push((None, false, "System Default".to_string()));
+                for src in list {
+                    entries.push((Some(src.node_name), false, src.description));
+                }
+
+                let mut first_btn: Option<gtk4::CheckButton> = None;
+                let mut default_btn: Option<gtk4::CheckButton> = None;
+                let mut selected_btn: Option<gtk4::CheckButton> = None;
+
+                for (target, is_muted, label) in entries {
+                    let is_selected = if is_muted {
+                        cfg.muted
+                    } else if target.is_none() {
+                        !cfg.muted && cfg.target.is_none()
+                    } else {
+                        !cfg.muted && cfg.target == target
+                    };
+
+                    let btn = gtk4::CheckButton::with_label(&label);
+                    if let Some(ref group) = first_btn {
+                        btn.set_group(Some(group));
+                    } else {
+                        first_btn = Some(btn.clone());
+                    }
+                    if !is_muted && target.is_none() {
+                        default_btn = Some(btn.clone());
+                    }
+                    if is_selected {
+                        btn.set_active(true);
+                        selected_btn = Some(btn.clone());
+                    }
+
+                    let updating = Rc::clone(&updating_mics);
+                    let active_mic_btn_c = Rc::clone(&active_mic_btn);
+                    btn.connect_toggled(move |b| {
+                        if updating.get() || !b.is_active() {
+                            return;
+                        }
+                        *active_mic_btn_c.borrow_mut() = Some(b.clone());
+                        if is_muted {
+                            crate::audio::set_mic_muted(true);
+                        } else {
+                            // Set target before unmuting so we never briefly unmute the previous mic.
+                            crate::audio::set_mic_target(target.clone());
+                            crate::audio::set_mic_muted(false);
+                        }
+                    });
+                    mic_list_box.append(&btn);
+                }
+
+                // If the configured target disappeared, fall back to System Default and
+                // clear the stale target so audio::MicConfig stays in sync with the UI.
+                if selected_btn.is_none() {
+                    if let Some(ref fallback) = default_btn {
+                        fallback.set_active(true);
+                        selected_btn = Some(fallback.clone());
+                        if !cfg.muted {
+                            crate::audio::set_mic_target(None);
+                        }
+                    } else {
+                        selected_btn = first_btn.clone();
                     }
                 }
-                *mic_sources.borrow_mut() = list;
-                let str_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-                let model = gtk4::StringList::new(&str_refs);
-                dropdown.set_model(Some(&model));
-                dropdown.set_selected(selected_idx);
+                *active_mic_btn.borrow_mut() = selected_btn;
                 updating_mics.set(false);
-            }
-        };
-        populate_mics(&mic_dropdown);
-
-        mic_dropdown.connect_selected_notify({
-            let mic_sources = Rc::clone(&mic_sources);
-            let updating_mics = Rc::clone(&updating_mics);
-            move |dd| {
-                if updating_mics.get() {
-                    return;
-                }
-                let idx = dd.selected();
-                if idx == 0 {
-                    crate::audio::set_mic_muted(true);
-                } else if idx == 1 {
-                    crate::audio::set_mic_muted(false);
-                    crate::audio::set_mic_target(None);
-                } else if let Some(src) = mic_sources.borrow().get((idx - 2) as usize) {
-                    crate::audio::set_mic_muted(false);
-                    crate::audio::set_mic_target(Some(src.node_name.clone()));
-                }
             }
         });
 
         let mic_refresh_btn = gtk4::Button::with_label("↻");
+        mic_refresh_btn.add_css_class("compact-btn");
         mic_refresh_btn.set_tooltip_text(Some("Refresh host microphones"));
         mic_refresh_btn.connect_clicked({
-            let mic_dropdown = mic_dropdown.clone();
+            let populate_mics = Rc::clone(&populate_mics);
+            let active_mic_btn = Rc::clone(&active_mic_btn);
             move |_| {
-                populate_mics(&mic_dropdown);
+                populate_mics();
+                if let Some(btn) = active_mic_btn.borrow().as_ref() {
+                    btn.grab_focus();
+                }
             }
         });
 
+        let settings_popover = gtk4::Popover::new();
+        settings_popover.add_css_class("rw-settings-popover");
+        let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        settings_box.set_margin_top(10);
+        settings_box.set_margin_bottom(10);
+        settings_box.set_margin_start(10);
+        settings_box.set_margin_end(10);
+        settings_box.set_width_request(300);
+
+        let settings_title = gtk4::Label::new(None);
+        settings_title.set_markup("<b>Settings</b>");
+        settings_title.set_halign(gtk4::Align::Start);
+
+        let mic_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let mic_lbl = gtk4::Label::new(Some("Microphone"));
+        mic_lbl.set_halign(gtk4::Align::Start);
+        mic_lbl.set_hexpand(true);
+        mic_lbl.add_css_class("dim-label");
+        mic_header.append(&mic_lbl);
+        mic_header.append(&mic_refresh_btn);
+
+        let mic_scroll = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(300)
+            .child(&mic_list_box)
+            .build();
+
+        settings_box.append(&settings_title);
+        settings_box.append(&mic_header);
+        settings_box.append(&mic_scroll);
+        settings_popover.set_child(Some(&settings_box));
+        settings_popover.connect_show({
+            let populate_mics = Rc::clone(&populate_mics);
+            move |_| {
+                populate_mics();
+            }
+        });
+        settings_popover.connect_map({
+            let active_mic_btn = Rc::clone(&active_mic_btn);
+            move |pop| {
+                let pop = pop.clone();
+                let active_mic_btn = Rc::clone(&active_mic_btn);
+                glib::idle_add_local_once(move || {
+                    if pop.is_visible() {
+                        if let Some(btn) = active_mic_btn.borrow().as_ref() {
+                            btn.grab_focus();
+                        }
+                    }
+                });
+            }
+        });
+
+        let settings_btn = gtk4::MenuButton::builder()
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Settings")
+            .popover(&settings_popover)
+            .build();
+
         top_bar.append(&search_entry);
-        top_bar.append(&mic_dropdown);
-        top_bar.append(&mic_refresh_btn);
-        top_bar.append(&term_btn);
+        top_bar.append(&term_split);
+        top_bar.append(&settings_btn);
         right_pane.append(&top_bar);
 
         // App icon grid (filtered in-place via set_filter_func for instant typing/backspace)
@@ -885,21 +1042,24 @@ mod gtk4_ui {
             let state = Rc::clone(&state);
             let status_net_lbl = status_net_lbl.clone();
             let status_dot = status_dot.clone();
-            let term_btn = term_btn.clone();
+            let term_split = term_split.clone();
+            let term_popover = term_popover.clone();
 
             Rc::new(move || {
                 let st = state.borrow();
                 let Some(target) = st.active_target.as_ref() else {
                     status_dot.set_markup("<span foreground='#888888'>●</span>");
                     status_net_lbl.set_text("No server selected");
-                    term_btn.set_sensitive(false);
+                    term_popover.popdown();
+                    term_split.set_sensitive(false);
                     return;
                 };
 
                 let Some(sess) = st.sessions.get(target) else {
                     status_dot.set_markup("<span foreground='#888888'>●</span>");
                     status_net_lbl.set_text(&format!("{target} · Disconnected"));
-                    term_btn.set_sensitive(false);
+                    term_popover.popdown();
+                    term_split.set_sensitive(false);
                     return;
                 };
 
@@ -913,15 +1073,17 @@ mod gtk4_ui {
                             .unwrap_or_else(|| format!("{target} · Disconnected"));
                         status_net_lbl.set_text(&msg);
                         status_net_lbl.set_tooltip_text(Some(&msg));
-                        term_btn.set_sensitive(false);
+                        term_popover.popdown();
+                        term_split.set_sensitive(false);
                     }
                     ConnStatus::Connecting => {
                         status_dot.set_markup("<span foreground='#ddaa22'>●</span>");
                         status_net_lbl.set_text(&format!("{target} · Connecting via SSH…"));
-                        term_btn.set_sensitive(false);
+                        term_popover.popdown();
+                        term_split.set_sensitive(false);
                     }
                     ConnStatus::Connected => {
-                        term_btn.set_sensitive(true);
+                        term_split.set_sensitive(true);
                         if sess.congested {
                             status_dot.set_markup("<span foreground='#dd8822'>●</span>");
                             let rtt = sess.rtt_ms.unwrap_or(0);
@@ -1662,19 +1824,29 @@ mod gtk4_ui {
             }
         });
 
-        // New Terminal button
-        term_btn.connect_clicked({
+        // New Terminal split button (primary = default emulator, dropdown = pick emulator)
+        let launch_terminal_with: Rc<dyn Fn(Option<&str>)> = Rc::new({
             let state = Rc::clone(&state);
             let refresh_status_bar = Rc::clone(&refresh_status_bar);
             let search_entry = search_entry.clone();
-            move |_| {
-                {
-                    let mut st = state.borrow_mut();
-                    if let Some(sess) = st.active_session_mut() {
-                        if let Some(sock_path) = sess.pty_socket.clone() {
-                            // Server PtyManager announces this persistent PTY via AppState.
-                            let _ = spawn_local_terminal_pty_socket(&sock_path, None, None);
-                        }
+            move |terminal: Option<&str>| {
+                let sock_path = state
+                    .borrow()
+                    .active_session()
+                    .and_then(|sess| sess.pty_socket.clone());
+                if let Some(sock_path) = sock_path {
+                    // Server PtyManager announces this persistent PTY via AppState.
+                    if let Err(err) = spawn_local_terminal_pty_socket_with_terminal(
+                        &sock_path,
+                        None,
+                        None,
+                        terminal,
+                    ) {
+                        tracing::warn!(
+                            error = %err,
+                            ?terminal,
+                            "failed to launch local terminal for remote PTY"
+                        );
                     }
                 }
                 search_entry.grab_focus();
@@ -1682,8 +1854,79 @@ mod gtk4_ui {
             }
         });
 
+        term_btn.connect_clicked({
+            let launch_terminal_with = Rc::clone(&launch_terminal_with);
+            move |_| {
+                launch_terminal_with(None);
+            }
+        });
+
+        let launch_term_action =
+            gio::SimpleAction::new("launch-terminal", Some(glib::VariantTy::STRING));
+        launch_term_action.connect_activate({
+            let launch_terminal_with = Rc::clone(&launch_terminal_with);
+            move |_, param| {
+                if let Some(term) = param.and_then(|v| v.get::<String>()) {
+                    launch_terminal_with(Some(&term));
+                }
+            }
+        });
+        window.add_action(&launch_term_action);
+
+        let last_term_list: Rc<RefCell<Option<Vec<String>>>> = Rc::new(RefCell::new(None));
+        let populate_term_menu: Rc<dyn Fn()> = Rc::new({
+            let term_menu = term_menu.clone();
+            let last_term_list = Rc::clone(&last_term_list);
+            move || {
+                let terminals = available_local_terminals();
+                if last_term_list.borrow().as_deref() == Some(terminals.as_slice()) {
+                    return;
+                }
+                *last_term_list.borrow_mut() = Some(terminals.clone());
+                term_menu.remove_all();
+                if terminals.is_empty() {
+                    let item = gio::MenuItem::new(Some("No terminal emulators found"), None);
+                    term_menu.append_item(&item);
+                    return;
+                }
+                for (idx, term) in terminals.into_iter().enumerate() {
+                    let display_name = terminal_basename(&term);
+                    let raw_label = if idx == 0 {
+                        format!("{display_name} (default)")
+                    } else {
+                        display_name.to_string()
+                    };
+                    // Escape underscores so GMenu doesn't interpret them as mnemonic prefixes.
+                    let label_text = raw_label.replace('_', "__");
+                    let item = gio::MenuItem::new(Some(&label_text), None);
+                    item.set_action_and_target_value(
+                        Some("win.launch-terminal"),
+                        Some(&term.to_variant()),
+                    );
+                    term_menu.append_item(&item);
+                }
+            }
+        });
+        // Populate before first popup so PopoverMenu widgets already exist when
+        // keyboard activation grabs focus, and refresh before each subsequent popup.
+        populate_term_menu();
+        term_menu_btn.set_create_popup_func({
+            let populate_term_menu = Rc::clone(&populate_term_menu);
+            move |_| {
+                populate_term_menu();
+            }
+        });
+        term_popover.connect_map(|pop| {
+            let pop = pop.clone();
+            glib::idle_add_local_once(move || {
+                if pop.is_visible() {
+                    pop.child_focus(gtk4::DirectionType::TabForward);
+                }
+            });
+        });
+
         // Clean Tab / Shift+Tab focus ring:
-        // manage_btn <-> server_list <-> (search_entry + flow) <-> term_btn <-> status_bar_btn
+        // manage_btn <-> server_list <-> (search_entry + flow) <-> term_btn <-> term_menu_btn <-> settings_btn <-> status_bar_btn
         let win_key_ctrl = gtk4::EventControllerKey::new();
         win_key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
         win_key_ctrl.connect_key_pressed({
@@ -1692,7 +1935,13 @@ mod gtk4_ui {
             let server_list = server_list.clone();
             let search_entry = search_entry.clone();
             let flow = flow.clone();
+            let term_split = term_split.clone();
             let term_btn = term_btn.clone();
+            let term_menu_btn = term_menu_btn.clone();
+            let term_popover = term_popover.clone();
+            let settings_btn = settings_btn.clone();
+            let settings_popover = settings_popover.clone();
+            let programs_popover = programs_popover.clone();
             let status_bar_btn = status_bar_btn.clone();
             move |_, key, _, mods| {
                 let is_shift_tab = key == gtk4::gdk::Key::ISO_Left_Tab
@@ -1700,7 +1949,11 @@ mod gtk4_ui {
                         && mods.contains(gtk4::gdk::ModifierType::SHIFT_MASK));
                 let is_tab = key == gtk4::gdk::Key::Tab
                     && !mods.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-                if !is_tab && !is_shift_tab {
+                if (!is_tab && !is_shift_tab)
+                    || settings_popover.is_visible()
+                    || term_popover.is_visible()
+                    || programs_popover.is_visible()
+                {
                     return glib::Propagation::Proceed;
                 }
 
@@ -1724,7 +1977,10 @@ mod gtk4_ui {
                     || focused.is_ancestor(&search_entry)
                     || focused == flow
                     || focused.is_ancestor(&flow);
-                let in_term = focused == term_btn || focused.is_ancestor(&term_btn);
+                let in_term_btn = focused == term_btn || focused.is_ancestor(&term_btn);
+                let in_term_menu =
+                    focused == term_menu_btn || focused.is_ancestor(&term_menu_btn);
+                let in_settings = focused == settings_btn || focused.is_ancestor(&settings_btn);
                 let in_status = focused == status_bar_btn || focused.is_ancestor(&status_bar_btn);
 
                 if is_tab {
@@ -1733,12 +1989,16 @@ mod gtk4_ui {
                     } else if in_servers {
                         search_entry.grab_focus();
                     } else if in_launcher {
-                        if term_btn.is_sensitive() {
+                        if term_split.is_sensitive() {
                             term_btn.grab_focus();
                         } else {
-                            status_bar_btn.grab_focus();
+                            settings_btn.grab_focus();
                         }
-                    } else if in_term {
+                    } else if in_term_btn {
+                        term_menu_btn.grab_focus();
+                    } else if in_term_menu {
+                        settings_btn.grab_focus();
+                    } else if in_settings {
                         status_bar_btn.grab_focus();
                     } else if in_status {
                         manage_btn.grab_focus();
@@ -1755,14 +2015,18 @@ mod gtk4_ui {
                     manage_btn.grab_focus();
                 } else if in_launcher {
                     focus_servers();
-                } else if in_term {
+                } else if in_term_btn {
                     search_entry.grab_focus();
-                } else if in_status {
-                    if term_btn.is_sensitive() {
-                        term_btn.grab_focus();
+                } else if in_term_menu {
+                    term_btn.grab_focus();
+                } else if in_settings {
+                    if term_split.is_sensitive() {
+                        term_menu_btn.grab_focus();
                     } else {
                         search_entry.grab_focus();
                     }
+                } else if in_status {
+                    settings_btn.grab_focus();
                 } else {
                     return glib::Propagation::Proceed;
                 }
@@ -1771,13 +2035,23 @@ mod gtk4_ui {
         });
         window.add_controller(win_key_ctrl);
 
-        // Auto-focus search box on Alt-Tab if active server is connected, else focus server list
+        // Auto-focus search box on Alt-Tab if active server is connected, else focus server list.
+        // Skip when any popover is open so opening an xdg_popup doesn't steal focus back to search.
         window.connect_is_active_notify({
             let state = Rc::clone(&state);
             let search_entry = search_entry.clone();
             let server_list = server_list.clone();
+            let term_popover = term_popover.clone();
+            let settings_popover = settings_popover.clone();
+            let programs_popover = programs_popover.clone();
             move |win| {
                 if win.is_active() {
+                    if term_popover.is_visible()
+                        || settings_popover.is_visible()
+                        || programs_popover.is_visible()
+                    {
+                        return;
+                    }
                     let connected = state
                         .borrow()
                         .active_session()

@@ -1,6 +1,6 @@
 //! Local terminal <-> remote PTY QUIC / Unix-tunnel stream bridge with silent auto-reattach.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -414,6 +414,17 @@ pub fn spawn_local_terminal_pty_socket(
     pty_id: Option<u64>,
     command: Option<&str>,
 ) -> Result<std::process::Child> {
+    spawn_local_terminal_pty_socket_with_terminal(socket_path, pty_id, command, None)
+}
+
+/// Spawn a specific (or default when `terminal` is `None`) local terminal emulator
+/// attached to `remotewayland-client pty-attach --socket <path>`.
+pub fn spawn_local_terminal_pty_socket_with_terminal(
+    socket_path: &Path,
+    pty_id: Option<u64>,
+    command: Option<&str>,
+    terminal: Option<&str>,
+) -> Result<std::process::Child> {
     let mut attach_args = vec![
         "pty-attach".to_string(),
         "--socket".to_string(),
@@ -432,7 +443,7 @@ pub fn spawn_local_terminal_pty_socket(
     } else {
         InitialTabMode::ProfileDefault
     };
-    spawn_local_terminal_with_args(&attach_args, Some(socket_path), initial_mode)
+    spawn_local_terminal_with_args(&attach_args, Some(socket_path), initial_mode, terminal)
 }
 
 /// Spawn the user's preferred local terminal emulator attached to `remotewayland-client pty-attach --uri <uri>`.
@@ -446,7 +457,7 @@ pub fn spawn_local_terminal_pty(uri: &str, command: Option<&str>) -> Result<std:
         attach_args.push("--command".to_string());
         attach_args.push(cmd.to_string());
     }
-    spawn_local_terminal_with_args(&attach_args, None, InitialTabMode::CustomCommand)
+    spawn_local_terminal_with_args(&attach_args, None, InitialTabMode::CustomCommand, None)
 }
 
 #[derive(Debug, Default)]
@@ -719,55 +730,112 @@ fn prepare_konsole_remote_profile_with_env(
     })
 }
 
-fn executable_exists(program: &str) -> bool {
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+}
+
+fn executable_exists_in_path(program: &str, path_var: Option<&OsStr>) -> bool {
     let path = Path::new(program);
     if path.components().count() > 1 {
-        return path.is_file();
+        return is_executable_file(path);
     }
-    let Some(path_var) = std::env::var_os("PATH") else {
+    let Some(path_var) = path_var else {
         return false;
     };
-    std::env::split_paths(&path_var).any(|dir| dir.join(program).is_file())
+    std::env::split_paths(path_var).any(|dir| is_executable_file(&dir.join(program)))
+}
+
+fn executable_exists(program: &str) -> bool {
+    let path_var = std::env::var_os("PATH");
+    executable_exists_in_path(program, path_var.as_deref())
+}
+
+const KNOWN_TERMINALS: &[&str] = &[
+    "konsole",
+    "alacritty",
+    "kitty",
+    "foot",
+    "ghostty",
+    "wezterm",
+    "gnome-terminal",
+    "xfce4-terminal",
+    "lxterminal",
+    "xterm",
+];
+
+/// Extract the display/matching executable basename for a terminal command or path.
+pub(crate) fn terminal_basename(term: &str) -> &str {
+    Path::new(term)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(term)
+}
+
+fn terminal_candidates_with(terminal_env: Option<&str>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(trimmed) = terminal_env.map(str::trim).filter(|s| !s.is_empty()) {
+        candidates.push(trimmed.to_string());
+    }
+    for term in KNOWN_TERMINALS {
+        if !candidates.iter().any(|c| terminal_basename(c) == *term) {
+            candidates.push((*term).to_string());
+        }
+    }
+    candidates
+}
+
+#[cfg(any(feature = "gtk4", test))]
+fn terminal_candidates() -> Vec<String> {
+    let env_term = std::env::var("TERMINAL").ok();
+    terminal_candidates_with(env_term.as_deref())
+}
+
+/// Resolve the ordered candidate list to try, validating `preferred_terminal` against
+/// the configured allowlist (`$TERMINAL` + `KNOWN_TERMINALS`) so external callers
+/// (e.g. GTK D-Bus `win.launch-terminal` actions) cannot execute arbitrary binaries.
+fn resolve_terminal_candidates(
+    preferred_terminal: Option<&str>,
+    terminal_env: Option<&str>,
+) -> Result<Vec<String>> {
+    let allowed = terminal_candidates_with(terminal_env);
+    match preferred_terminal.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(term) => {
+            if allowed.iter().any(|a| a == term) {
+                Ok(vec![term.to_string()])
+            } else {
+                bail!("terminal emulator '{term}' is not in the allowed terminal list");
+            }
+        }
+        None => Ok(allowed),
+    }
+}
+
+/// Return installed local terminal emulators in priority order (index 0 is the default).
+#[cfg(any(feature = "gtk4", test))]
+pub fn available_local_terminals() -> Vec<String> {
+    terminal_candidates()
+        .into_iter()
+        .filter(|term| executable_exists(term))
+        .collect()
 }
 
 fn spawn_local_terminal_with_args(
     attach_args: &[String],
     new_tab_socket: Option<&Path>,
     initial_mode: InitialTabMode,
+    preferred_terminal: Option<&str>,
 ) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("failed to locate remotewayland-client binary")?;
-
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(term) = std::env::var("TERMINAL") {
-        let trimmed = term.trim();
-        if !trimmed.is_empty() {
-            candidates.push(trimmed.to_string());
-        }
-    }
-    for term in [
-        "konsole",
-        "alacritty",
-        "kitty",
-        "foot",
-        "wezterm",
-        "gnome-terminal",
-        "xfce4-terminal",
-        "xterm",
-    ] {
-        if !candidates.iter().any(|c| c == term) {
-            candidates.push(term.to_string());
-        }
-    }
+    let env_term = std::env::var("TERMINAL").ok();
+    let candidates = resolve_terminal_candidates(preferred_terminal, env_term.as_deref())?;
+    let mut last_err: Option<(String, std::io::Error)> = None;
 
     for term in candidates {
         if !executable_exists(&term) {
             continue;
         }
         let mut proc = Command::new(&term);
-        let base = Path::new(&term)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&term);
+        let base = terminal_basename(&term);
         match base {
             "konsole" => {
                 if let Some(sock) = new_tab_socket {
@@ -808,13 +876,21 @@ fn spawn_local_terminal_with_args(
                 proc.arg("-e").arg(&exe).args(attach_args);
             }
         }
-        if let Ok(child) = proc.spawn() {
-            return Ok(child);
+        match proc.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err) => last_err = Some((term, err)),
         }
     }
 
+    if let Some((term, err)) = last_err {
+        bail!("failed to launch terminal emulator '{term}': {err}");
+    }
+    if let Some(term) = preferred_terminal.map(str::trim).filter(|s| !s.is_empty()) {
+        bail!("terminal emulator '{term}' not found");
+    }
     anyhow::bail!(
-        "no local terminal emulator found ($TERMINAL, konsole, alacritty, kitty, foot, wezterm, gnome-terminal, xfce4-terminal, xterm)"
+        "no local terminal emulator found ($TERMINAL, {})",
+        KNOWN_TERMINALS.join(", ")
     )
 }
 
@@ -960,6 +1036,54 @@ mod tests {
             fs::symlink_metadata(&overlay.config_home).unwrap().permissions().mode() & 0o777,
             0o700
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_candidates_deduplicates_by_basename_and_validates_allowlist() {
+        let list = terminal_candidates_with(Some("  /usr/bin/konsole  "));
+        assert_eq!(list[0], "/usr/bin/konsole");
+        assert_eq!(
+            list.iter().filter(|c| terminal_basename(c) == "konsole").count(),
+            1
+        );
+
+        // Allowlist accepts $TERMINAL and KNOWN_TERMINALS, rejects arbitrary binaries.
+        assert_eq!(
+            resolve_terminal_candidates(Some("/usr/bin/konsole"), Some("/usr/bin/konsole"))
+                .unwrap(),
+            vec!["/usr/bin/konsole".to_string()]
+        );
+        assert_eq!(
+            resolve_terminal_candidates(Some("xterm"), None).unwrap(),
+            vec!["xterm".to_string()]
+        );
+        assert!(resolve_terminal_candidates(Some("/bin/sh"), None).is_err());
+    }
+
+    #[test]
+    fn executable_exists_in_path_checks_execute_bits() {
+        let dir = std::env::temp_dir().join(format!("rw-exec-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let non_exec = dir.join("not-exec");
+        fs::write(&non_exec, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&non_exec, Permissions::from_mode(0o644)).unwrap();
+
+        let exec = dir.join("is-exec");
+        fs::write(&exec, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&exec, Permissions::from_mode(0o755)).unwrap();
+
+        let path_env = OsString::from(&dir);
+        assert!(!executable_exists_in_path("not-exec", Some(path_env.as_os_str())));
+        assert!(executable_exists_in_path("is-exec", Some(path_env.as_os_str())));
+        assert!(!executable_exists_in_path(
+            non_exec.to_str().unwrap(),
+            None
+        ));
+        assert!(executable_exists_in_path(exec.to_str().unwrap(), None));
 
         let _ = fs::remove_dir_all(&dir);
     }
