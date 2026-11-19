@@ -231,6 +231,7 @@ mod gtk4_ui {
         spawn_local_terminal_pty_socket_with_terminal, terminal_basename,
     };
     use crate::quic::{self, LauncherNetEvent};
+    use crate::search::{self, MatchTier, SearchIndexEntry};
     use crate::window::{self, ClientUiEvent};
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -278,6 +279,8 @@ mod gtk4_ui {
         active_target: Option<String>,
         next_launch_id: u64,
         grid_apps: Vec<RemoteAppEntry>,
+        grid_search: Vec<SearchIndexEntry>,
+        grid_tiers: Vec<Option<MatchTier>>,
         icon_cache: HashMap<String, Option<gtk4::gdk::Texture>>,
     }
 
@@ -380,11 +383,20 @@ mod gtk4_ui {
                 outline: 2px solid @theme_selected_bg_color;
                 outline-offset: -2px;
             }
-            /* Use :focus-visible inside Settings so mouse clicks don't leave a sticky focus ring. */
-            popover.rw-settings-popover checkbutton:focus-visible,
+            /* Match terminal popover highlight inside Settings and use inset outline
+               so focus rings aren't clipped by the ScrolledWindow viewport. */
+            popover.rw-settings-popover checkbutton {
+                padding: 3px 6px;
+                border-radius: 5px;
+            }
+            popover.rw-settings-popover checkbutton:focus {
+                background-color: alpha(@theme_selected_bg_color, 0.22);
+                outline: 2px solid @theme_selected_bg_color;
+                outline-offset: -2px;
+            }
             popover.rw-settings-popover button:focus-visible {
                 outline: 2px solid @theme_selected_bg_color;
-                outline-offset: 1px;
+                outline-offset: -2px;
                 border-radius: 4px;
             }
             ",
@@ -647,6 +659,8 @@ mod gtk4_ui {
             active_target: initial_target,
             next_launch_id: seed_id,
             grid_apps: Vec::new(),
+            grid_search: Vec::new(),
+            grid_tiers: Vec::new(),
             icon_cache: HashMap::new(),
         }));
         let current_filter = Rc::new(RefCell::new(String::new()));
@@ -903,7 +917,7 @@ mod gtk4_ui {
         top_bar.append(&settings_btn);
         right_pane.append(&top_bar);
 
-        // App icon grid (filtered in-place via set_filter_func for instant typing/backspace)
+        // App icon grid (filtered + ranked in-place via set_filter_func / set_sort_func)
         let flow = gtk4::FlowBox::builder()
             .valign(gtk4::Align::Start)
             .max_children_per_line(8)
@@ -913,20 +927,85 @@ mod gtk4_ui {
             .row_spacing(8)
             .column_spacing(8)
             .build();
+
+        /// Recover the original `grid_apps`/`grid_search` index from a `FlowBoxChild`.
+        /// `child.index()` reflects sorted visual order once `set_sort_func` runs, so we
+        /// tag each child's `widget_name` with its stable source index in `rebuild_grid`.
+        fn flow_child_app_idx(child: &gtk4::FlowBoxChild) -> Option<usize> {
+            child.widget_name().parse::<usize>().ok()
+        }
+        fn recompute_grid_tiers(st: &mut AppUi, query: &str) {
+            st.grid_tiers.clear();
+            if query.is_empty() {
+                return;
+            }
+            st.grid_tiers.extend(
+                st.grid_search
+                    .iter()
+                    .map(|entry| search::match_tier(entry, query)),
+            );
+        }
+        fn child_matches_query(st: &AppUi, child: &gtk4::FlowBoxChild, query: &str) -> bool {
+            if query.is_empty() {
+                return true;
+            }
+            flow_child_app_idx(child)
+                .and_then(|idx| st.grid_tiers.get(idx).copied().flatten())
+                .is_some()
+        }
+        fn first_matching_child(
+            flow: &gtk4::FlowBox,
+            st: &AppUi,
+            query: &str,
+        ) -> Option<gtk4::FlowBoxChild> {
+            let mut cur = flow.first_child();
+            while let Some(widget) = cur {
+                if let Ok(child) = widget.clone().downcast::<gtk4::FlowBoxChild>() {
+                    if child_matches_query(st, &child, query) {
+                        return Some(child);
+                    }
+                }
+                cur = widget.next_sibling();
+            }
+            None
+        }
+
         flow.set_filter_func({
             let state = Rc::clone(&state);
             let current_filter = Rc::clone(&current_filter);
             move |child| {
                 let needle = current_filter.borrow();
-                if needle.is_empty() {
-                    return true;
-                }
-                let idx = child.index() as usize;
-                state
-                    .borrow()
-                    .grid_apps
-                    .get(idx)
-                    .is_some_and(|a| a.name.to_lowercase().contains(needle.as_str()))
+                child_matches_query(&state.borrow(), child, needle.as_str())
+            }
+        });
+        flow.set_sort_func({
+            let state = Rc::clone(&state);
+            let current_filter = Rc::clone(&current_filter);
+            move |a, b| {
+                let st = state.borrow();
+                let needle = current_filter.borrow();
+                let ia = flow_child_app_idx(a);
+                let ib = flow_child_app_idx(b);
+                let ea = ia.and_then(|i| st.grid_search.get(i));
+                let eb = ib.and_then(|i| st.grid_search.get(i));
+                let ord = match (ea, eb) {
+                    (Some(ea), Some(eb)) if !needle.is_empty() => {
+                        let ta = ia
+                            .and_then(|i| st.grid_tiers.get(i).copied().flatten())
+                            .map(|t| t as u8)
+                            .unwrap_or(u8::MAX);
+                        let tb = ib
+                            .and_then(|i| st.grid_tiers.get(i).copied().flatten())
+                            .map(|t| t as u8)
+                            .unwrap_or(u8::MAX);
+                        (ta, ea.name_lower.as_str()).cmp(&(tb, eb.name_lower.as_str()))
+                    }
+                    (Some(ea), Some(eb)) => ea.name_lower.cmp(&eb.name_lower),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                ord.into()
             }
         });
 
@@ -1251,15 +1330,9 @@ mod gtk4_ui {
             let current_filter = Rc::clone(&current_filter);
             Rc::new(move || {
                 let needle = current_filter.borrow();
-                let first_idx = state
-                    .borrow()
-                    .grid_apps
-                    .iter()
-                    .position(|a| needle.is_empty() || a.name.to_lowercase().contains(needle.as_str()));
-                if let Some(idx) = first_idx {
-                    if let Some(child) = flow.child_at_index(idx as i32) {
-                        flow.select_child(&child);
-                    }
+                let st = state.borrow();
+                if let Some(child) = first_matching_child(&flow, &st, needle.as_str()) {
+                    flow.select_child(&child);
                 } else {
                     flow.unselect_all();
                 }
@@ -1269,6 +1342,7 @@ mod gtk4_ui {
         let rebuild_grid: Rc<dyn Fn()> = {
             let flow = flow.clone();
             let state = Rc::clone(&state);
+            let current_filter = Rc::clone(&current_filter);
             let select_first_visible = Rc::clone(&select_first_visible);
             Rc::new(move || {
                 while let Some(child) = flow.first_child() {
@@ -1287,11 +1361,14 @@ mod gtk4_ui {
                             st.icon_cache.insert(entry.id.clone(), tex);
                         }
                     }
+                    st.grid_search = apps.iter().map(SearchIndexEntry::from_app).collect();
                     st.grid_apps = apps.clone();
+                    let needle = current_filter.borrow();
+                    recompute_grid_tiers(&mut st, needle.as_str());
                     apps
                 };
 
-                for entry in &apps {
+                for (idx, entry) in apps.iter().enumerate() {
                     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
                     vbox.set_size_request(96, 84);
                     vbox.set_margin_top(4);
@@ -1309,12 +1386,14 @@ mod gtk4_ui {
                     vbox.append(&lbl);
 
                     let child = gtk4::FlowBoxChild::new();
+                    child.set_widget_name(&idx.to_string());
                     child.set_tooltip_text(Some(&entry.name));
                     child.set_child(Some(&vbox));
                     flow.insert(&child, -1);
                 }
 
                 flow.invalidate_filter();
+                flow.invalidate_sort();
                 select_first_visible();
             })
         };
@@ -1587,15 +1666,25 @@ mod gtk4_ui {
             }
         });
 
-        // Instant in-place search filter + KDE-style Enter to launch & reset
-        search_entry.connect_search_changed({
+        // Instant in-place ranked search filter + KDE-style Enter to launch & reset
+        let apply_filter: Rc<dyn Fn(String)> = Rc::new({
+            let state = Rc::clone(&state);
             let current_filter = Rc::clone(&current_filter);
             let flow = flow.clone();
             let select_first_visible = Rc::clone(&select_first_visible);
-            move |e| {
-                *current_filter.borrow_mut() = e.text().trim().to_lowercase();
+            move |query: String| {
+                *current_filter.borrow_mut() = query.clone();
+                recompute_grid_tiers(&mut state.borrow_mut(), &query);
                 flow.invalidate_filter();
+                flow.invalidate_sort();
                 select_first_visible();
+            }
+        });
+
+        search_entry.connect_search_changed({
+            let apply_filter = Rc::clone(&apply_filter);
+            move |e| {
+                apply_filter(e.text().trim().to_lowercase());
             }
         });
 
@@ -1603,26 +1692,34 @@ mod gtk4_ui {
             let state = Rc::clone(&state);
             let flow = flow.clone();
             let current_filter = Rc::clone(&current_filter);
+            let apply_filter = Rc::clone(&apply_filter);
             let launch_exec_or_app = Rc::clone(&launch_exec_or_app);
             move |e| {
                 let typed = e.text().trim().to_string();
-                let selected_idx = flow
-                    .selected_children()
-                    .first()
-                    .map(|c| c.index() as usize);
+                if let Some(cmd) = search::explicit_command(&typed) {
+                    if !cmd.is_empty() {
+                        launch_exec_or_app(cmd.to_string(), cmd.to_string());
+                    }
+                    return;
+                }
+                // Sync immediately if Enter was pressed before GtkSearchEntry's 150ms debounce fired.
+                let normalized = typed.to_lowercase();
+                if *current_filter.borrow() != normalized {
+                    apply_filter(normalized);
+                }
+                let selected_child = flow.selected_children().into_iter().next();
                 let picked = {
                     let st = state.borrow();
                     let needle = current_filter.borrow();
-                    selected_idx
+                    selected_child
+                        .as_ref()
+                        .filter(|c| child_matches_query(&st, c, needle.as_str()))
+                        .and_then(flow_child_app_idx)
                         .and_then(|idx| st.grid_apps.get(idx))
-                        .filter(|a| {
-                            needle.is_empty() || a.name.to_lowercase().contains(needle.as_str())
-                        })
                         .or_else(|| {
-                            st.grid_apps.iter().find(|a| {
-                                needle.is_empty()
-                                    || a.name.to_lowercase().contains(needle.as_str())
-                            })
+                            first_matching_child(&flow, &st, needle.as_str())
+                                .and_then(|c| flow_child_app_idx(&c))
+                                .and_then(|idx| st.grid_apps.get(idx))
                         })
                         .cloned()
                 };
@@ -1644,13 +1741,15 @@ mod gtk4_ui {
             let current_filter = Rc::clone(&current_filter);
             move |_, key, _, _| {
                 if key == gtk4::gdk::Key::Down {
-                    let target = flow.selected_children().into_iter().next().or_else(|| {
+                    let target = {
                         let needle = current_filter.borrow();
-                        let idx = state.borrow().grid_apps.iter().position(|a| {
-                            needle.is_empty() || a.name.to_lowercase().contains(needle.as_str())
-                        })?;
-                        flow.child_at_index(idx as i32)
-                    });
+                        let st = state.borrow();
+                        flow.selected_children()
+                            .into_iter()
+                            .next()
+                            .filter(|c| child_matches_query(&st, c, needle.as_str()))
+                            .or_else(|| first_matching_child(&flow, &st, needle.as_str()))
+                    };
                     if let Some(child) = target {
                         flow.select_child(&child);
                         child.grab_focus();
@@ -1684,17 +1783,20 @@ mod gtk4_ui {
                 );
                 if is_arrow {
                     let needle = current_filter.borrow();
-                    let apps = &state.borrow().grid_apps;
+                    let st = state.borrow();
                     let mut visible: Vec<(gtk4::FlowBoxChild, f32, f32)> = Vec::new();
-                    for (i, a) in apps.iter().enumerate() {
-                        if needle.is_empty() || a.name.to_lowercase().contains(needle.as_str()) {
-                            if let Some(ch) = flow.child_at_index(i as i32) {
+                    let mut cur = flow.first_child();
+                    while let Some(widget) = cur {
+                        if let Ok(ch) = widget.clone().downcast::<gtk4::FlowBoxChild>() {
+                            if child_matches_query(&st, &ch, needle.as_str()) {
                                 if let Some(b) = ch.compute_bounds(&flow) {
                                     visible.push((ch, b.x(), b.y()));
                                 }
                             }
                         }
+                        cur = widget.next_sibling();
                     }
+                    drop(st);
                     drop(needle);
 
                     if visible.is_empty() {
@@ -1816,8 +1918,8 @@ mod gtk4_ui {
             let state = Rc::clone(&state);
             let launch_exec_or_app = Rc::clone(&launch_exec_or_app);
             move |_, child| {
-                let idx = child.index() as usize;
-                let picked = state.borrow().grid_apps.get(idx).cloned();
+                let picked = flow_child_app_idx(child)
+                    .and_then(|idx| state.borrow().grid_apps.get(idx).cloned());
                 if let Some(app) = picked {
                     launch_exec_or_app(app.name, app.exec);
                 }

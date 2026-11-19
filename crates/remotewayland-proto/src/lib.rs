@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -99,6 +99,8 @@ pub enum PtyMessage {
 pub struct RemoteAppEntry {
     pub id: String,
     pub name: String,
+    pub generic_name: Option<String>,
+    pub keywords: Vec<String>,
     pub exec: String,
     pub categories: Vec<String>,
     pub icon_mime: Option<String>,
@@ -601,5 +603,37 @@ mod tests {
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), cursor);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), scheme);
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn app_list_roundtrip_preserves_search_metadata() {
+        let (mut tx, mut rx) = tokio::io::duplex(4096);
+        let msg = ControlMessage::AppList {
+            apps: vec![
+                RemoteAppEntry {
+                    id: "firefox.desktop".into(),
+                    name: "Firefox".into(),
+                    generic_name: Some("Web Browser".into()),
+                    keywords: vec!["internet".into(), "www".into()],
+                    exec: "firefox".into(),
+                    categories: vec!["Network".into()],
+                    icon_mime: None,
+                    icon_data: Vec::new(),
+                },
+                RemoteAppEntry {
+                    id: "xterm.desktop".into(),
+                    name: "XTerm".into(),
+                    generic_name: None,
+                    keywords: Vec::new(),
+                    exec: "xterm".into(),
+                    categories: Vec::new(),
+                    icon_mime: None,
+                    icon_data: Vec::new(),
+                },
+            ],
+        };
+        write_control_message(&mut tx, &msg).await.unwrap();
+        drop(tx);
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), msg);
     }
 }

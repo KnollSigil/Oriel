@@ -10,6 +10,8 @@ mod launcher;
 mod media;
 mod pty;
 mod quic;
+#[cfg(any(feature = "gtk4", test))]
+mod search;
 mod window;
 
 use std::net::SocketAddr;

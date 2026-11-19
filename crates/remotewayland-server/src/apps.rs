@@ -103,6 +103,22 @@ fn parse_desktop_file(
     icon_dirs: &[PathBuf],
 ) -> Option<RemoteAppEntry> {
     let content = fs::read_to_string(path).ok()?;
+    parse_desktop_content(&content, id, icon_dirs)
+}
+
+fn parse_semicolon_list(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn parse_desktop_content(
+    content: &str,
+    id: &str,
+    icon_dirs: &[PathBuf],
+) -> Option<RemoteAppEntry> {
     let mut in_desktop_entry = false;
     let mut fields: HashMap<String, String> = HashMap::new();
 
@@ -145,14 +161,20 @@ fn parse_desktop_file(
         return None;
     }
 
+    let generic_name = fields
+        .get("GenericName")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let keywords = fields
+        .get("Keywords")
+        .map(|s| parse_semicolon_list(s))
+        .unwrap_or_default();
+
     let categories = fields
         .get("Categories")
-        .map(|s| {
-            s.split(';')
-                .filter(|c| !c.is_empty())
-                .map(|c| c.to_string())
-                .collect()
-        })
+        .map(|s| parse_semicolon_list(s))
         .unwrap_or_default();
 
     let (icon_mime, icon_data) = fields
@@ -164,6 +186,8 @@ fn parse_desktop_file(
     Some(RemoteAppEntry {
         id: id.to_string(),
         name,
+        generic_name,
+        keywords,
         exec,
         categories,
         icon_mime,
@@ -216,4 +240,41 @@ fn read_icon_file(path: &Path) -> Option<(String, Vec<u8>)> {
         _ => return None,
     };
     Some((mime.to_string(), data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_desktop_content_extracts_generic_name_keywords_categories_and_exec() {
+        let content = "\
+            [Desktop Entry]
+            Type=Application
+            Name=Firefox
+            GenericName=Web Browser
+            Keywords=internet; www ; ;web;
+            Categories=Network;WebBrowser;
+            Exec=/usr/bin/firefox %u
+        ";
+        let app = parse_desktop_content(content, "firefox.desktop", &[]).unwrap();
+        assert_eq!(app.id, "firefox.desktop");
+        assert_eq!(app.name, "Firefox");
+        assert_eq!(app.generic_name.as_deref(), Some("Web Browser"));
+        assert_eq!(app.keywords, vec!["internet", "www", "web"]);
+        assert_eq!(app.categories, vec!["Network", "WebBrowser"]);
+        assert_eq!(app.exec, "/usr/bin/firefox");
+    }
+
+    #[test]
+    fn parse_desktop_content_handles_missing_optional_fields_and_hidden() {
+        let minimal = "[Desktop Entry]\nType=Application\nName=XTerm\nExec=xterm %f\n";
+        let app = parse_desktop_content(minimal, "xterm.desktop", &[]).unwrap();
+        assert_eq!(app.generic_name, None);
+        assert!(app.keywords.is_empty());
+        assert_eq!(app.exec, "xterm");
+
+        let hidden = "[Desktop Entry]\nType=Application\nName=Hidden\nExec=true\nNoDisplay=true\n";
+        assert!(parse_desktop_content(hidden, "hidden.desktop", &[]).is_none());
+    }
 }
