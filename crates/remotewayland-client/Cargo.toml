@@ -7,11 +7,13 @@ license.workspace = true
 [features]
 default = ["gtk4"]
 gtk4 = ["dep:gtk4"]
+qt = ["dep:qtbridge"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 gtk4 = { version = "0.9", optional = true, features = ["v4_12"] }
+qtbridge = { version = "0.4", optional = true }
 libc.workspace = true
 lz4_flex.workspace = true
 opus.workspace = true

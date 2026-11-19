@@ -9,8 +9,10 @@ mod hosts;
 mod launcher;
 mod media;
 mod pty;
+#[cfg(feature = "qt")]
+mod qt_launcher;
 mod quic;
-#[cfg(any(feature = "gtk4", test))]
+#[cfg(any(feature = "gtk4", feature = "qt", test))]
 mod search;
 mod window;
 

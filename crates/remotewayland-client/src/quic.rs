@@ -166,7 +166,7 @@ pub async fn connect_and_auth(
 
 /// Events sent from the QUIC client to the launcher UI.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "gtk4"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "gtk4", feature = "qt")), allow(dead_code))]
 pub enum LauncherNetEvent {
     AppList(Vec<RemoteAppEntry>),
     AppState {

@@ -1,19 +1,25 @@
-//! RemoteWayland launcher UI (native GTK4 when `feature = "gtk4"` is enabled,
+//! RemoteWayland launcher UI (native Qt Quick/QML when `feature = "qt"` is enabled,
+//! native GTK4 when `feature = "gtk4"` is enabled without `qt`,
 //! with an interactive terminal fallback otherwise).
 
 use anyhow::Result;
 
-#[cfg(feature = "gtk4")]
+#[cfg(feature = "qt")]
+pub fn run_launcher() -> Result<()> {
+    crate::qt_launcher::run()
+}
+
+#[cfg(all(feature = "gtk4", not(feature = "qt")))]
 pub fn run_launcher() -> Result<()> {
     gtk4_ui::run()
 }
 
-#[cfg(not(feature = "gtk4"))]
+#[cfg(all(not(feature = "gtk4"), not(feature = "qt")))]
 pub fn run_launcher() -> Result<()> {
     cli_ui::run()
 }
 
-#[cfg(not(feature = "gtk4"))]
+#[cfg(all(not(feature = "gtk4"), not(feature = "qt")))]
 mod cli_ui {
     use std::io::{self, BufRead, Write};
 
@@ -208,7 +214,7 @@ mod cli_ui {
     }
 }
 
-#[cfg(feature = "gtk4")]
+#[cfg(all(feature = "gtk4", not(feature = "qt")))]
 mod gtk4_ui {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;

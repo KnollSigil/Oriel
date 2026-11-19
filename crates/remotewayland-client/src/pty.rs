@@ -784,7 +784,7 @@ fn terminal_candidates_with(terminal_env: Option<&str>) -> Vec<String> {
     candidates
 }
 
-#[cfg(any(feature = "gtk4", test))]
+#[cfg(any(feature = "gtk4", feature = "qt", test))]
 fn terminal_candidates() -> Vec<String> {
     let env_term = std::env::var("TERMINAL").ok();
     terminal_candidates_with(env_term.as_deref())
@@ -811,7 +811,7 @@ fn resolve_terminal_candidates(
 }
 
 /// Return installed local terminal emulators in priority order (index 0 is the default).
-#[cfg(any(feature = "gtk4", test))]
+#[cfg(any(feature = "gtk4", feature = "qt", test))]
 pub fn available_local_terminals() -> Vec<String> {
     terminal_candidates()
         .into_iter()
