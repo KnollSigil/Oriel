@@ -53,6 +53,10 @@ struct Cli {
     #[arg(long, hide = true)]
     daemon: bool,
 
+    /// Disable embedded XWayland support (Wayland-only session).
+    #[arg(long)]
+    no_xwayland: bool,
+
     /// Target GUI application and arguments to launch inside the isolated session.
     #[arg(last = true)]
     command: Vec<String>,
@@ -69,6 +73,10 @@ enum ServerSubcommand {
         /// Hostname or IP to embed in the printed URI (defaults to listen IP).
         #[arg(long)]
         host: Option<String>,
+
+        /// Disable embedded XWayland support when starting a new daemon.
+        #[arg(long)]
+        no_xwayland: bool,
     },
 }
 
@@ -86,8 +94,13 @@ async fn main() -> Result<()> {
     // Validate host XDG_RUNTIME_DIR up front (strict 0700 owned by current UID, no /tmp fallback).
     let host_runtime_dir = session::validate_host_runtime_dir()?;
 
-    if let Some(ServerSubcommand::Attach { listen, host }) = cli.subcommand {
-        return run_attach(&host_runtime_dir, listen, host).await;
+    if let Some(ServerSubcommand::Attach {
+        listen,
+        host,
+        no_xwayland,
+    }) = cli.subcommand
+    {
+        return run_attach(&host_runtime_dir, listen, host, no_xwayland).await;
     }
 
     tracing_subscriber::fmt()
@@ -117,7 +130,7 @@ async fn main() -> Result<()> {
     };
     let creds = Arc::new(quic::generate_ephemeral_credentials(token, initial_ttl)?);
 
-    let (comp_handle, event_rx) = compositor::start_compositor(cli.command)?;
+    let (comp_handle, event_rx) = compositor::start_compositor(cli.command, !cli.no_xwayland)?;
     info!(
         socket = ?comp_handle.socket_name,
         session_dir = %session_guard.runtime_dir().display(),
@@ -221,6 +234,7 @@ async fn run_attach(
     host_runtime_dir: &Path,
     listen: SocketAddr,
     host: Option<String>,
+    no_xwayland: bool,
 ) -> Result<()> {
     let sock_path = session::control_socket_path(host_runtime_dir);
     if let Ok(info) = query_control_socket(&sock_path).await {
@@ -244,6 +258,9 @@ async fn run_attach(
         .arg("--listen")
         .arg(listen.to_string())
         .stdin(Stdio::null());
+    if no_xwayland {
+        cmd.arg("--no-xwayland");
+    }
     if let Some(file) = log_file {
         let err_file = file.try_clone().unwrap_or(file);
         cmd.stdout(Stdio::from(err_file));
@@ -292,24 +309,7 @@ fn print_attach_uri(host: &Option<String>, listen: SocketAddr, info: &ControlSoc
 /// Generate a 256-bit cryptographically random session token via `getrandom(2)`.
 fn generate_ephemeral_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    let mut filled = 0;
-    while filled < bytes.len() {
-        let ret = unsafe {
-            libc::getrandom(
-                bytes[filled..].as_mut_ptr().cast::<libc::c_void>(),
-                bytes.len() - filled,
-                0,
-            )
-        };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err).context("getrandom(2) failed while generating session token");
-        }
-        filled += ret as usize;
-    }
+    session::fill_random_bytes(&mut bytes).context("failed to generate session token")?;
 
     let mut hex = String::with_capacity(3 + bytes.len() * 2);
     hex.push_str("rw-");

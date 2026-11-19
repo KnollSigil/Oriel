@@ -6,23 +6,29 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::io::{Read, Write};
-use std::os::unix::io::OwnedFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use calloop::channel::{self, Channel, Sender as CalloopSender};
 use calloop::generic::Generic;
-use calloop::{EventLoop, Interest, Mode, PostAction};
-use remotewayland_proto::{LaunchState, WindowId};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
+use remotewayland_proto::{
+    LaunchState, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
+};
 use smithay::backend::input::KeyState;
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::{PopupKind, PopupManager, Space, Window};
-use smithay::input::keyboard::{FilterResult, XkbConfig};
-use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent};
+use smithay::input::keyboard::{
+    FilterResult, KeyboardTarget, KeysymHandle, ModifiersState, XkbConfig,
+};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent,
+};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -33,7 +39,7 @@ use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{backend::ObjectId, Client, Display, DisplayHandle, Resource};
-use smithay::utils::{Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
+use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     get_parent, with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
@@ -41,9 +47,14 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::{
     request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+};
+use smithay::wayland::selection::primary_selection::{
+    request_primary_client_selection, set_primary_focus, set_primary_selection,
+    PrimarySelectionHandler, PrimarySelectionState,
 };
 use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
@@ -54,9 +65,15 @@ use smithay::wayland::shell::xdg::{
 use smithay::wayland::shm::{with_buffer_contents, ShmHandler, ShmState};
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
+use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
+use smithay::xwayland::xwm::{
+    Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, WmWindowType, X11Window, XwmId,
+};
+use smithay::xwayland::{X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler};
 use smithay::{
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_primary_selection, delegate_seat, delegate_shm, delegate_xdg_decoration,
+    delegate_xdg_shell, delegate_xwayland_shell,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -139,7 +156,18 @@ pub enum CompositorEvent {
         visible: bool,
         shape_name: String,
     },
+    CursorBitmap {
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        bgra: Vec<u8>,
+    },
     ClipboardText {
+        text: String,
+    },
+    PrimarySelectionText {
         text: String,
     },
     AppState {
@@ -185,6 +213,9 @@ pub enum CompositorCommand {
         pressed: bool,
     },
     SetClipboardText {
+        text: String,
+    },
+    SetPrimarySelectionText {
         text: String,
     },
     LaunchApp {
@@ -251,6 +282,116 @@ struct TrackedPopup {
     latest_bgra: Option<(u32, u32, Vec<u8>)>,
 }
 
+struct TrackedX11Window {
+    window_id: WindowId,
+    surface: X11Surface,
+    geo: Rectangle<i32, Logical>,
+    last_title: String,
+    last_app_id: String,
+    last_width: u32,
+    last_height: u32,
+    server_side_decoration: bool,
+    announced: bool,
+    has_window_entry: bool,
+    latest_bgra: Option<(u32, u32, Vec<u8>)>,
+}
+
+struct TrackedX11Popup {
+    window_id: WindowId,
+    parent_id: WindowId,
+    surface: X11Surface,
+    geo: Rectangle<i32, Logical>,
+    rel_pos: (i32, i32),
+    announced: bool,
+    latest_bgra: Option<(u32, u32, Vec<u8>)>,
+}
+
+/// Keyboard focus target supporting both native Wayland surfaces and XWayland `X11Surface`s.
+/// Using `X11Surface` as a `KeyboardTarget` ensures Smithay sends `XSetInputFocus` and
+/// `WM_TAKE_FOCUS` to X11 clients (required for X11 menus/popups in Chromium, GTK, etc.).
+#[derive(Debug, Clone, PartialEq)]
+enum KeyboardFocusTarget {
+    Wayland(WlSurface),
+    X11(X11Surface),
+}
+
+impl IsAlive for KeyboardFocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Wayland(s) => s.alive(),
+            Self::X11(s) => s.alive(),
+        }
+    }
+}
+
+impl WaylandFocus for KeyboardFocusTarget {
+    fn wl_surface(&self) -> Option<std::borrow::Cow<'_, WlSurface>> {
+        match self {
+            Self::Wayland(s) => Some(std::borrow::Cow::Borrowed(s)),
+            Self::X11(s) => s.wl_surface().map(std::borrow::Cow::Owned),
+        }
+    }
+}
+
+impl KeyboardTarget<AppState> for KeyboardFocusTarget {
+    fn enter(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        keys: Vec<KeysymHandle<'_>>,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
+            Self::X11(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
+        }
+    }
+
+    fn leave(&self, seat: &Seat<AppState>, data: &mut AppState, serial: Serial) {
+        match self {
+            Self::Wayland(s) => KeyboardTarget::leave(s, seat, data, serial),
+            Self::X11(s) => KeyboardTarget::leave(s, seat, data, serial),
+        }
+    }
+
+    fn key(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        key: KeysymHandle<'_>,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match self {
+            Self::Wayland(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
+            Self::X11(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
+        }
+    }
+
+    fn modifiers(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        modifiers: ModifiersState,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
+            Self::X11(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
+        }
+    }
+}
+
+/// Tracks which source currently owns a selection (Wayland client, X11 client, or remote host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionOwner {
+    None,
+    RemoteHost,
+    WaylandClient,
+    X11Client,
+}
+
 struct LaunchedApp {
     launch_id: u64,
     name: String,
@@ -262,6 +403,7 @@ struct LaunchedApp {
 #[allow(dead_code)]
 struct AppState {
     display_handle: DisplayHandle,
+    loop_handle: LoopHandle<'static, Self>,
     socket_name: OsString,
     cmd_tx: CalloopSender<CompositorCommand>,
     compositor_state: CompositorState,
@@ -270,16 +412,30 @@ struct AppState {
     xdg_decoration_state: XdgDecorationState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
+    primary_selection_state: PrimarySelectionState,
     cursor_shape_state: CursorShapeManagerState,
     output_manager_state: OutputManagerState,
+    xwayland_shell_state: XWaylandShellState,
+    xwm: Option<X11Wm>,
+    xwayland_client: Option<Client>,
     output: Output,
+    output_size: (i32, i32),
     seat: Seat<Self>,
     space: Space<Window>,
     popups: PopupManager,
     next_window_id: WindowId,
     focused_window_id: WindowId,
+    last_focused_x11_window_id: Option<WindowId>,
+    next_x11_pos: (i32, i32),
+    cursor_surface: Option<WlSurface>,
+    last_cursor_bitmap: Option<(u32, u32, i32, i32, Vec<u8>)>,
+    clipboard_owner: SelectionOwner,
     clipboard_text: Option<String>,
     pending_clipboard_mime: Option<String>,
+    primary_owner: SelectionOwner,
+    primary_text: Option<String>,
+    pending_primary_mime: Option<String>,
+    pending_initial_command: Vec<String>,
     start_time: Instant,
     /// Map from `WlSurface::id()` (`ObjectId`, unique across clients) -> WindowId (for toplevels & popups).
     surface_to_window: HashMap<ObjectId, WindowId>,
@@ -287,6 +443,9 @@ struct AppState {
     surface_buffers: HashMap<ObjectId, (u32, u32, Vec<u8>)>,
     windows: HashMap<WindowId, TrackedWindow>,
     popup_windows: HashMap<WindowId, TrackedPopup>,
+    x11_windows: HashMap<WindowId, TrackedX11Window>,
+    x11_popups: HashMap<WindowId, TrackedX11Popup>,
+    x11_id_by_win: HashMap<X11Window, WindowId>,
     launched_apps: BTreeMap<u64, LaunchedApp>,
     next_server_launch_id: u64,
     event_tx: mpsc::UnboundedSender<CompositorEvent>,
@@ -297,6 +456,86 @@ impl AppState {
         let id = self.next_window_id;
         self.next_window_id += 1;
         id
+    }
+
+    /// Dynamically expand the headless virtual output if a window or X11 geometry
+    /// exceeds its current bounds so X11 windows and menus are not clamped on 4K/ultrawide displays.
+    fn ensure_virtual_output_size(&mut self, min_w: i32, min_h: i32) {
+        let new_w = self.output_size.0.max(min_w);
+        let new_h = self.output_size.1.max(min_h);
+        if (new_w, new_h) != self.output_size {
+            self.output_size = (new_w, new_h);
+            let mode = OutputMode {
+                size: (new_w, new_h).into(),
+                refresh: 60_000,
+            };
+            self.output
+                .change_current_state(Some(mode), None, None, Some((0, 0).into()));
+            self.output.set_preferred(mode);
+            debug!(width = new_w, height = new_h, "expanded headless virtual output");
+        }
+    }
+
+    fn alloc_x11_position(&mut self, w: i32, h: i32) -> (i32, i32) {
+        let (x, y) = self.next_x11_pos;
+        let next_x = if x + 40 + w.min(800) > self.output_size.0 {
+            100
+        } else {
+            x + 40
+        };
+        let next_y = if y + 40 + h.min(600) > self.output_size.1 {
+            100
+        } else {
+            y + 40
+        };
+        self.next_x11_pos = (next_x, next_y);
+        self.ensure_virtual_output_size(x + w + 64, y + h + 64);
+        (x, y)
+    }
+
+    fn emit_cursor_surface_bitmap(&mut self, surf: &WlSurface) {
+        let Some((w, h, bgra)) = self.surface_buffers.get(&surf.id()) else {
+            return;
+        };
+        if *w == 0 || *h == 0 || *w > MAX_CURSOR_DIM || *h > MAX_CURSOR_DIM {
+            return;
+        }
+        let (hotspot_x, hotspot_y) = with_states(surf, |states| {
+            states
+                .data_map
+                .get::<CursorImageSurfaceData>()
+                .and_then(|d| d.lock().ok())
+                .map(|attrs| (attrs.hotspot.x, attrs.hotspot.y))
+                .unwrap_or((0, 0))
+        });
+        if self
+            .last_cursor_bitmap
+            .as_ref()
+            .is_some_and(|(lw, lh, lhx, lhy, lbgra)| {
+                *lw == *w && *lh == *h && *lhx == hotspot_x && *lhy == hotspot_y && lbgra == bgra
+            })
+        {
+            return;
+        }
+        let bgra_cloned = bgra.clone();
+        self.last_cursor_bitmap = Some((*w, *h, hotspot_x, hotspot_y, bgra_cloned.clone()));
+        let _ = self.event_tx.send(CompositorEvent::CursorBitmap {
+            window_id: self.focused_window_id,
+            width: *w,
+            height: *h,
+            hotspot_x,
+            hotspot_y,
+            bgra: bgra_cloned,
+        });
+    }
+
+    fn cleanup_xwayland_state(&mut self) {
+        crate::session::clear_x11_env();
+        self.xwm = None;
+        let x11_wins: Vec<X11Window> = self.x11_id_by_win.keys().copied().collect();
+        for win in x11_wins {
+            self.remove_x11_window(win);
+        }
     }
 
     fn hit_test_tree(
@@ -400,15 +639,51 @@ impl AppState {
                         });
                         toplevel.send_pending_configure();
                     }
+                } else if let Some(xwin) = self.x11_windows.get_mut(&window_id) {
+                    let w = width.max(1) as i32;
+                    let h = height.max(1) as i32;
+                    let mut geo = xwin.geo;
+                    geo.size = (w, h).into();
+                    let min_w = geo.loc.x + geo.size.w + 64;
+                    let min_h = geo.loc.y + geo.size.h + 64;
+                    xwin.geo = geo;
+                    let surf = xwin.surface.clone();
+                    let has_child_popup = self
+                        .x11_popups
+                        .values()
+                        .any(|p| p.parent_id == window_id);
+                    let _ = surf.set_maximized(maximized);
+                    let _ = surf.set_fullscreen(fullscreen);
+                    if activated || !has_child_popup {
+                        let _ = surf.set_activated(activated);
+                    }
+                    let _ = surf.configure(geo);
+                    if activated && !has_child_popup {
+                        if let Some(xwm) = self.xwm.as_mut() {
+                            let _ = xwm.raise_window(&surf);
+                        }
+                        if let Some(keyboard) = self.seat.get_keyboard() {
+                            let target = KeyboardFocusTarget::X11(surf.clone());
+                            if keyboard.current_focus().as_ref() != Some(&target) {
+                                keyboard.set_focus(self, Some(target), serial);
+                            }
+                        }
+                    }
+                    self.ensure_virtual_output_size(min_w, min_h);
                 }
             }
             CompositorCommand::CloseWindow { window_id } => {
+                debug!(window_id, "CloseWindow command received from client");
                 if let Some(tracked) = self.windows.get(&window_id) {
                     if let Some(toplevel) = tracked.window.toplevel() {
                         toplevel.send_close();
                     }
                 } else if let Some(popup) = self.popup_windows.get(&window_id) {
                     popup.surface.send_popup_done();
+                } else if let Some(xwin) = self.x11_windows.get(&window_id) {
+                    let _ = xwin.surface.close();
+                } else if let Some(xpop) = self.x11_popups.get(&window_id) {
+                    let _ = xpop.surface.close();
                 }
             }
             CompositorCommand::PointerMotion { window_id, x, y } => {
@@ -422,6 +697,26 @@ impl AppState {
                     } else if let Some(tp) = self.popup_windows.get(&window_id) {
                         let (gx, gy) = tp.geo_offset;
                         self.hit_test_tree(tp.surface.wl_surface(), (-gx, -gy), x, y)
+                    } else if let Some(xw) = self.x11_windows.get(&window_id) {
+                        let ox = xw.geo.loc.x as f64;
+                        let oy = xw.geo.loc.y as f64;
+                        xw.surface.wl_surface().map(|s| {
+                            (
+                                s,
+                                Point::<f64, Logical>::from((ox, oy)),
+                                Point::<f64, Logical>::from((ox + x, oy + y)),
+                            )
+                        })
+                    } else if let Some(xp) = self.x11_popups.get(&window_id) {
+                        let ox = xp.geo.loc.x as f64;
+                        let oy = xp.geo.loc.y as f64;
+                        xp.surface.wl_surface().map(|s| {
+                            (
+                                s,
+                                Point::<f64, Logical>::from((ox, oy)),
+                                Point::<f64, Logical>::from((ox + x, oy + y)),
+                            )
+                        })
                     } else {
                         None
                     };
@@ -449,16 +744,36 @@ impl AppState {
             } => {
                 self.focused_window_id = window_id;
                 if pressed {
-                    if let (Some(keyboard), Some(tracked)) =
-                        (self.seat.get_keyboard(), self.windows.get(&window_id))
-                    {
-                        if let Some(toplevel) = tracked.window.toplevel() {
-                            let root_surface = toplevel.wl_surface().clone();
-                            if keyboard.current_focus().as_ref() != Some(&root_surface) {
-                                keyboard.set_focus(self, Some(root_surface.clone()), serial);
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        if let Some(tracked) = self.windows.get(&window_id) {
+                            if let Some(toplevel) = tracked.window.toplevel() {
+                                let root_surface = toplevel.wl_surface().clone();
+                                let target = KeyboardFocusTarget::Wayland(root_surface.clone());
+                                if keyboard.current_focus().as_ref() != Some(&target) {
+                                    keyboard.set_focus(self, Some(target), serial);
+                                }
+                                for (popup, _) in PopupManager::popups_for_surface(&root_surface) {
+                                    let _ = PopupManager::dismiss_popup(&root_surface, &popup);
+                                }
                             }
-                            for (popup, _) in PopupManager::popups_for_surface(&root_surface) {
-                                let _ = PopupManager::dismiss_popup(&root_surface, &popup);
+                        } else if let Some(xw) = self.x11_windows.get(&window_id) {
+                            self.last_focused_x11_window_id = Some(window_id);
+                            let x11_surf = xw.surface.clone();
+                            let has_child_popup = self
+                                .x11_popups
+                                .values()
+                                .any(|p| p.parent_id == window_id);
+                            let target = KeyboardFocusTarget::X11(x11_surf.clone());
+                            if keyboard.current_focus().as_ref() != Some(&target) {
+                                keyboard.set_focus(self, Some(target), serial);
+                            }
+                            if !x11_surf.is_activated() {
+                                let _ = x11_surf.set_activated(true);
+                                if !has_child_popup {
+                                    if let Some(xwm) = self.xwm.as_mut() {
+                                        let _ = xwm.raise_window(&x11_surf);
+                                    }
+                                }
                             }
                         }
                     }
@@ -508,13 +823,21 @@ impl AppState {
                 if let Some(keyboard) = self.seat.get_keyboard() {
                     if let Some(tracked) = self.windows.get(&window_id) {
                         if let Some(toplevel) = tracked.window.toplevel() {
-                            if keyboard.current_focus().as_ref() != Some(toplevel.wl_surface()) {
-                                keyboard.set_focus(
-                                    self,
-                                    Some(toplevel.wl_surface().clone()),
-                                    serial,
-                                );
+                            let target = KeyboardFocusTarget::Wayland(toplevel.wl_surface().clone());
+                            if keyboard.current_focus().as_ref() != Some(&target) {
+                                keyboard.set_focus(self, Some(target), serial);
                             }
+                        }
+                    } else if let Some(xw) = self.x11_windows.get(&window_id) {
+                        self.last_focused_x11_window_id = Some(window_id);
+                        let target = KeyboardFocusTarget::X11(xw.surface.clone());
+                        if keyboard.current_focus().as_ref() != Some(&target) {
+                            keyboard.set_focus(self, Some(target), serial);
+                        }
+                    } else if let Some(xp) = self.x11_popups.get(&window_id) {
+                        let target = KeyboardFocusTarget::X11(xp.surface.clone());
+                        if keyboard.current_focus().as_ref() != Some(&target) {
+                            keyboard.set_focus(self, Some(target), serial);
                         }
                     }
                     let state = if pressed {
@@ -534,23 +857,32 @@ impl AppState {
                 }
             }
             CompositorCommand::SetClipboardText { text } => {
-                if self.clipboard_text.as_deref() == Some(text.as_str()) {
+                if self.clipboard_owner == SelectionOwner::RemoteHost
+                    && self.clipboard_text.as_deref() == Some(text.as_str())
+                {
                     return;
                 }
+                self.clipboard_owner = SelectionOwner::RemoteHost;
                 self.clipboard_text = Some(text);
-                set_data_device_selection(
-                    &self.display_handle,
-                    &self.seat,
-                    vec![
-                        "text/plain;charset=utf-8".to_string(),
-                        "text/plain;charset=UTF-8".to_string(),
-                        "UTF8_STRING".to_string(),
-                        "text/plain".to_string(),
-                        "STRING".to_string(),
-                        "TEXT".to_string(),
-                    ],
-                    (),
-                );
+                let mimes = text_selection_mimes();
+                set_data_device_selection(&self.display_handle, &self.seat, mimes.clone(), ());
+                if let Some(xwm) = self.xwm.as_mut() {
+                    let _ = xwm.new_selection(SelectionTarget::Clipboard, Some(mimes));
+                }
+            }
+            CompositorCommand::SetPrimarySelectionText { text } => {
+                if self.primary_owner == SelectionOwner::RemoteHost
+                    && self.primary_text.as_deref() == Some(text.as_str())
+                {
+                    return;
+                }
+                self.primary_owner = SelectionOwner::RemoteHost;
+                self.primary_text = Some(text);
+                let mimes = text_selection_mimes();
+                set_primary_selection(&self.display_handle, &self.seat, mimes.clone(), ());
+                if let Some(xwm) = self.xwm.as_mut() {
+                    let _ = xwm.new_selection(SelectionTarget::Primary, Some(mimes));
+                }
             }
             CompositorCommand::LaunchApp {
                 launch_id,
@@ -602,6 +934,8 @@ impl AppState {
                         if let Some(toplevel) = tracked.window.toplevel() {
                             toplevel.send_close();
                         }
+                    } else if let Some(xwin) = self.x11_windows.get(&wid) {
+                        let _ = xwin.surface.close();
                     }
                 } else if let Some(app) = self.launched_apps.get(&launch_id) {
                     if !matches!(app.state, LaunchState::Exited(_)) && app.pgid > 0 {
@@ -629,6 +963,22 @@ impl AppState {
                                     tracked.last_title.clone()
                                 } else {
                                     tracked.last_app_id.clone()
+                                };
+                                let _ = self.event_tx.send(CompositorEvent::AppState {
+                                    launch_id: WINDOW_LAUNCH_ID_BASE | wid,
+                                    name: win_name,
+                                    state: LaunchState::Running,
+                                });
+                            }
+                        } else if let Some(xwin) = self.x11_windows.get_mut(&wid) {
+                            if !xwin.has_window_entry {
+                                xwin.has_window_entry = true;
+                                let win_name = if !app.name.is_empty() {
+                                    app.name
+                                } else if !xwin.last_title.is_empty() {
+                                    xwin.last_title.clone()
+                                } else {
+                                    xwin.last_app_id.clone()
                                 };
                                 let _ = self.event_tx.send(CompositorEvent::AppState {
                                     launch_id: WINDOW_LAUNCH_ID_BASE | wid,
@@ -698,6 +1048,63 @@ impl AppState {
                             });
                             let _ = self.event_tx.send(CompositorEvent::PopupFrame {
                                 window_id: popup.window_id,
+                                width: *w,
+                                height: *h,
+                                bgra: bgra.clone(),
+                            });
+                        }
+                    }
+                }
+                for xwin in self.x11_windows.values() {
+                    if xwin.announced {
+                        if xwin.has_window_entry {
+                            let win_name = if !xwin.last_title.is_empty() {
+                                xwin.last_title.clone()
+                            } else if !xwin.last_app_id.is_empty() {
+                                xwin.last_app_id.clone()
+                            } else {
+                                format!("X11 Window #{}", xwin.window_id)
+                            };
+                            let _ = self.event_tx.send(CompositorEvent::AppState {
+                                launch_id: WINDOW_LAUNCH_ID_BASE | xwin.window_id,
+                                name: win_name,
+                                state: LaunchState::Running,
+                            });
+                        }
+                        let _ = self.event_tx.send(CompositorEvent::WindowCreated {
+                            window_id: xwin.window_id,
+                            title: xwin.last_title.clone(),
+                            app_id: xwin.last_app_id.clone(),
+                            width: xwin.last_width,
+                            height: xwin.last_height,
+                        });
+                        let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
+                            window_id: xwin.window_id,
+                            server_side: xwin.server_side_decoration,
+                        });
+                        if let Some((w, h, bgra)) = &xwin.latest_bgra {
+                            let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
+                                window_id: xwin.window_id,
+                                width: *w,
+                                height: *h,
+                                bgra: bgra.clone(),
+                            });
+                        }
+                    }
+                }
+                for xpop in self.x11_popups.values() {
+                    if xpop.announced {
+                        if let Some((w, h, bgra)) = &xpop.latest_bgra {
+                            let _ = self.event_tx.send(CompositorEvent::PopupCreated {
+                                window_id: xpop.window_id,
+                                parent_id: xpop.parent_id,
+                                x: xpop.rel_pos.0,
+                                y: xpop.rel_pos.1,
+                                width: *w,
+                                height: *h,
+                            });
+                            let _ = self.event_tx.send(CompositorEvent::PopupFrame {
+                                window_id: xpop.window_id,
                                 width: *w,
                                 height: *h,
                                 bgra: bgra.clone(),
@@ -965,21 +1372,32 @@ impl CompositorHandler for AppState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        if let Some(state) = client.get_data::<ClientState>() {
+            return &state.compositor_state;
+        }
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
+        panic!("unknown Wayland client data type");
     }
 
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
 
+        let is_cursor_surface = self
+            .cursor_surface
+            .as_ref()
+            .is_some_and(|cs| cs == surface);
+
         let mut cur = surface.clone();
-        let window_id = loop {
+        let window_id_opt = loop {
             let key = cur.id();
             if let Some(&wid) = self.surface_to_window.get(&key) {
-                break wid;
+                break Some(wid);
             }
             match get_parent(&cur) {
                 Some(parent) => cur = parent,
-                None => return,
+                None => break None,
             }
         };
 
@@ -1026,6 +1444,14 @@ impl CompositorHandler for AppState {
             buffer.release();
         }
 
+        if is_cursor_surface {
+            self.emit_cursor_surface_bitmap(surface);
+        }
+
+        let Some(window_id) = window_id_opt else {
+            return;
+        };
+
         if let Some(tracked) = self.windows.get_mut(&window_id) {
             tracked.window.on_commit();
             if let Some(toplevel) = tracked.window.toplevel() {
@@ -1034,6 +1460,10 @@ impl CompositorHandler for AppState {
             }
         } else if self.popup_windows.contains_key(&window_id) {
             self.recomposite_popup(window_id);
+        } else if self.x11_windows.contains_key(&window_id) {
+            self.recomposite_x11_window(window_id, surface);
+        } else if self.x11_popups.contains_key(&window_id) {
+            self.recomposite_x11_popup(window_id, surface);
         }
     }
 }
@@ -1085,7 +1515,7 @@ impl XdgShellHandler for AppState {
         self.focused_window_id = window_id;
         if let Some(keyboard) = self.seat.get_keyboard() {
             let serial = SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, Some(wl_surface), serial);
+            keyboard.set_focus(self, Some(KeyboardFocusTarget::Wayland(wl_surface)), serial);
         }
         debug!(window_id, ?surf_id, "new xdg_toplevel registered");
     }
@@ -1236,9 +1666,11 @@ impl XdgShellHandler for AppState {
         let geo = positioner.get_geometry();
         surface.with_pending_state(|state| {
             state.geometry = geo;
+            state.positioner = positioner;
         });
         let _ = self.popups.track_popup(PopupKind::Xdg(surface.clone()));
         let _ = surface.send_configure();
+        debug!(window_id, parent_id, ?geo, "Wayland xdg_popup created");
 
         self.surface_to_window.insert(surf_id.clone(), window_id);
         self.popup_windows.insert(
@@ -1302,7 +1734,7 @@ impl XdgShellHandler for AppState {
 }
 
 impl SeatHandler for AppState {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -1310,22 +1742,138 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
         let dh = &self.display_handle;
-        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
-        set_data_device_focus(dh, seat, client);
+        let client = focused
+            .and_then(|f| f.wl_surface())
+            .and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client.clone());
+        set_primary_focus(dh, seat, client);
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        let (visible, shape_name) = match image {
-            CursorImageStatus::Hidden => (false, String::new()),
-            CursorImageStatus::Named(icon) => (true, icon.name().to_string()),
-            CursorImageStatus::Surface(_) => (true, "default".to_string()),
+        match image {
+            CursorImageStatus::Hidden => {
+                self.cursor_surface = None;
+                self.last_cursor_bitmap = None;
+                let _ = self.event_tx.send(CompositorEvent::CursorUpdate {
+                    window_id: self.focused_window_id,
+                    visible: false,
+                    shape_name: String::new(),
+                });
+            }
+            CursorImageStatus::Named(icon) => {
+                self.cursor_surface = None;
+                self.last_cursor_bitmap = None;
+                let _ = self.event_tx.send(CompositorEvent::CursorUpdate {
+                    window_id: self.focused_window_id,
+                    visible: true,
+                    shape_name: icon.name().to_string(),
+                });
+            }
+            CursorImageStatus::Surface(surf) => {
+                self.cursor_surface = Some(surf.clone());
+                if self.surface_buffers.contains_key(&surf.id()) {
+                    self.emit_cursor_surface_bitmap(&surf);
+                } else {
+                    self.last_cursor_bitmap = None;
+                    let _ = self.event_tx.send(CompositorEvent::CursorUpdate {
+                        window_id: self.focused_window_id,
+                        visible: true,
+                        shape_name: "default".to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn text_selection_mimes() -> Vec<String> {
+    SUPPORTED_TEXT_MIMES.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn pick_preferred_text_mime(mime_types: &[String]) -> Option<String> {
+    SUPPORTED_TEXT_MIMES
+        .iter()
+        .find(|&&m| mime_types.iter().any(|t| t == m))
+        .map(|&m| m.to_string())
+}
+
+/// Read up to `MAX_SELECTION_BYTES` of UTF-8 text from a selection pipe with a
+/// bounded `poll(2)` deadline so a misbehaving client cannot leak threads or RAM.
+fn read_selection_fd_bounded(fd: OwnedFd) -> Option<String> {
+    let raw = fd.as_raw_fd();
+    let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while buf.len() < MAX_SELECTION_BYTES {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
         };
-        let _ = self.event_tx.send(CompositorEvent::CursorUpdate {
-            window_id: self.focused_window_id,
-            visible,
-            shape_name,
-        });
+        let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if rc == 0 {
+            break;
+        }
+        let max_read = chunk.len().min(MAX_SELECTION_BYTES - buf.len());
+        let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast::<libc::c_void>(), max_read) };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+    }
+    String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+}
+
+/// Write selection bytes to `fd` with a bounded `poll(2)` deadline so a stalled
+/// reader cannot pin a worker thread indefinitely.
+fn write_selection_fd_timeout(fd: OwnedFd, bytes: &[u8]) {
+    let raw = fd.as_raw_fd();
+    let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
+    let mut written = 0;
+    while written < bytes.len() {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if rc == 0 || (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
+            break;
+        }
+        let n = unsafe {
+            libc::write(
+                raw,
+                bytes[written..].as_ptr().cast::<libc::c_void>(),
+                bytes.len() - written,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        written += n as usize;
     }
 }
 
@@ -1338,70 +1886,884 @@ impl SelectionHandler for AppState {
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
-        if ty != SelectionTarget::Clipboard {
-            return;
+        let is_clipboard = ty == SelectionTarget::Clipboard;
+        if is_clipboard {
+            self.clipboard_text = None;
+            self.clipboard_owner = if source.is_some() {
+                SelectionOwner::WaylandClient
+            } else {
+                SelectionOwner::None
+            };
+        } else {
+            self.primary_text = None;
+            self.primary_owner = if source.is_some() {
+                SelectionOwner::WaylandClient
+            } else {
+                SelectionOwner::None
+            };
         }
-        // Remote client now owns or cleared the selection, so invalidate cached host text.
-        self.clipboard_text = None;
+
         if let Some(src) = source {
             let mime_types = src.mime_types();
-            let preferred = [
-                "text/plain;charset=utf-8",
-                "text/plain;charset=UTF-8",
-                "UTF8_STRING",
-                "text/plain",
-                "STRING",
-                "TEXT",
-            ]
-            .into_iter()
-            .find(|m| mime_types.iter().any(|t| t == m));
-            if let Some(mime) = preferred {
-                // Note: Smithay invokes `SelectionHandler::new_selection` BEFORE storing the new
-                // `OfferReplySource::Client(source)` into `SeatData::set_clipboard_selection`.
-                // Defer `request_data_device_client_selection` until right after dispatch finishes.
-                self.pending_clipboard_mime = Some(mime.to_string());
+            if let Some(xwm) = self.xwm.as_mut() {
+                let _ = xwm.new_selection(ty, Some(mime_types.clone()));
             }
+            if let Some(mime) = pick_preferred_text_mime(&mime_types) {
+                // Note: Smithay invokes `SelectionHandler::new_selection` BEFORE storing the new
+                // `OfferReplySource::Client(source)` into `SeatData`.
+                // Defer requesting client selection until right after dispatch finishes.
+                if is_clipboard {
+                    self.pending_clipboard_mime = Some(mime);
+                } else {
+                    self.pending_primary_mime = Some(mime);
+                }
+            }
+        } else if let Some(xwm) = self.xwm.as_mut() {
+            let _ = xwm.new_selection(ty, None);
         }
     }
 
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
-        _mime_type: String,
+        mime_type: String,
         fd: OwnedFd,
         _seat: Seat<Self>,
         _user_data: &Self::SelectionUserData,
     ) {
-        if ty == SelectionTarget::Clipboard {
-            if let Some(text) = self.clipboard_text.clone() {
-                std::thread::spawn(move || {
-                    let mut file = std::fs::File::from(fd);
-                    let _ = file.write_all(text.as_bytes());
-                });
+        let (owner, cached) = match ty {
+            SelectionTarget::Clipboard => (self.clipboard_owner, self.clipboard_text.clone()),
+            SelectionTarget::Primary => (self.primary_owner, self.primary_text.clone()),
+        };
+        match owner {
+            SelectionOwner::RemoteHost => {
+                if let Some(text) = cached {
+                    std::thread::spawn(move || {
+                        write_selection_fd_timeout(fd, text.as_bytes());
+                    });
+                }
             }
+            SelectionOwner::X11Client => {
+                if let Some(xwm) = self.xwm.as_mut() {
+                    if let Err(err) =
+                        xwm.send_selection(ty, mime_type, fd, self.loop_handle.clone())
+                    {
+                        debug!(error = ?err, ?ty, "X11Wm::send_selection failed for Wayland client");
+                    }
+                }
+            }
+            SelectionOwner::WaylandClient | SelectionOwner::None => {}
         }
     }
 }
 
 impl AppState {
-    fn poll_pending_clipboard(&mut self) {
-        let Some(mime) = self.pending_clipboard_mime.take() else {
-            return;
-        };
-        let Ok((mut read_pipe, write_pipe)) = std::io::pipe() else {
-            return;
-        };
-        let write_fd: OwnedFd = write_pipe.into();
-        if request_data_device_client_selection(&self.seat, mime, write_fd).is_ok() {
-            let _ = self.display_handle.flush_clients();
-            let event_tx = self.event_tx.clone();
-            std::thread::spawn(move || {
-                let mut text = String::new();
-                if read_pipe.read_to_string(&mut text).is_ok() && !text.is_empty() {
-                    let _ = event_tx.send(CompositorEvent::ClipboardText { text });
+    fn poll_pending_selections(&mut self) {
+        if let Some(mime) = self.pending_clipboard_mime.take() {
+            if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
+                let write_fd: OwnedFd = write_pipe.into();
+                if request_data_device_client_selection(&self.seat, mime, write_fd).is_ok() {
+                    let _ = self.display_handle.flush_clients();
+                    let event_tx = self.event_tx.clone();
+                    let read_fd: OwnedFd = read_pipe.into();
+                    std::thread::spawn(move || {
+                        if let Some(text) = read_selection_fd_bounded(read_fd) {
+                            let _ = event_tx.send(CompositorEvent::ClipboardText { text });
+                        }
+                    });
                 }
+            }
+        }
+        if let Some(mime) = self.pending_primary_mime.take() {
+            if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
+                let write_fd: OwnedFd = write_pipe.into();
+                if request_primary_client_selection(&self.seat, mime, write_fd).is_ok() {
+                    let _ = self.display_handle.flush_clients();
+                    let event_tx = self.event_tx.clone();
+                    let read_fd: OwnedFd = read_pipe.into();
+                    std::thread::spawn(move || {
+                        if let Some(text) = read_selection_fd_bounded(read_fd) {
+                            let _ = event_tx.send(CompositorEvent::PrimarySelectionText { text });
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn recomposite_x11_window(&mut self, window_id: WindowId, wl_surface: &WlSurface) {
+        let Some((w, h, bgra_ref)) = self.surface_buffers.get(&wl_surface.id()) else {
+            return;
+        };
+        let (w, h) = (*w, *h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(xwin) = self.x11_windows.get_mut(&window_id) else {
+            return;
+        };
+        let mut title = xwin.surface.title();
+        let app_id = xwin.surface.class();
+        if title.is_empty() {
+            title = if !app_id.is_empty() {
+                app_id.clone()
+            } else {
+                format!("X11 Window #{window_id}")
+            };
+        }
+        let title_or_app_changed = title != xwin.last_title || app_id != xwin.last_app_id;
+        let size_changed = w != xwin.last_width || h != xwin.last_height;
+        let frame_unchanged = xwin.announced
+            && !title_or_app_changed
+            && xwin
+                .latest_bgra
+                .as_ref()
+                .is_some_and(|(lw, lh, lbgra)| *lw == w && *lh == h && lbgra == bgra_ref);
+        if frame_unchanged {
+            return;
+        }
+
+        let bgra = bgra_ref.clone();
+        xwin.last_title = title.clone();
+        xwin.last_app_id = app_id.clone();
+        xwin.last_width = w;
+        xwin.last_height = h;
+        xwin.latest_bgra = Some((w, h, bgra.clone()));
+
+        if !xwin.announced {
+            xwin.announced = true;
+            let ssd = xwin.server_side_decoration;
+            let _ = self.event_tx.send(CompositorEvent::WindowCreated {
+                window_id,
+                title: title.clone(),
+                app_id: app_id.clone(),
+                width: w,
+                height: h,
+            });
+            let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
+                window_id,
+                server_side: ssd,
+            });
+
+            // Link to an in-flight launched app if any, or emit a standalone window AppState.
+            let mut matched_launch = None;
+            for app in self.launched_apps.values_mut() {
+                if app.state == LaunchState::Launching && app.linked_window_id.is_none() {
+                    app.state = LaunchState::Running;
+                    app.linked_window_id = Some(window_id);
+                    matched_launch = Some((app.launch_id, app.name.clone()));
+                    break;
+                }
+            }
+            if let Some((lid, lname)) = matched_launch {
+                let _ = self.event_tx.send(CompositorEvent::AppState {
+                    launch_id: lid,
+                    name: lname,
+                    state: LaunchState::Running,
+                });
+            } else if let Some(xwin_mut) = self.x11_windows.get_mut(&window_id) {
+                xwin_mut.has_window_entry = true;
+                let _ = self.event_tx.send(CompositorEvent::AppState {
+                    launch_id: WINDOW_LAUNCH_ID_BASE | window_id,
+                    name: title,
+                    state: LaunchState::Running,
+                });
+            }
+        } else {
+            if title_or_app_changed {
+                let _ = self.event_tx.send(CompositorEvent::WindowCreated {
+                    window_id,
+                    title,
+                    app_id,
+                    width: w,
+                    height: h,
+                });
+            }
+            if size_changed {
+                let _ = self.event_tx.send(CompositorEvent::WindowConfigured {
+                    window_id,
+                    width: w,
+                    height: h,
+                    scale_factor: 1.0,
+                });
+            }
+        }
+
+        let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
+            window_id,
+            width: w,
+            height: h,
+            bgra,
+        });
+    }
+
+    fn recomposite_x11_popup(&mut self, window_id: WindowId, wl_surface: &WlSurface) {
+        let Some((w, h, bgra_ref)) = self.surface_buffers.get(&wl_surface.id()) else {
+            return;
+        };
+        let (w, h) = (*w, *h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(xpop) = self.x11_popups.get_mut(&window_id) else {
+            return;
+        };
+        if xpop.announced
+            && xpop
+                .latest_bgra
+                .as_ref()
+                .is_some_and(|(lw, lh, lbgra)| *lw == w && *lh == h && lbgra == bgra_ref)
+        {
+            return;
+        }
+        let bgra = bgra_ref.clone();
+        xpop.latest_bgra = Some((w, h, bgra.clone()));
+        if !xpop.announced {
+            xpop.announced = true;
+            debug!(
+                window_id,
+                parent_id = xpop.parent_id,
+                x = xpop.rel_pos.0,
+                y = xpop.rel_pos.1,
+                w,
+                h,
+                "emitting PopupCreated for X11 popup"
+            );
+            let _ = self.event_tx.send(CompositorEvent::PopupCreated {
+                window_id,
+                parent_id: xpop.parent_id,
+                x: xpop.rel_pos.0,
+                y: xpop.rel_pos.1,
+                width: w,
+                height: h,
             });
         }
+        let _ = self.event_tx.send(CompositorEvent::PopupFrame {
+            window_id,
+            width: w,
+            height: h,
+            bgra,
+        });
+    }
+
+    fn find_x11_parent(&self, window: &X11Surface) -> Option<(WindowId, Rectangle<i32, Logical>)> {
+        if let Some(transient_x11) = window.is_transient_for() {
+            if let Some(&pid) = self.x11_id_by_win.get(&transient_x11) {
+                if let Some(parent) = self.x11_windows.get(&pid).filter(|p| p.announced) {
+                    return Some((pid, parent.geo));
+                }
+            }
+        }
+        if let Some(pid) = window.pid() {
+            if let Some(focused_id) = self.last_focused_x11_window_id {
+                if let Some(parent) = self.x11_windows.get(&focused_id).filter(|p| p.announced) {
+                    if parent.surface.pid() == Some(pid) {
+                        return Some((focused_id, parent.geo));
+                    }
+                }
+            }
+            for (&wid, parent) in &self.x11_windows {
+                if parent.announced && parent.surface.pid() == Some(pid) {
+                    return Some((wid, parent.geo));
+                }
+            }
+        }
+        if let Some(focused_id) = self.last_focused_x11_window_id {
+            if let Some(parent) = self.x11_windows.get(&focused_id).filter(|p| p.announced) {
+                return Some((focused_id, parent.geo));
+            }
+        }
+        self.x11_windows
+            .iter()
+            .find(|(_, parent)| parent.announced)
+            .map(|(&wid, parent)| (wid, parent.geo))
+    }
+
+    fn remove_x11_window(&mut self, x11_win: X11Window) {
+        let Some(window_id) = self.x11_id_by_win.remove(&x11_win) else {
+            return;
+        };
+        if let Some(xwin) = self.x11_windows.remove(&window_id) {
+            if let Some(wl) = xwin.surface.wl_surface() {
+                self.surface_to_window.remove(&wl.id());
+                self.surface_buffers.remove(&wl.id());
+            }
+            if self.last_focused_x11_window_id == Some(window_id) {
+                self.last_focused_x11_window_id = self.x11_windows.keys().next().copied();
+            }
+            if xwin.has_window_entry {
+                let _ = self.event_tx.send(CompositorEvent::AppState {
+                    launch_id: WINDOW_LAUNCH_ID_BASE | window_id,
+                    name: xwin.last_title,
+                    state: LaunchState::Exited(0),
+                });
+            }
+            if xwin.announced {
+                let _ = self
+                    .event_tx
+                    .send(CompositorEvent::WindowClosed { window_id });
+            }
+        } else if let Some(xpop) = self.x11_popups.remove(&window_id) {
+            debug!(
+                window_id,
+                x11_win,
+                announced = xpop.announced,
+                "removing X11 popup"
+            );
+            if let Some(wl) = xpop.surface.wl_surface() {
+                self.surface_to_window.remove(&wl.id());
+                self.surface_buffers.remove(&wl.id());
+            }
+            if xpop.announced {
+                let _ = self
+                    .event_tx
+                    .send(CompositorEvent::WindowClosed { window_id });
+            }
+        }
+    }
+}
+
+impl PrimarySelectionHandler for AppState {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+impl XWaylandShellHandler for AppState {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+
+    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
+        let x11_win = surface.window_id();
+        debug!(
+            x11_win,
+            wl_id = ?wl_surface.id(),
+            tracked = self.x11_id_by_win.contains_key(&x11_win),
+            "XWayland surface_associated"
+        );
+        if let Some(&window_id) = self.x11_id_by_win.get(&x11_win) {
+            self.surface_to_window.insert(wl_surface.id(), window_id);
+            if self.x11_windows.contains_key(&window_id) {
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    let target = KeyboardFocusTarget::X11(surface.clone());
+                    if keyboard.current_focus().as_ref() != Some(&target) {
+                        keyboard.set_focus(self, Some(target), SERIAL_COUNTER.next_serial());
+                    }
+                }
+                self.recomposite_x11_window(window_id, &wl_surface);
+            } else if self.x11_popups.contains_key(&window_id) {
+                self.recomposite_x11_popup(window_id, &wl_surface);
+            }
+        }
+    }
+}
+
+fn x11_resize_edge_to_xdg(edge: X11ResizeEdge) -> u32 {
+    match edge {
+        X11ResizeEdge::Top => xdg_toplevel::ResizeEdge::Top as u32,
+        X11ResizeEdge::Bottom => xdg_toplevel::ResizeEdge::Bottom as u32,
+        X11ResizeEdge::Left => xdg_toplevel::ResizeEdge::Left as u32,
+        X11ResizeEdge::Right => xdg_toplevel::ResizeEdge::Right as u32,
+        X11ResizeEdge::TopLeft => xdg_toplevel::ResizeEdge::TopLeft as u32,
+        X11ResizeEdge::TopRight => xdg_toplevel::ResizeEdge::TopRight as u32,
+        X11ResizeEdge::BottomLeft => xdg_toplevel::ResizeEdge::BottomLeft as u32,
+        X11ResizeEdge::BottomRight => xdg_toplevel::ResizeEdge::BottomRight as u32,
+    }
+}
+
+impl XwmHandler for AppState {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        self.xwm.as_mut().expect("X11Wm not initialized")
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let x11_win = window.window_id();
+        if self.x11_id_by_win.contains_key(&x11_win) {
+            let _ = window.set_mapped(true);
+            return;
+        }
+        let mut geo = window.geometry();
+        let is_popup_type = matches!(
+            window.window_type(),
+            Some(
+                WmWindowType::PopupMenu
+                    | WmWindowType::DropdownMenu
+                    | WmWindowType::Menu
+                    | WmWindowType::Tooltip
+                    | WmWindowType::Notification
+            )
+        );
+        if is_popup_type {
+            if let Some((parent_id, parent_geo)) = self.find_x11_parent(&window) {
+                if let Err(err) = window.set_mapped(true) {
+                    warn!(error = ?err, x11_win, "failed to map X11 popup window");
+                    return;
+                }
+                if geo.size.w > 0 && geo.size.h > 0 {
+                    let _ = window.configure(geo);
+                }
+                let window_id = self.alloc_window_id();
+                let wl_opt = window.wl_surface();
+                if let Some(ref wl) = wl_opt {
+                    self.surface_to_window.insert(wl.id(), window_id);
+                }
+                self.x11_id_by_win.insert(x11_win, window_id);
+                let rel_pos = (geo.loc.x - parent_geo.loc.x, geo.loc.y - parent_geo.loc.y);
+                debug!(
+                    window_id,
+                    parent_id,
+                    x11_win,
+                    ?rel_pos,
+                    w = geo.size.w,
+                    h = geo.size.h,
+                    "mapped managed X11 popup window"
+                );
+                self.x11_popups.insert(
+                    window_id,
+                    TrackedX11Popup {
+                        window_id,
+                        parent_id,
+                        surface: window,
+                        geo,
+                        rel_pos,
+                        announced: false,
+                        latest_bgra: None,
+                    },
+                );
+                if let Some(wl) = wl_opt {
+                    self.recomposite_x11_popup(window_id, &wl);
+                }
+                return;
+            }
+        }
+
+        if geo.size.w <= 0 {
+            geo.size.w = 800;
+        }
+        if geo.size.h <= 0 {
+            geo.size.h = 600;
+        }
+        let (px, py) = self.alloc_x11_position(geo.size.w, geo.size.h);
+        geo.loc = (px, py).into();
+
+        if let Err(err) = window.set_mapped(true) {
+            warn!(error = ?err, x11_win, "failed to map X11 window");
+            return;
+        }
+        let _ = window.configure(geo);
+        let _ = window.set_activated(true);
+        if let Some(xwm) = self.xwm.as_mut() {
+            let _ = xwm.raise_window(&window);
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                Some(KeyboardFocusTarget::X11(window.clone())),
+                SERIAL_COUNTER.next_serial(),
+            );
+        }
+
+        let window_id = self.alloc_window_id();
+        let ssd = window.is_decorated();
+        let wl_opt = window.wl_surface();
+        if let Some(ref wl) = wl_opt {
+            self.surface_to_window.insert(wl.id(), window_id);
+        }
+        self.x11_id_by_win.insert(x11_win, window_id);
+        self.last_focused_x11_window_id = Some(window_id);
+        self.x11_windows.insert(
+            window_id,
+            TrackedX11Window {
+                window_id,
+                surface: window,
+                geo,
+                last_title: String::new(),
+                last_app_id: String::new(),
+                last_width: geo.size.w as u32,
+                last_height: geo.size.h as u32,
+                server_side_decoration: ssd,
+                announced: false,
+                has_window_entry: false,
+                latest_bgra: None,
+            },
+        );
+        if let Some(wl) = wl_opt {
+            self.recomposite_x11_window(window_id, &wl);
+        }
+    }
+
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let x11_win = window.window_id();
+        if self.x11_id_by_win.contains_key(&x11_win) {
+            return;
+        }
+        let geo = window.geometry();
+        let window_id = self.alloc_window_id();
+        let wl_opt = window.wl_surface();
+        if let Some(ref wl) = wl_opt {
+            self.surface_to_window.insert(wl.id(), window_id);
+        }
+        self.x11_id_by_win.insert(x11_win, window_id);
+
+        if let Some((parent_id, parent_geo)) = self.find_x11_parent(&window) {
+            let rel_pos = (geo.loc.x - parent_geo.loc.x, geo.loc.y - parent_geo.loc.y);
+            debug!(
+                window_id,
+                parent_id,
+                x11_win,
+                win_type = ?window.window_type(),
+                ?geo,
+                ?parent_geo,
+                ?rel_pos,
+                has_wl = wl_opt.is_some(),
+                "mapped X11 override-redirect popup"
+            );
+            self.x11_popups.insert(
+                window_id,
+                TrackedX11Popup {
+                    window_id,
+                    parent_id,
+                    surface: window,
+                    geo,
+                    rel_pos,
+                    announced: false,
+                    latest_bgra: None,
+                },
+            );
+            if let Some(wl) = wl_opt {
+                self.recomposite_x11_popup(window_id, &wl);
+            }
+        } else {
+            // Orphaned override-redirect window (e.g., splash screen or dmenu) -> borderless toplevel.
+            self.x11_windows.insert(
+                window_id,
+                TrackedX11Window {
+                    window_id,
+                    surface: window,
+                    geo,
+                    last_title: String::new(),
+                    last_app_id: String::new(),
+                    last_width: geo.size.w.max(1) as u32,
+                    last_height: geo.size.h.max(1) as u32,
+                    server_side_decoration: false,
+                    announced: false,
+                    has_window_entry: false,
+                    latest_bgra: None,
+                },
+            );
+            if let Some(wl) = wl_opt {
+                self.recomposite_x11_window(window_id, &wl);
+            }
+        }
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.remove_x11_window(window.window_id());
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.remove_x11_window(window.window_id());
+    }
+
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        _reorder: Option<Reorder>,
+    ) {
+        let mut geo = window.geometry();
+        if let Some(x) = x {
+            geo.loc.x = x;
+        }
+        if let Some(y) = y {
+            geo.loc.y = y;
+        }
+        if let Some(w) = w {
+            geo.size.w = w.max(1) as i32;
+        }
+        if let Some(h) = h {
+            geo.size.h = h.max(1) as i32;
+        }
+        self.ensure_virtual_output_size(geo.loc.x + geo.size.w + 64, geo.loc.y + geo.size.h + 64);
+        let _ = window.configure(geo);
+        if let Some(&wid) = self.x11_id_by_win.get(&window.window_id()) {
+            if let Some(xwin) = self.x11_windows.get_mut(&wid) {
+                xwin.geo = geo;
+            }
+        }
+    }
+
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        _above: Option<X11Window>,
+    ) {
+        let Some(&wid) = self.x11_id_by_win.get(&window.window_id()) else {
+            return;
+        };
+        if let Some(xwin) = self.x11_windows.get_mut(&wid) {
+            xwin.geo = geometry;
+        } else if let Some(xpop) = self.x11_popups.get(&wid) {
+            let parent_id = xpop.parent_id;
+            let parent_loc = self
+                .x11_windows
+                .get(&parent_id)
+                .map(|p| p.geo.loc)
+                .unwrap_or_else(|| (0, 0).into());
+            let new_rel = (geometry.loc.x - parent_loc.x, geometry.loc.y - parent_loc.y);
+            if let Some(xpop_mut) = self.x11_popups.get_mut(&wid) {
+                let changed = xpop_mut.rel_pos != new_rel || xpop_mut.geo.size != geometry.size;
+                xpop_mut.geo = geometry;
+                xpop_mut.rel_pos = new_rel;
+                if xpop_mut.announced && changed {
+                    let _ = self.event_tx.send(CompositorEvent::PopupRepositioned {
+                        window_id: wid,
+                        x: new_rel.0,
+                        y: new_rel.1,
+                        width: geometry.size.w.max(1) as u32,
+                        height: geometry.size.h.max(1) as u32,
+                    });
+                }
+            }
+        }
+    }
+
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if !matches!(
+            property,
+            WmWindowProperty::Title | WmWindowProperty::Class | WmWindowProperty::MotifHints
+        ) {
+            return;
+        }
+        let Some(&wid) = self.x11_id_by_win.get(&window.window_id()) else {
+            return;
+        };
+        let Some(xwin) = self.x11_windows.get_mut(&wid) else {
+            return;
+        };
+        if property == WmWindowProperty::MotifHints {
+            let ssd = window.is_decorated();
+            if ssd != xwin.server_side_decoration {
+                xwin.server_side_decoration = ssd;
+                if xwin.announced {
+                    let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
+                        window_id: wid,
+                        server_side: ssd,
+                    });
+                }
+            }
+            return;
+        }
+        let mut title = window.title();
+        let app_id = window.class();
+        if title.is_empty() {
+            title = if !app_id.is_empty() {
+                app_id.clone()
+            } else {
+                format!("X11 Window #{wid}")
+            };
+        }
+        if title != xwin.last_title || app_id != xwin.last_app_id {
+            xwin.last_title = title.clone();
+            xwin.last_app_id = app_id.clone();
+            if xwin.announced {
+                let _ = self.event_tx.send(CompositorEvent::WindowCreated {
+                    window_id: wid,
+                    title,
+                    app_id,
+                    width: xwin.last_width,
+                    height: xwin.last_height,
+                });
+            }
+        }
+    }
+
+    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
+            let _ = self.event_tx.send(CompositorEvent::SetMaximized {
+                window_id,
+                maximized: true,
+            });
+        }
+    }
+
+    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
+            let _ = self.event_tx.send(CompositorEvent::SetMaximized {
+                window_id,
+                maximized: false,
+            });
+        }
+    }
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
+            let _ = self.event_tx.send(CompositorEvent::SetFullscreen {
+                window_id,
+                fullscreen: true,
+            });
+        }
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
+            let _ = self.event_tx.send(CompositorEvent::SetFullscreen {
+                window_id,
+                fullscreen: false,
+            });
+        }
+    }
+
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
+            let _ = self
+                .event_tx
+                .send(CompositorEvent::SetMinimized { window_id });
+        }
+    }
+
+    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+        if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
+            let _ = self
+                .event_tx
+                .send(CompositorEvent::StartMove { window_id });
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _button: u32,
+        resize_edge: X11ResizeEdge,
+    ) {
+        if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
+            let _ = self.event_tx.send(CompositorEvent::StartResize {
+                window_id,
+                edge: x11_resize_edge_to_xdg(resize_edge),
+            });
+        }
+    }
+
+    fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
+        true
+    }
+
+    fn send_selection(
+        &mut self,
+        _xwm: XwmId,
+        selection: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        let (owner, cached) = match selection {
+            SelectionTarget::Clipboard => (self.clipboard_owner, self.clipboard_text.clone()),
+            SelectionTarget::Primary => (self.primary_owner, self.primary_text.clone()),
+        };
+        match owner {
+            SelectionOwner::RemoteHost => {
+                if let Some(text) = cached {
+                    std::thread::spawn(move || {
+                        write_selection_fd_timeout(fd, text.as_bytes());
+                    });
+                }
+            }
+            SelectionOwner::WaylandClient => match selection {
+                SelectionTarget::Clipboard => {
+                    let _ = request_data_device_client_selection(&self.seat, mime_type, fd);
+                    let _ = self.display_handle.flush_clients();
+                }
+                SelectionTarget::Primary => {
+                    let _ = request_primary_client_selection(&self.seat, mime_type, fd);
+                    let _ = self.display_handle.flush_clients();
+                }
+            },
+            SelectionOwner::X11Client | SelectionOwner::None => {}
+        }
+    }
+
+    fn new_selection(
+        &mut self,
+        _xwm: XwmId,
+        selection: SelectionTarget,
+        mime_types: Vec<String>,
+    ) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                self.clipboard_owner = SelectionOwner::X11Client;
+                self.clipboard_text = None;
+                set_data_device_selection(
+                    &self.display_handle,
+                    &self.seat,
+                    mime_types.clone(),
+                    (),
+                );
+            }
+            SelectionTarget::Primary => {
+                self.primary_owner = SelectionOwner::X11Client;
+                self.primary_text = None;
+                set_primary_selection(&self.display_handle, &self.seat, mime_types.clone(), ());
+            }
+        }
+
+        if let Some(mime) = pick_preferred_text_mime(&mime_types) {
+            if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
+                let write_fd: OwnedFd = write_pipe.into();
+                if let Some(xwm) = self.xwm.as_mut() {
+                    if xwm
+                        .send_selection(selection, mime, write_fd, self.loop_handle.clone())
+                        .is_ok()
+                    {
+                        let event_tx = self.event_tx.clone();
+                        let read_fd: OwnedFd = read_pipe.into();
+                        std::thread::spawn(move || {
+                            if let Some(text) = read_selection_fd_bounded(read_fd) {
+                                let ev = match selection {
+                                    SelectionTarget::Clipboard => {
+                                        CompositorEvent::ClipboardText { text }
+                                    }
+                                    SelectionTarget::Primary => {
+                                        CompositorEvent::PrimarySelectionText { text }
+                                    }
+                                };
+                                let _ = event_tx.send(ev);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                if self.clipboard_owner == SelectionOwner::X11Client {
+                    self.clipboard_owner = SelectionOwner::None;
+                }
+            }
+            SelectionTarget::Primary => {
+                if self.primary_owner == SelectionOwner::X11Client {
+                    self.primary_owner = SelectionOwner::None;
+                }
+            }
+        }
+    }
+
+    fn disconnected(&mut self, _xwm: XwmId) {
+        warn!("X11Wm lost connection to XWayland; clearing X11 session state");
+        self.cleanup_xwayland_state();
     }
 }
 
@@ -1456,13 +2818,16 @@ delegate_xdg_shell!(AppState);
 delegate_xdg_decoration!(AppState);
 delegate_seat!(AppState);
 delegate_data_device!(AppState);
+delegate_primary_selection!(AppState);
 delegate_cursor_shape!(AppState);
 delegate_output!(AppState);
+delegate_xwayland_shell!(AppState);
 
 /// Start the headless Smithay Wayland compositor on a background OS thread
-/// and optionally launch `command` inside the isolated `WAYLAND_DISPLAY`.
+/// and optionally launch `command` inside the isolated session.
 pub fn start_compositor(
     command: Vec<String>,
+    enable_xwayland: bool,
 ) -> Result<(CompositorHandle, mpsc::UnboundedReceiver<CompositorEvent>)> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx): (CalloopSender<CompositorCommand>, Channel<CompositorCommand>) =
@@ -1474,9 +2839,14 @@ pub fn start_compositor(
     std::thread::Builder::new()
         .name("rw-compositor".into())
         .spawn(move || {
-            if let Err(err) =
-                run_compositor_loop(event_tx, cmd_rx, cmd_tx_loop, ready_tx.clone(), command)
-            {
+            if let Err(err) = run_compositor_loop(
+                event_tx,
+                cmd_rx,
+                cmd_tx_loop,
+                ready_tx.clone(),
+                command,
+                enable_xwayland,
+            ) {
                 error!(error = %err, "headless compositor exited with error");
                 let _ = ready_tx.send(Err(err));
             }
@@ -1496,15 +2866,86 @@ pub fn start_compositor(
     ))
 }
 
+fn spawn_xwayland_with_auth(
+    dh: &DisplayHandle,
+) -> Result<Option<(XWayland, Client, Option<PathBuf>)>> {
+    let runtime_dir = crate::session::session_runtime_dir();
+    let shim_dir = runtime_dir.as_ref().map(|d| d.join("bin"));
+    let Some(real_xwayland) = crate::session::find_xwayland_binary(shim_dir.as_deref()) else {
+        warn!("Xwayland binary not found in PATH; continuing in Wayland-only mode");
+        return Ok(None);
+    };
+
+    let xauth_and_path = if let Some(ref rdir) = runtime_dir {
+        let xauth = rdir.join("Xauthority");
+        let bin_dir = crate::session::write_xwayland_auth_shim(rdir, &real_xwayland, &xauth)?;
+        let mut new_path = OsString::from(&bin_dir);
+        if let Some(old_path) = std::env::var_os("PATH") {
+            new_path.push(":");
+            new_path.push(old_path);
+        }
+        Some((xauth, new_path))
+    } else {
+        None
+    };
+
+    // Scan free X11 display slots so we can pre-generate an exact MIT-MAGIC-COOKIE-1
+    // Xauthority file for the chosen display number before launching Xwayland.
+    for display_num in 0..64u32 {
+        let mut envs: Vec<(OsString, OsString)> = Vec::new();
+        let xauth_path = if let Some((ref xauth, ref new_path)) = xauth_and_path {
+            crate::session::write_xauthority_file(xauth, display_num)?;
+            envs.push((OsString::from("PATH"), new_path.clone()));
+            Some(xauth.clone())
+        } else {
+            None
+        };
+
+        match XWayland::spawn(
+            dh,
+            Some(display_num),
+            envs,
+            false, // disable abstract Unix sockets for multi-user isolation
+            Stdio::null(),
+            Stdio::null(),
+            |_| {},
+        ) {
+            Ok((xwayland, client)) => {
+                // Defense-in-depth: restrict filesystem X11 socket inode to owner-only (0600).
+                let sock_path = PathBuf::from(format!("/tmp/.X11-unix/X{display_num}"));
+                let _ = crate::session::set_mode(&sock_path, 0o600);
+                return Ok(Some((xwayland, client, xauth_path)));
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AddrInUse
+                        | std::io::ErrorKind::AlreadyExists
+                        | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => {
+                return Err(err).context("failed to spawn XWayland");
+            }
+        }
+    }
+
+    anyhow::bail!("no free X11 display slot available in range :0..:63")
+}
+
 fn run_compositor_loop(
     event_tx: mpsc::UnboundedSender<CompositorEvent>,
     cmd_rx: Channel<CompositorCommand>,
     cmd_tx: CalloopSender<CompositorCommand>,
     ready_tx: std::sync::mpsc::SyncSender<Result<OsString>>,
     command: Vec<String>,
+    enable_xwayland: bool,
 ) -> Result<()> {
     let mut event_loop: EventLoop<AppState> =
         EventLoop::try_new().context("failed to create calloop EventLoop")?;
+    let loop_handle = event_loop.handle();
     let display: Display<AppState> =
         Display::new().context("failed to create Wayland Display")?;
     let dh = display.handle();
@@ -1515,8 +2956,10 @@ fn run_compositor_loop(
     let xdg_decoration_state = XdgDecorationState::new::<AppState>(&dh);
     let mut seat_state = SeatState::new();
     let data_device_state = DataDeviceState::new::<AppState>(&dh);
+    let primary_selection_state = PrimarySelectionState::new::<AppState>(&dh);
     let cursor_shape_state = CursorShapeManagerState::new::<AppState>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<AppState>(&dh);
+    let xwayland_shell_state = XWaylandShellState::new::<AppState>(&dh);
 
     let mut seat = seat_state.new_wl_seat(&dh, "remotewayland-seat");
     seat.add_keyboard(XkbConfig::default(), 200, 25)
@@ -1548,8 +2991,84 @@ fn run_compositor_loop(
     let socket_name = socket_source.socket_name().to_os_string();
     info!(?socket_name, "headless Wayland compositor listening");
 
+    let mut xwayland_spawned = false;
+    let mut xwayland_client: Option<Client> = None;
+    if enable_xwayland {
+        match spawn_xwayland_with_auth(&dh) {
+            Ok(Some((xwayland, client, xauth_path))) => {
+                xwayland_spawned = true;
+                xwayland_client = Some(client.clone());
+                let xwm_loop_handle = loop_handle.clone();
+                if let Err(err) = loop_handle.insert_source(xwayland, move |event, _, state| {
+                    match event {
+                        XWaylandEvent::Ready {
+                            x11_socket,
+                            display_number,
+                        } => {
+                            let disp = format!(":{display_number}");
+                            let sock_path =
+                                PathBuf::from(format!("/tmp/.X11-unix/X{display_number}"));
+                            let _ = crate::session::set_mode(&sock_path, 0o600);
+                            crate::session::set_x11_env(disp.clone(), xauth_path.clone());
+                            match X11Wm::start_wm(
+                                xwm_loop_handle.clone(),
+                                x11_socket,
+                                client.clone(),
+                            ) {
+                                Ok(wm) => {
+                                    state.xwm = Some(wm);
+                                    info!(
+                                        display = %disp,
+                                        xauthority = ?xauth_path,
+                                        "embedded XWayland window manager ready"
+                                    );
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        error = ?err,
+                                        display = %disp,
+                                        "failed to attach X11 window manager to XWayland"
+                                    );
+                                }
+                            }
+                            if !state.pending_initial_command.is_empty() {
+                                let cmd = std::mem::take(&mut state.pending_initial_command);
+                                spawn_gui_command(&state.socket_name, &cmd);
+                            }
+                        }
+                        XWaylandEvent::Error => {
+                            warn!("XWayland exited unexpectedly; clearing X11 state and continuing Wayland-only");
+                            state.cleanup_xwayland_state();
+                            if !state.pending_initial_command.is_empty() {
+                                let cmd = std::mem::take(&mut state.pending_initial_command);
+                                spawn_gui_command(&state.socket_name, &cmd);
+                            }
+                        }
+                    }
+                }) {
+                    warn!(error = ?err, "failed to insert XWayland event source; continuing Wayland-only");
+                    xwayland_spawned = false;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(error = %err, "failed to start XWayland; continuing in Wayland-only mode");
+            }
+        }
+    }
+
+    let pending_initial_command = if xwayland_spawned {
+        command
+    } else {
+        if !command.is_empty() {
+            spawn_gui_command(&socket_name, &command);
+        }
+        Vec::new()
+    };
+
     let mut state = AppState {
         display_handle: dh.clone(),
+        loop_handle: loop_handle.clone(),
         socket_name: socket_name.clone(),
         cmd_tx,
         compositor_state,
@@ -1558,21 +3077,38 @@ fn run_compositor_loop(
         xdg_decoration_state,
         seat_state,
         data_device_state,
+        primary_selection_state,
         cursor_shape_state,
         output_manager_state,
+        xwayland_shell_state,
+        xwm: None,
+        xwayland_client,
         output,
+        output_size: (1920, 1080),
         seat,
         space,
         popups: PopupManager::default(),
         next_window_id: 1,
         focused_window_id: 1,
+        last_focused_x11_window_id: None,
+        next_x11_pos: (100, 100),
+        cursor_surface: None,
+        last_cursor_bitmap: None,
+        clipboard_owner: SelectionOwner::None,
         clipboard_text: None,
         pending_clipboard_mime: None,
+        primary_owner: SelectionOwner::None,
+        primary_text: None,
+        pending_primary_mime: None,
+        pending_initial_command,
         start_time: Instant::now(),
         surface_to_window: HashMap::new(),
         surface_buffers: HashMap::new(),
         windows: HashMap::new(),
         popup_windows: HashMap::new(),
+        x11_windows: HashMap::new(),
+        x11_popups: HashMap::new(),
+        x11_id_by_win: HashMap::new(),
         launched_apps: BTreeMap::new(),
         next_server_launch_id: 1_000_000,
         event_tx,
@@ -1600,7 +3136,7 @@ fn run_compositor_loop(
                         warn!(error = %err, "Wayland dispatch_clients error");
                     }
                 }
-                state.poll_pending_clipboard();
+                state.poll_pending_selections();
                 Ok(PostAction::Continue)
             },
         )
@@ -1617,12 +3153,15 @@ fn run_compositor_loop(
 
     let _ = ready_tx.send(Ok(socket_name.clone()));
 
-    if !command.is_empty() {
-        spawn_gui_command(&socket_name, &command);
-    }
+    let initial_cmd_deadline = Instant::now() + Duration::from_secs(3);
 
     loop {
         event_loop.dispatch(Duration::from_millis(16), &mut state)?;
+        if !state.pending_initial_command.is_empty() && Instant::now() >= initial_cmd_deadline {
+            warn!("XWayland startup timed out; launching initial command without waiting");
+            let cmd = std::mem::take(&mut state.pending_initial_command);
+            spawn_gui_command(&state.socket_name, &cmd);
+        }
         let elapsed = state.start_time.elapsed();
         for tracked in state.windows.values() {
             tracked.window.send_frame(
@@ -1640,6 +3179,44 @@ fn run_compositor_loop(
                 Some(Duration::ZERO),
                 |_, _| Some(state.output.clone()),
             );
+        }
+        for xwin in state.x11_windows.values() {
+            if let Some(wl) = xwin.surface.wl_surface() {
+                send_frames_surface_tree(
+                    &wl,
+                    &state.output,
+                    elapsed,
+                    Some(Duration::ZERO),
+                    |_, _| Some(state.output.clone()),
+                );
+            }
+        }
+        for xpop in state.x11_popups.values() {
+            if let Some(wl) = xpop.surface.wl_surface() {
+                send_frames_surface_tree(
+                    &wl,
+                    &state.output,
+                    elapsed,
+                    Some(Duration::ZERO),
+                    |_, _| Some(state.output.clone()),
+                );
+            }
+        }
+        if let Some(ref cs) = state.cursor_surface {
+            if cs.alive() {
+                send_frames_surface_tree(
+                    cs,
+                    &state.output,
+                    elapsed,
+                    Some(Duration::ZERO),
+                    |_, _| Some(state.output.clone()),
+                );
+            } else {
+                let id = cs.id();
+                state.surface_buffers.remove(&id);
+                state.cursor_surface = None;
+                state.last_cursor_bitmap = None;
+            }
         }
         state.display_handle.flush_clients()?;
         state.popups.cleanup();
@@ -1754,5 +3331,55 @@ fn blit_rgba_over(
                 dst[d_idx + 3] = (sa + (dst[d_idx + 3] as u32 * inv) / 255) as u8;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_preferred_text_mime_prefers_utf8_over_legacy() {
+        let mimes = vec![
+            "STRING".to_string(),
+            "text/plain".to_string(),
+            "text/plain;charset=utf-8".to_string(),
+        ];
+        assert_eq!(
+            pick_preferred_text_mime(&mimes).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            pick_preferred_text_mime(&["image/png".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn x11_resize_edge_maps_to_xdg_edges() {
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::Top),
+            xdg_toplevel::ResizeEdge::Top as u32
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::BottomRight),
+            xdg_toplevel::ResizeEdge::BottomRight as u32
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::TopLeft),
+            xdg_toplevel::ResizeEdge::TopLeft as u32
+        );
+    }
+
+    #[test]
+    fn selection_fd_helpers_roundtrip_text() {
+        let (read_pipe, write_pipe) = std::io::pipe().unwrap();
+        let write_fd: OwnedFd = write_pipe.into();
+        let read_fd: OwnedFd = read_pipe.into();
+        write_selection_fd_timeout(write_fd, b"hello xwayland");
+        assert_eq!(
+            read_selection_fd_bounded(read_fd).as_deref(),
+            Some("hello xwayland")
+        );
     }
 }

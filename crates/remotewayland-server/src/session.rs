@@ -24,6 +24,8 @@ pub struct SessionEnvInfo {
     pub runtime_dir: PathBuf,
     pub dbus_address: Option<String>,
     pub wayland_socket: Option<OsString>,
+    pub x11_display: Option<String>,
+    pub xauthority: Option<PathBuf>,
 }
 
 static SESSION_INFO: OnceLock<Mutex<SessionEnvInfo>> = OnceLock::new();
@@ -155,6 +157,8 @@ impl SessionGuard {
             runtime_dir: runtime_dir.clone(),
             dbus_address: dbus_address.clone(),
             wayland_socket: None,
+            x11_display: None,
+            xauthority: None,
         };
         let _ = SESSION_INFO.set(Mutex::new(info));
 
@@ -302,24 +306,203 @@ fn start_xdg_desktop_portal(runtime_dir: &Path, wayland_socket: &OsStr) -> Resul
     Ok(child)
 }
 
-/// Apply the unified isolated session environment (Wayland, D-Bus, PipeWire,
-/// PulseAudio, and XDG_RUNTIME_DIR, with host DISPLAY/XAUTHORITY stripped)
-/// to a child command (both GUI apps and remote PTYs).
+/// Return the isolated session runtime directory if initialized.
+pub fn session_runtime_dir() -> Option<PathBuf> {
+    SESSION_INFO
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .map(|info| info.runtime_dir.clone())
+}
+
+/// Record the active XWayland `DISPLAY` and `XAUTHORITY` paths so subsequent
+/// GUI applications and remote PTYs automatically inherit them.
+pub fn set_x11_env(display: String, xauthority: Option<PathBuf>) {
+    if let Some(lock) = SESSION_INFO.get() {
+        if let Ok(mut info) = lock.lock() {
+            info.x11_display = Some(display);
+            info.xauthority = xauthority;
+        }
+    }
+}
+
+/// Clear `DISPLAY` and `XAUTHORITY` from the session environment (e.g., if
+/// XWayland exits unexpectedly).
+pub fn clear_x11_env() {
+    if let Some(lock) = SESSION_INFO.get() {
+        if let Ok(mut info) = lock.lock() {
+            info.x11_display = None;
+            info.xauthority = None;
+        }
+    }
+}
+
+/// Fill `buf` with cryptographically secure random bytes via `getrandom(2)`.
+pub fn fill_random_bytes(buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let ret = unsafe {
+            libc::getrandom(
+                buf[filled..].as_mut_ptr().cast::<libc::c_void>(),
+                buf.len() - filled,
+                0,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err).context("getrandom(2) failed");
+        }
+        filled += ret as usize;
+    }
+    Ok(())
+}
+
+/// Locate the real `Xwayland` executable on `PATH` (excluding any session shim dir).
+pub fn find_xwayland_binary(exclude_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Some(excl) = exclude_dir {
+                if dir == excl {
+                    continue;
+                }
+            }
+            let candidate = dir.join("Xwayland");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    for fallback in ["/usr/bin/Xwayland", "/usr/local/bin/Xwayland"] {
+        let p = Path::new(fallback);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Write a per-session `MIT-MAGIC-COOKIE-1` Xauthority file (mode `0600`) for
+/// `display_num` using 128 bits of CSPRNG entropy from `getrandom(2)`.
+pub fn write_xauthority_file(path: &Path, display_num: u32) -> Result<()> {
+    let mut cookie = [0u8; 16];
+    fill_random_bytes(&mut cookie).context("failed to generate Xauthority cookie")?;
+
+    let hostname = read_hostname();
+    let display_str = display_num.to_string();
+    let mut data = Vec::with_capacity(128);
+    // FamilyLocal (256) with local hostname
+    if !hostname.is_empty() {
+        append_xauth_record(&mut data, 256, hostname.as_bytes(), display_str.as_bytes(), &cookie);
+    }
+    // FamilyWild (65535) so local clients connecting via unix socket match regardless of hostname
+    append_xauth_record(&mut data, 65535, &[], display_str.as_bytes(), &cookie);
+
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = fs::remove_file(path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to create Xauthority file {}", path.display()))?;
+    file.write_all(&data)
+        .with_context(|| format!("failed to write Xauthority file {}", path.display()))?;
+    set_mode(path, 0o600)?;
+    Ok(())
+}
+
+fn append_xauth_record(
+    out: &mut Vec<u8>,
+    family: u16,
+    address: &[u8],
+    display_num: &[u8],
+    cookie: &[u8],
+) {
+    const AUTH_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
+    out.extend_from_slice(&family.to_be_bytes());
+    out.extend_from_slice(&(address.len() as u16).to_be_bytes());
+    out.extend_from_slice(address);
+    out.extend_from_slice(&(display_num.len() as u16).to_be_bytes());
+    out.extend_from_slice(display_num);
+    out.extend_from_slice(&(AUTH_NAME.len() as u16).to_be_bytes());
+    out.extend_from_slice(AUTH_NAME);
+    out.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+    out.extend_from_slice(cookie);
+}
+
+fn read_hostname() -> String {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Create a `0700` wrapper script `<runtime_dir>/bin/Xwayland` that execs the
+/// real `Xwayland` binary with `-auth <xauth_path>` so Smithay's `XWayland::spawn`
+/// enforces MIT-MAGIC-COOKIE-1 authentication.
+pub fn write_xwayland_auth_shim(
+    runtime_dir: &Path,
+    real_xwayland: &Path,
+    xauth_path: &Path,
+) -> Result<PathBuf> {
+    let bin_dir = runtime_dir.join("bin");
+    create_private_dir(&bin_dir)?;
+    let shim_path = bin_dir.join("Xwayland");
+    let real_str = real_xwayland
+        .to_str()
+        .context("Xwayland binary path must be valid UTF-8")?;
+    let xauth_str = xauth_path
+        .to_str()
+        .context("Xauthority path must be valid UTF-8")?;
+    let script = format!(
+        "#!/bin/sh\nexec {} -auth {} \"$@\"\n",
+        sh_single_quote(real_str),
+        sh_single_quote(xauth_str),
+    );
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = fs::remove_file(&shim_path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&shim_path)
+        .with_context(|| format!("failed to create Xwayland auth shim {}", shim_path.display()))?;
+    file.write_all(script.as_bytes())?;
+    set_mode(&shim_path, 0o700)?;
+    Ok(bin_dir)
+}
+
+/// Apply the unified isolated session environment (Wayland, XWayland DISPLAY/XAUTHORITY,
+/// D-Bus, PipeWire, PulseAudio, and XDG_RUNTIME_DIR) to a child command (both GUI apps
+/// and remote PTYs) without forcing toolkit backend overrides.
 pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
     cmd.env_remove("DISPLAY")
         .env_remove("XAUTHORITY")
         .env("PULSE_SINK", crate::audio::VIRTUAL_SINK_NAME)
-        .env("PULSE_SOURCE", crate::audio::VIRTUAL_MIC_NAME)
-        .env("GDK_BACKEND", "wayland")
-        .env("QT_QPA_PLATFORM", "wayland")
-        .env("MOZ_ENABLE_WAYLAND", "1")
-        .env("SDL_VIDEODRIVER", "wayland");
+        .env("PULSE_SOURCE", crate::audio::VIRTUAL_MIC_NAME);
 
     if let Some(lock) = SESSION_INFO.get() {
         if let Ok(info) = lock.lock() {
             cmd.env("XDG_RUNTIME_DIR", &info.runtime_dir);
             if let Some(ws) = wayland_override.or(info.wayland_socket.as_deref()) {
                 cmd.env("WAYLAND_DISPLAY", ws);
+            }
+            if let Some(disp) = &info.x11_display {
+                cmd.env("DISPLAY", disp);
+            }
+            if let Some(xauth) = &info.xauthority {
+                cmd.env("XAUTHORITY", xauth);
             }
             if let Some(addr) = &info.dbus_address {
                 cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
@@ -338,5 +521,93 @@ pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
                 "PULSE_SERVER",
                 format!("unix:{}", pw_dir.join("pulse/native").display()),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestTempDir(PathBuf);
+
+    impl TestTempDir {
+        fn new(prefix: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            create_private_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn sh_single_quote_escapes_shell_metacharacters() {
+        assert_eq!(sh_single_quote("/usr/bin/Xwayland"), "'/usr/bin/Xwayland'");
+        assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sh_single_quote("dir with spaces/$HOME/`id`"), "'dir with spaces/$HOME/`id`'");
+    }
+
+    #[test]
+    fn xauthority_file_has_valid_records_and_0600_mode() {
+        let dir = TestTempDir::new("rw-xauth-test");
+        let xauth = dir.0.join("Xauthority");
+
+        write_xauthority_file(&xauth, 12).unwrap();
+
+        let meta = fs::metadata(&xauth).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        let bytes = fs::read(&xauth).unwrap();
+        // Parse at least one MIT-MAGIC-COOKIE-1 record for display "12" with a 16-byte cookie.
+        let mut cursor = 0;
+        let mut records = 0;
+        while cursor < bytes.len() {
+            let family = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]);
+            cursor += 2;
+            let addr_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+            cursor += 2 + addr_len;
+            let num_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+            cursor += 2;
+            assert_eq!(&bytes[cursor..cursor + num_len], b"12");
+            cursor += num_len;
+            let name_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+            cursor += 2;
+            assert_eq!(&bytes[cursor..cursor + name_len], b"MIT-MAGIC-COOKIE-1");
+            cursor += name_len;
+            let data_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+            cursor += 2;
+            assert_eq!(data_len, 16);
+            cursor += data_len;
+            assert!(family == 256 || family == 65535);
+            records += 1;
+        }
+        assert!(records >= 1);
+    }
+
+    #[test]
+    fn xwayland_auth_shim_passes_auth_flag_via_child_path() {
+        let dir = TestTempDir::new("rw-xshim-test");
+        let xauth = dir.0.join("Xauthority");
+        write_xauthority_file(&xauth, 7).unwrap();
+
+        let fake_xwayland = Path::new("/bin/echo");
+        let bin_dir = write_xwayland_auth_shim(&dir.0, fake_xwayland, &xauth).unwrap();
+
+        let output = Command::new("Xwayland")
+            .arg(":7")
+            .arg("-rootless")
+            .env_clear()
+            .env("PATH", &bin_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("-auth {} :7 -rootless\n", xauth.display());
+        assert_eq!(stdout, expected);
     }
 }

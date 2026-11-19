@@ -5,19 +5,19 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 ## Architecture
 
 - **`remotewayland-proto`**: Shared wire protocol, stream framing, and ephemeral TLS/token handshake types.
-- **`remotewayland-server`**: Headless Wayland compositor (`smithay`), pure-Rust XOR-delta + LZ4 video encoder, isolated PipeWire/PulseAudio virtual sink/source bridge, and QUIC server.
+- **`remotewayland-server`**: Headless Wayland compositor (`smithay`) with embedded `Xwayland` (`X11Wm`) for remote X11 apps, pure-Rust XOR-delta + LZ4 video encoder, isolated PipeWire/PulseAudio virtual sink/source bridge, and QUIC server.
 - **`remotewayland-client`**: Rootless multi-window & unbounded `xdg_popup` Wayland client (`smithay-client-toolkit`), pure-Rust LZ4 delta decoder, and local PipeWire/PulseAudio bridge.
 
 ## System Dependencies
 
 ### Fedora / RHEL
 ```bash
-sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-utils
+sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-utils xorg-x11-server-Xwayland
 ```
 
 ### Ubuntu / Debian
 ```bash
-sudo apt install libwayland-dev libxkbcommon-dev pulseaudio-utils
+sudo apt install libwayland-dev libxkbcommon-dev pulseaudio-utils xwayland
 ```
 
 ## Building

@@ -440,8 +440,16 @@ async fn handle_connection(
                             window_id, visible, shape_name
                         }).await?;
                     }
+                    Ok(CompositorEvent::CursorBitmap { window_id, width, height, hotspot_x, hotspot_y, bgra }) => {
+                        write_control_message(&mut send, &ControlMessage::CursorBitmap {
+                            window_id, width, height, hotspot_x, hotspot_y, bgra
+                        }).await?;
+                    }
                     Ok(CompositorEvent::ClipboardText { text }) => {
                         write_control_message(&mut send, &ControlMessage::ClipboardText { text }).await?;
+                    }
+                    Ok(CompositorEvent::PrimarySelectionText { text }) => {
+                        write_control_message(&mut send, &ControlMessage::PrimarySelectionText { text }).await?;
                     }
                     Ok(CompositorEvent::AppState { launch_id, name, state }) => {
                         write_control_message(&mut send, &ControlMessage::AppState {
@@ -505,6 +513,9 @@ async fn handle_connection(
                     }
                     Some(ControlMessage::ClipboardText { text }) => {
                         let _ = cmd_tx.send(CompositorCommand::SetClipboardText { text });
+                    }
+                    Some(ControlMessage::PrimarySelectionText { text }) => {
+                        let _ = cmd_tx.send(CompositorCommand::SetPrimarySelectionText { text });
                     }
                     Some(ControlMessage::PointerMotion { window_id, x, y }) => {
                         let _ = cmd_tx.send(CompositorCommand::PointerMotion { window_id, x, y });

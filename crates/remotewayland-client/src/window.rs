@@ -2,13 +2,13 @@
 //! built on `smithay-client-toolkit` (`sctk`).
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{Read, Write};
-use std::os::unix::io::OwnedFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use remotewayland_proto::{ControlMessage, WindowId};
+use remotewayland_proto::{
+    ControlMessage, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
+};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Sender as CalloopSender};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -21,9 +21,14 @@ use smithay_client_toolkit::{
         DataDeviceManagerState, WritePipe,
     },
     delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
-    delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_popup,
-    delegate_xdg_shell, delegate_xdg_window,
+    delegate_pointer, delegate_primary_selection, delegate_registry, delegate_seat, delegate_shm,
+    delegate_xdg_popup, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
+    primary_selection::{
+        device::{PrimarySelectionDevice, PrimarySelectionDeviceHandler},
+        selection::{PrimarySelectionSource, PrimarySelectionSourceHandler},
+        PrimarySelectionManagerState,
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -54,6 +59,10 @@ use wayland_client::{
         wl_surface,
     },
     Connection, Proxy, QueueHandle, WEnum,
+};
+use wayland_protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+    zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
@@ -132,10 +141,34 @@ pub enum ClientUiEvent {
         visible: bool,
         shape_name: String,
     },
+    CursorBitmap {
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        bgra: Vec<u8>,
+    },
     ClipboardText {
         text: String,
     },
+    PrimarySelectionText {
+        text: String,
+    },
     Disconnected,
+}
+
+#[derive(Clone)]
+enum ActiveCursor {
+    Hidden,
+    Named(CursorIcon),
+    Bitmap {
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        bgra: Vec<u8>,
+    },
 }
 
 /// Sender handle used by background tasks to wake and message the Wayland event loop.
@@ -169,6 +202,7 @@ struct ClientApp {
     xdg_shell: XdgShell,
     shm: Shm,
     data_device_manager_state: Option<DataDeviceManagerState>,
+    primary_selection_manager_state: Option<PrimarySelectionManagerState>,
     pool: SlotPool,
     conn: Connection,
     qh: QueueHandle<Self>,
@@ -176,15 +210,19 @@ struct ClientApp {
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     themed_pointer: Option<ThemedPointer>,
+    custom_cursor_surface: Option<wl_surface::WlSurface>,
     data_device: Option<DataDevice>,
     copy_paste_source: Option<CopyPasteSource>,
+    primary_selection_device: Option<PrimarySelectionDevice>,
+    primary_selection_source: Option<PrimarySelectionSource>,
     focused_window_id: WindowId,
     pointer_window_id: WindowId,
     last_button_serial: u32,
     last_input_serial: u32,
+    last_pointer_enter_serial: u32,
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u32>,
-    last_cursor: (bool, CursorIcon),
+    last_cursor: ActiveCursor,
     border_resize_active: bool,
 
     windows: HashMap<WindowId, RemoteWindow>,
@@ -193,10 +231,74 @@ struct ClientApp {
 
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
     last_clipboard: String,
+    last_primary: String,
     exit: bool,
 }
 
 impl ClientApp {
+    fn apply_active_cursor(&mut self) {
+        let Some(tp) = &self.themed_pointer else {
+            return;
+        };
+        match &self.last_cursor {
+            ActiveCursor::Hidden => {
+                let _ = tp.hide_cursor();
+            }
+            ActiveCursor::Named(icon) => {
+                let _ = tp.set_cursor(&self.conn, *icon);
+            }
+            ActiveCursor::Bitmap {
+                width,
+                height,
+                hotspot_x,
+                hotspot_y,
+                bgra,
+            } => {
+                let w = *width;
+                let h = *height;
+                let byte_len = w
+                    .checked_mul(h)
+                    .and_then(|px| px.checked_mul(4))
+                    .map(|n| n as usize);
+                let Some(byte_len) = byte_len else {
+                    let _ = tp.set_cursor(&self.conn, CursorIcon::Default);
+                    return;
+                };
+                if w == 0
+                    || h == 0
+                    || w > MAX_CURSOR_DIM
+                    || h > MAX_CURSOR_DIM
+                    || bgra.len() < byte_len
+                {
+                    let _ = tp.set_cursor(&self.conn, CursorIcon::Default);
+                    return;
+                }
+                let surf = self
+                    .custom_cursor_surface
+                    .get_or_insert_with(|| self.compositor_state.create_surface(&self.qh))
+                    .clone();
+                let stride = (w * 4) as i32;
+                if let Ok((buffer, canvas)) = self.pool.create_buffer(
+                    w as i32,
+                    h as i32,
+                    stride,
+                    wl_shm::Format::Argb8888,
+                ) {
+                    canvas[..byte_len].copy_from_slice(&bgra[..byte_len]);
+                    tp.pointer().set_cursor(
+                        self.last_pointer_enter_serial,
+                        Some(&surf),
+                        *hotspot_x,
+                        *hotspot_y,
+                    );
+                    if buffer.attach_to(&surf).is_ok() {
+                        surf.damage_buffer(0, 0, w as i32, h as i32);
+                        surf.commit();
+                    }
+                }
+            }
+        }
+    }
     fn release_pressed_buttons(&mut self, window_id: WindowId) {
         for button in self.pressed_buttons.drain() {
             let _ = self.ctrl_tx.send(ControlMessage::PointerButton {
@@ -216,7 +318,13 @@ impl ClientApp {
                 width,
                 height,
             } => {
-                if self.windows.contains_key(&window_id) {
+                if let Some(existing) = self.windows.get(&window_id) {
+                    if !title.is_empty() {
+                        existing.window.set_title(title);
+                    }
+                    if !app_id.is_empty() {
+                        existing.window.set_app_id(app_id);
+                    }
                     return;
                 }
                 let wl_surf = self.compositor_state.create_surface(&self.qh);
@@ -480,15 +588,34 @@ impl ClientApp {
             } => {
                 if window_id == self.pointer_window_id || window_id == self.focused_window_id {
                     let icon = shape_name.parse::<CursorIcon>().unwrap_or(CursorIcon::Default);
-                    self.last_cursor = (visible, icon);
+                    self.last_cursor = if visible {
+                        ActiveCursor::Named(icon)
+                    } else {
+                        ActiveCursor::Hidden
+                    };
                     if !self.border_resize_active {
-                        if let Some(tp) = &self.themed_pointer {
-                            if !visible {
-                                let _ = tp.hide_cursor();
-                            } else {
-                                let _ = tp.set_cursor(&self.conn, icon);
-                            }
-                        }
+                        self.apply_active_cursor();
+                    }
+                }
+            }
+            ClientUiEvent::CursorBitmap {
+                window_id,
+                width,
+                height,
+                hotspot_x,
+                hotspot_y,
+                bgra,
+            } => {
+                if window_id == self.pointer_window_id || window_id == self.focused_window_id {
+                    self.last_cursor = ActiveCursor::Bitmap {
+                        width,
+                        height,
+                        hotspot_x,
+                        hotspot_y,
+                        bgra,
+                    };
+                    if !self.border_resize_active {
+                        self.apply_active_cursor();
                     }
                 }
             }
@@ -504,6 +631,22 @@ impl ClientApp {
                             mgr.create_copy_paste_source(&self.qh, SUPPORTED_TEXT_MIMES.to_vec());
                         source.set_selection(data_device, self.last_input_serial);
                         self.copy_paste_source = Some(source);
+                    }
+                }
+            }
+            ClientUiEvent::PrimarySelectionText { text } => {
+                if !text.is_empty()
+                    && (self.primary_selection_source.is_none() || text != self.last_primary)
+                {
+                    self.last_primary = text;
+                    if let (Some(mgr), Some(primary_device)) = (
+                        &self.primary_selection_manager_state,
+                        &self.primary_selection_device,
+                    ) {
+                        let source =
+                            mgr.create_selection_source(&self.qh, SUPPORTED_TEXT_MIMES.to_vec());
+                        source.set_selection(primary_device, self.last_input_serial);
+                        self.primary_selection_source = Some(source);
                     }
                 }
             }
@@ -795,6 +938,11 @@ impl SeatHandler for ClientApp {
                 self.data_device = Some(mgr.get_data_device(qh, &seat));
             }
         }
+        if self.primary_selection_device.is_none() {
+            if let Some(mgr) = &self.primary_selection_manager_state {
+                self.primary_selection_device = Some(mgr.get_selection_device(qh, &seat));
+            }
+        }
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             if let Ok(kbd) = self.seat_state.get_keyboard(qh, &seat, None) {
                 self.keyboard = Some(kbd);
@@ -936,8 +1084,9 @@ impl PointerHandler for ClientApp {
             match event.kind {
                 PointerEventKind::Enter { serial } => {
                     self.last_input_serial = serial;
+                    self.last_pointer_enter_serial = serial;
                     self.pointer_window_id = window_id;
-                    self.last_cursor = (true, CursorIcon::Default);
+                    self.last_cursor = ActiveCursor::Named(CursorIcon::Default);
                     let resize_icon = self.windows.get(&window_id).and_then(|win| {
                         (!win.maximized && !win.fullscreen && !win.tiled)
                             .then(|| {
@@ -958,9 +1107,7 @@ impl PointerHandler for ClientApp {
                         }
                     } else {
                         self.border_resize_active = false;
-                        if let Some(tp) = &self.themed_pointer {
-                            let _ = tp.set_cursor(&self.conn, self.last_cursor.1);
-                        }
+                        self.apply_active_cursor();
                     }
                     let _ = self.ctrl_tx.send(ControlMessage::PointerMotion {
                         window_id,
@@ -990,13 +1137,7 @@ impl PointerHandler for ClientApp {
                         }
                     } else if self.border_resize_active {
                         self.border_resize_active = false;
-                        if let Some(tp) = &self.themed_pointer {
-                            if !self.last_cursor.0 {
-                                let _ = tp.hide_cursor();
-                            } else {
-                                let _ = tp.set_cursor(&self.conn, self.last_cursor.1);
-                            }
-                        }
+                        self.apply_active_cursor();
                     }
                     let _ = self.ctrl_tx.send(ControlMessage::PointerMotion {
                         window_id,
@@ -1068,7 +1209,7 @@ impl PointerHandler for ClientApp {
                 }
                 PointerEventKind::Leave { .. } => {
                     self.border_resize_active = false;
-                    self.last_cursor = (true, CursorIcon::Default);
+                    self.last_cursor = ActiveCursor::Named(CursorIcon::Default);
                     self.release_pressed_buttons(window_id);
                 }
             }
@@ -1082,14 +1223,84 @@ impl ShmHandler for ClientApp {
     }
 }
 
-const SUPPORTED_TEXT_MIMES: &[&str] = &[
-    "text/plain;charset=utf-8",
-    "text/plain;charset=UTF-8",
-    "UTF8_STRING",
-    "text/plain",
-    "STRING",
-    "TEXT",
-];
+const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read up to `MAX_SELECTION_BYTES` of UTF-8 text from a selection pipe with a
+/// bounded `poll(2)` deadline so a misbehaving peer cannot leak threads or RAM.
+fn read_selection_fd_bounded(fd: OwnedFd) -> Option<String> {
+    let raw = fd.as_raw_fd();
+    let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while buf.len() < MAX_SELECTION_BYTES {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if rc == 0 {
+            break;
+        }
+        let max_read = chunk.len().min(MAX_SELECTION_BYTES - buf.len());
+        let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast::<libc::c_void>(), max_read) };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+    }
+    String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+}
+
+/// Write selection bytes to `fd` with a bounded `poll(2)` deadline so a stalled
+/// reader cannot pin a worker thread indefinitely.
+fn write_selection_fd_timeout(fd: OwnedFd, bytes: &[u8]) {
+    let raw = fd.as_raw_fd();
+    let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
+    let mut written = 0;
+    while written < bytes.len() {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if rc == 0 || (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
+            break;
+        }
+        let n = unsafe {
+            libc::write(
+                raw,
+                bytes[written..].as_ptr().cast::<libc::c_void>(),
+                bytes.len() - written,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        written += n as usize;
+    }
+}
 
 impl DataDeviceHandler for ClientApp {
     fn enter(
@@ -1136,9 +1347,7 @@ impl DataDeviceHandler for ClientApp {
         let _ = self.conn.flush();
         let ctrl_tx = self.ctrl_tx.clone();
         std::thread::spawn(move || {
-            let mut file = File::from(OwnedFd::from(read_pipe));
-            let mut text = String::new();
-            if file.read_to_string(&mut text).is_ok() && !text.is_empty() {
+            if let Some(text) = read_selection_fd_bounded(OwnedFd::from(read_pipe)) {
                 let _ = ctrl_tx.send(ControlMessage::ClipboardText { text });
             }
         });
@@ -1193,8 +1402,7 @@ impl DataSourceHandler for ClientApp {
         {
             let text = self.last_clipboard.clone();
             std::thread::spawn(move || {
-                let mut file = File::from(OwnedFd::from(write_pipe));
-                let _ = file.write_all(text.as_bytes());
+                write_selection_fd_timeout(OwnedFd::from(write_pipe), text.as_bytes());
             });
         }
     }
@@ -1216,6 +1424,88 @@ impl DataSourceHandler for ClientApp {
     fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
 }
 
+impl PrimarySelectionDeviceHandler for ClientApp {
+    fn selection(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        primary_selection_device: &ZwpPrimarySelectionDeviceV1,
+    ) {
+        // Ignore selection echo when our own PrimarySelectionSource is active.
+        if self.primary_selection_source.is_some() {
+            return;
+        }
+        let Some(dev) = &self.primary_selection_device else {
+            return;
+        };
+        if dev.inner() != primary_selection_device {
+            return;
+        }
+        let Some(offer) = dev.data().selection_offer() else {
+            return;
+        };
+        let mime = offer.with_mime_types(|mimes| {
+            SUPPORTED_TEXT_MIMES
+                .iter()
+                .find(|&&want| mimes.iter().any(|m| m == want))
+                .map(|&s| s.to_string())
+        });
+        let Some(mime) = mime else {
+            return;
+        };
+        let Ok(read_pipe) = offer.receive(mime) else {
+            return;
+        };
+        let _ = self.conn.flush();
+        let ctrl_tx = self.ctrl_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(text) = read_selection_fd_bounded(OwnedFd::from(read_pipe)) {
+                let _ = ctrl_tx.send(ControlMessage::PrimarySelectionText { text });
+            }
+        });
+    }
+}
+
+impl PrimarySelectionSourceHandler for ClientApp {
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &ZwpPrimarySelectionSourceV1,
+        mime: String,
+        write_pipe: WritePipe,
+    ) {
+        if self
+            .primary_selection_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+            && SUPPORTED_TEXT_MIMES.contains(&mime.as_str())
+        {
+            let text = self.last_primary.clone();
+            std::thread::spawn(move || {
+                write_selection_fd_timeout(OwnedFd::from(write_pipe), text.as_bytes());
+            });
+        }
+    }
+
+    fn cancelled(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &ZwpPrimarySelectionSourceV1,
+    ) {
+        if self
+            .primary_selection_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            self.primary_selection_source = None;
+        } else {
+            source.destroy();
+        }
+    }
+}
+
 impl ProvidesRegistryState for ClientApp {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -1230,6 +1520,7 @@ delegate_seat!(ClientApp);
 delegate_keyboard!(ClientApp);
 delegate_pointer!(ClientApp);
 delegate_data_device!(ClientApp);
+delegate_primary_selection!(ClientApp);
 delegate_xdg_shell!(ClientApp);
 delegate_xdg_window!(ClientApp);
 delegate_xdg_popup!(ClientApp);
@@ -1271,6 +1562,7 @@ pub fn run_event_loop(
     let xdg_shell = XdgShell::bind(&globals, &qh).context("xdg_wm_base not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
     let data_device_manager_state = DataDeviceManagerState::bind(&globals, &qh).ok();
+    let primary_selection_manager_state = PrimarySelectionManagerState::bind(&globals, &qh).ok();
     let pool = SlotPool::new(1920 * 1080 * 4, &shm).context("failed to create SlotPool")?;
 
     let mut app = ClientApp {
@@ -1281,27 +1573,33 @@ pub fn run_event_loop(
         xdg_shell,
         shm,
         data_device_manager_state,
+        primary_selection_manager_state,
         pool,
         conn,
         qh,
         seat: None,
         keyboard: None,
         themed_pointer: None,
+        custom_cursor_surface: None,
         data_device: None,
         copy_paste_source: None,
+        primary_selection_device: None,
+        primary_selection_source: None,
         focused_window_id: 1,
         pointer_window_id: 1,
         last_button_serial: 0,
         last_input_serial: 0,
+        last_pointer_enter_serial: 0,
         pressed_keys: HashSet::new(),
         pressed_buttons: HashSet::new(),
-        last_cursor: (true, CursorIcon::Default),
+        last_cursor: ActiveCursor::Named(CursorIcon::Default),
         border_resize_active: false,
         windows: HashMap::new(),
         popups: HashMap::new(),
         surface_to_remote: HashMap::new(),
         ctrl_tx,
         last_clipboard: String::new(),
+        last_primary: String::new(),
         exit: false,
     };
 

@@ -5,10 +5,26 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum UTF-8 selection payload size (4 MiB) read from clipboard or primary selection pipes.
+pub const MAX_SELECTION_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum allowed cursor bitmap width/height in pixels.
+pub const MAX_CURSOR_DIM: u32 = 512;
+
+/// Ordered preference list of text MIME types for clipboard and primary selection sync.
+pub const SUPPORTED_TEXT_MIMES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain;charset=UTF-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+    "TEXT",
+];
 
 /// Unique identifier for a remote Wayland window (`xdg_toplevel` or `xdg_popup`).
 pub type WindowId = u64;
@@ -226,6 +242,10 @@ pub enum ControlMessage {
     ClipboardText {
         text: String,
     },
+    /// Bidirectional: UTF-8 primary selection (middle-click paste) text synchronization.
+    PrimarySelectionText {
+        text: String,
+    },
     /// Server -> Client: enable/disable host microphone capture based on remote app demand.
     SetMicActive {
         active: bool,
@@ -235,6 +255,15 @@ pub enum ControlMessage {
         window_id: WindowId,
         visible: bool,
         shape_name: String,
+    },
+    /// Server -> Client: surface-based cursor bitmap (`Argb8888` BGRA bytes + hotspot).
+    CursorBitmap {
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        bgra: Vec<u8>,
     },
 
     /// Client -> Server: request list of discovered `.desktop` applications.
@@ -540,5 +569,29 @@ mod tests {
         assert_eq!(dec_hdr, pkt_hdr);
         assert_eq!(dec_payload, vec![9, 8, 7]);
         assert!(read_audio_packet(&mut rx).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn primary_selection_and_cursor_bitmap_roundtrip() {
+        let (mut tx, mut rx) = tokio::io::duplex(4096);
+        let primary = ControlMessage::PrimarySelectionText {
+            text: "middle-click paste".into(),
+        };
+        let cursor = ControlMessage::CursorBitmap {
+            window_id: 9,
+            width: 2,
+            height: 2,
+            hotspot_x: 1,
+            hotspot_y: 1,
+            bgra: [0u8, 0, 0, 255].repeat(4),
+        };
+
+        write_control_message(&mut tx, &primary).await.unwrap();
+        write_control_message(&mut tx, &cursor).await.unwrap();
+        drop(tx);
+
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), primary);
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), cursor);
+        assert!(read_control_message(&mut rx).await.unwrap().is_none());
     }
 }

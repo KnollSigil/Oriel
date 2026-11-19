@@ -554,8 +554,28 @@ pub async fn run_client(
                     shape_name,
                 });
             }
+            ControlMessage::CursorBitmap {
+                window_id,
+                width,
+                height,
+                hotspot_x,
+                hotspot_y,
+                bgra,
+            } => {
+                let _ = ui_tx.send(ClientUiEvent::CursorBitmap {
+                    window_id,
+                    width,
+                    height,
+                    hotspot_x,
+                    hotspot_y,
+                    bgra,
+                });
+            }
             ControlMessage::ClipboardText { text } => {
                 let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
+            }
+            ControlMessage::PrimarySelectionText { text } => {
+                let _ = ui_tx.send(ClientUiEvent::PrimarySelectionText { text });
             }
             ControlMessage::SetMicActive { active } => {
                 server_mic_wanted = active;
