@@ -355,6 +355,21 @@ async fn handle_connection(
     let mut popup_encoders: HashMap<WindowId, VideoEncoder> = HashMap::new();
     let session_start = Instant::now();
 
+    // Serialize and coalesce client ColorScheme updates onto a single worker so bursts
+    // cannot spawn unbounded blocking tasks or race on isolated portal config files.
+    let (color_scheme_tx, mut color_scheme_rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+    tokio::spawn(async move {
+        while color_scheme_rx.changed().await.is_ok() {
+            let scheme_opt = *color_scheme_rx.borrow_and_update();
+            if let Some(scheme) = scheme_opt {
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::session::apply_color_scheme(scheme);
+                })
+                .await;
+            }
+        }
+    });
+
     // Bridge compositor events -> QUIC control/video streams and QUIC control messages -> compositor.
     loop {
         tokio::select! {
@@ -544,6 +559,9 @@ async fn handle_connection(
                         } else {
                             let _ = cmd_tx.send(CompositorCommand::TerminateApp { launch_id, force });
                         }
+                    }
+                    Some(ControlMessage::ColorScheme { scheme }) => {
+                        let _ = color_scheme_tx.send(Some(scheme));
                     }
                     Some(other) => {
                         info!(?other, "received control message");

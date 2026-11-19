@@ -258,10 +258,21 @@ pub async fn run_client(
         })
     });
 
-    // Task: forward local winit input/resize/close messages to server control stream.
+    // Task: query and monitor local XDG portal `color-scheme` and forward changes to the server.
+    let (theme_tx, mut theme_rx) = mpsc::unbounded_channel::<u32>();
+    let color_scheme_task = tokio::spawn(watch_local_color_scheme(theme_tx));
+
+    // Task: forward local input/resize/close/theme messages to server control stream.
     let (ctrl_closed_tx, mut ctrl_closed_rx) = tokio::sync::oneshot::channel::<()>();
     let writer_task = tokio::spawn(async move {
-        while let Some(msg) = ctrl_rx.recv().await {
+        loop {
+            let msg = tokio::select! {
+                m = ctrl_rx.recv() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+                Some(scheme) = theme_rx.recv() => ControlMessage::ColorScheme { scheme },
+            };
             if let Err(err) = write_control_message(&mut send, &msg).await {
                 warn!(error = %err, "failed to send control message");
                 break;
@@ -620,6 +631,7 @@ pub async fn run_client(
     if let Some(t) = stats_task {
         t.abort();
     }
+    color_scheme_task.abort();
     writer_task.abort();
     if let Some((handle, task)) = active_mic.take() {
         task.abort();
@@ -627,4 +639,209 @@ pub async fn run_client(
     }
     uni_task.abort();
     Ok(())
+}
+
+/// Parse an XDG `org.freedesktop.appearance` `color-scheme` (`uint32 0|1|2`) from
+/// `gdbus call` or `gdbus monitor` output.
+fn parse_gdbus_color_scheme(text: &str) -> Option<u32> {
+    if let Some(idx) = text.find("uint32 ") {
+        let rest = &text[idx + "uint32 ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let val: u32 = digits.parse().ok()?;
+        return (val <= 2).then_some(val);
+    }
+    if let Some(idx) = text.rfind('<') {
+        let rest = &text[idx + 1..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            let val: u32 = digits.parse().ok()?;
+            return (val <= 2).then_some(val);
+        }
+    }
+    None
+}
+
+fn find_on_path(binary: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+async fn query_local_color_scheme() -> Option<u32> {
+    use tokio::process::Command;
+
+    let fut = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+            "--method",
+            "org.freedesktop.portal.Settings.Read",
+            "org.freedesktop.appearance",
+            "color-scheme",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+
+    let output = tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_gdbus_color_scheme(&stdout)
+}
+
+async fn watch_local_color_scheme(tx: mpsc::UnboundedSender<u32>) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    // 1. Query initial color-scheme from the local session portal.
+    let mut last_sent_scheme: Option<u32> = None;
+    if let Some(scheme) = query_local_color_scheme().await {
+        info!(scheme, "syncing initial local color-scheme to server");
+        if tx.send(scheme).is_err() {
+            return;
+        }
+        last_sent_scheme = Some(scheme);
+    }
+
+    // 2. Watch for live theme/palette changes on the local session D-Bus:
+    //    - `org.freedesktop.portal.Settings.SettingChanged` (GNOME / KDE / standard XDG portal)
+    //    - `org.kde.KGlobalSettings.notifyChange` (KDE Plasma palette/color-scheme switches)
+    let dbus_monitor = find_on_path("dbus-monitor");
+    let stdbuf = find_on_path("stdbuf");
+    let using_dbus_monitor = dbus_monitor.is_some();
+
+    let mut cmd = if let Some(ref mon_bin) = dbus_monitor {
+        let args = [
+            "--session",
+            "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'",
+            "type='signal',interface='org.kde.KGlobalSettings',member='notifyChange'",
+        ];
+        if let Some(ref sb) = stdbuf {
+            let mut c = Command::new(sb);
+            c.arg("-oL").arg(mon_bin).args(args);
+            c
+        } else {
+            let mut c = Command::new(mon_bin);
+            c.args(args);
+            c
+        }
+    } else {
+        let args = [
+            "monitor",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+        ];
+        if let Some(ref sb) = stdbuf {
+            let mut c = Command::new(sb);
+            c.args(["-oL", "gdbus"]).args(args);
+            c
+        } else {
+            let mut c = Command::new("gdbus");
+            c.args(args);
+            c
+        }
+    };
+
+    let mut child = match cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(error = %err, "local color-scheme watcher unavailable");
+            return;
+        }
+    };
+
+    let Some(stdout) = child.stdout.take() else {
+        return;
+    };
+    let mut lines = BufReader::new(stdout).lines();
+
+    // Trailing-edge debounce: wait 80ms after the last trigger line so KDE/portal
+    // finishes updating its cached color-scheme before we re-query.
+    let mut pending_sync = false;
+    let debounce = tokio::time::sleep(Duration::from_secs(3600));
+    tokio::pin!(debounce);
+
+    loop {
+        tokio::select! {
+            line_res = lines.next_line() => {
+                match line_res {
+                    Ok(Some(line)) => {
+                        let triggered = if using_dbus_monitor {
+                            line.contains("member=notifyChange") || line.contains("color-scheme")
+                        } else {
+                            line.contains("org.freedesktop.appearance")
+                                && line.contains("color-scheme")
+                        };
+                        if triggered {
+                            pending_sync = true;
+                            debounce
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_millis(80));
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!("local color-scheme watcher stream closed");
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "local color-scheme watcher read error");
+                        break;
+                    }
+                }
+            }
+            () = &mut debounce, if pending_sync => {
+                pending_sync = false;
+                if let Some(scheme) = query_local_color_scheme().await {
+                    if last_sent_scheme != Some(scheme) {
+                        last_sent_scheme = Some(scheme);
+                        info!(scheme, "local color-scheme/palette changed; syncing to server");
+                        if tx.send(scheme).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_gdbus_color_scheme_extracts_valid_values() {
+        assert_eq!(parse_gdbus_color_scheme("(<<uint32 1>>,)"), Some(1));
+        assert_eq!(
+            parse_gdbus_color_scheme(
+                "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged ('org.freedesktop.appearance', 'color-scheme', <uint32 2>)"
+            ),
+            Some(2)
+        );
+        assert_eq!(parse_gdbus_color_scheme("(<<uint32 0>>,)"), Some(0));
+        assert_eq!(parse_gdbus_color_scheme("(<1>,)"), Some(1));
+        assert_eq!(parse_gdbus_color_scheme("(<<2>>,)"), Some(2));
+        assert_eq!(parse_gdbus_color_scheme("(<<uint32 9>>,)"), None);
+        assert_eq!(parse_gdbus_color_scheme("unrelated"), None);
+    }
 }

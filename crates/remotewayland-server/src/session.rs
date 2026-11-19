@@ -22,10 +22,14 @@ use tracing::{info, warn};
 #[derive(Debug, Clone)]
 pub struct SessionEnvInfo {
     pub runtime_dir: PathBuf,
+    pub portal_config_dir: PathBuf,
     pub dbus_address: Option<String>,
     pub wayland_socket: Option<OsString>,
     pub x11_display: Option<String>,
     pub xauthority: Option<PathBuf>,
+    pub xdg_current_desktop: Option<String>,
+    pub gtk_modules: Option<String>,
+    pub color_scheme: Option<u32>,
 }
 
 static SESSION_INFO: OnceLock<Mutex<SessionEnvInfo>> = OnceLock::new();
@@ -153,18 +157,45 @@ impl SessionGuard {
             }
         };
 
+        let portal_config_dir = runtime_dir.join("portal-config");
+        create_private_dir(&portal_config_dir)?;
+
+        let inherited_desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let detected_backend = detect_portal_backend(inherited_desktop.as_deref());
+        let xdg_current_desktop = inherited_desktop.or_else(|| {
+            detected_backend.as_ref().map(|b| match b {
+                PortalBackend::Kde(_) => "KDE".to_string(),
+                PortalBackend::Gtk(_) => "GNOME".to_string(),
+            })
+        });
+        let inherited_gtk_modules = std::env::var("GTK_MODULES").ok();
+        let gtk_modules = build_gtk_modules(
+            inherited_gtk_modules.as_deref(),
+            has_gtk3_module("libwindow-decorations-gtk-module.so"),
+            has_gtk3_module("libcolorreload-gtk-module.so"),
+        );
+        prepare_portal_config_dir(&portal_config_dir, detected_backend.as_ref());
+
         let info = SessionEnvInfo {
             runtime_dir: runtime_dir.clone(),
+            portal_config_dir,
             dbus_address: dbus_address.clone(),
             wayland_socket: None,
             x11_display: None,
             xauthority: None,
+            xdg_current_desktop: xdg_current_desktop.clone(),
+            gtk_modules: gtk_modules.clone(),
+            color_scheme: None,
         };
         let _ = SESSION_INFO.set(Mutex::new(info));
 
         info!(
             runtime_dir = %runtime_dir.display(),
             dbus = ?dbus_address,
+            desktop = ?xdg_current_desktop,
+            gtk_modules = ?gtk_modules,
             "isolated RemoteWayland session runtime initialized"
         );
 
@@ -179,17 +210,62 @@ impl SessionGuard {
         &self.runtime_dir
     }
 
-    /// Record the Wayland socket name once the headless compositor is ready and
-    /// best-effort launch `xdg-desktop-portal` inside the isolated session.
+    /// Record the Wayland socket name once the headless compositor is ready,
+    /// sync the isolated activation environment into the private D-Bus daemon,
+    /// and best-effort launch the detected portal backends + `xdg-desktop-portal`.
     pub fn set_wayland_socket_and_start_portal(&mut self, socket_name: &OsStr) {
-        if let Some(lock) = SESSION_INFO.get() {
+        let portal_config_dir = if let Some(lock) = SESSION_INFO.get() {
             if let Ok(mut guard) = lock.lock() {
                 guard.wayland_socket = Some(socket_name.to_os_string());
+                guard.portal_config_dir.clone()
+            } else {
+                self.runtime_dir.join("portal-config")
             }
-        }
+        } else {
+            self.runtime_dir.join("portal-config")
+        };
 
         if self.dbus_address.is_some() {
-            match start_xdg_desktop_portal(&self.runtime_dir, socket_name) {
+            sync_dbus_activation_env();
+
+            let mut backends_to_start: Vec<PortalBackend> = Vec::new();
+            if let Some(p) = find_kde_portal_backend() {
+                backends_to_start.push(PortalBackend::Kde(p));
+            }
+            if let Some(p) = find_gtk_portal_backend() {
+                backends_to_start.push(PortalBackend::Gtk(p));
+            }
+
+            // Spawn all detected backends first, then wait against a shared deadline
+            // so startup latency does not multiply per backend.
+            let mut pending_names: Vec<(&'static str, usize)> = Vec::new();
+            for backend in &backends_to_start {
+                match start_portal_backend(
+                    backend,
+                    &self.runtime_dir,
+                    &portal_config_dir,
+                    socket_name,
+                ) {
+                    Ok(child) => {
+                        let idx = self.children.len();
+                        self.children.push(child);
+                        let bus_name = match backend {
+                            PortalBackend::Kde(_) => "org.freedesktop.impl.portal.desktop.kde",
+                            PortalBackend::Gtk(_) => "org.freedesktop.impl.portal.desktop.gtk",
+                        };
+                        pending_names.push((bus_name, idx));
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "portal backend not started inside isolated session"
+                        );
+                    }
+                }
+            }
+            wait_for_portal_backends(&mut self.children, &pending_names, Duration::from_millis(800));
+
+            match start_xdg_desktop_portal(&self.runtime_dir, &portal_config_dir, socket_name) {
                 Ok(child) => self.children.push(child),
                 Err(err) => {
                     warn!(
@@ -265,32 +341,287 @@ fn start_private_dbus(runtime_dir: &Path) -> Result<(String, Child)> {
     Ok((address, child))
 }
 
-fn find_portal_binary() -> Option<PathBuf> {
-    for candidate in [
-        "/usr/libexec/xdg-desktop-portal",
-        "/usr/lib/xdg-desktop-portal",
-        "/usr/lib/xdg-desktop-portal/xdg-desktop-portal",
-    ] {
-        let p = Path::new(candidate);
-        if p.is_file() {
-            return Some(p.to_path_buf());
-        }
-    }
-    None
+#[derive(Debug, Clone)]
+enum PortalBackend {
+    Kde(PathBuf),
+    Gtk(PathBuf),
 }
 
-fn start_xdg_desktop_portal(runtime_dir: &Path, wayland_socket: &OsStr) -> Result<Child> {
-    let Some(bin) = find_portal_binary() else {
-        bail!("xdg-desktop-portal binary not found in /usr/libexec or /usr/lib");
-    };
+fn find_first_file(candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .map(Path::to_path_buf)
+}
 
-    let mut cmd = Command::new(&bin);
+fn find_kde_portal_backend() -> Option<PathBuf> {
+    find_first_file(&[
+        "/usr/libexec/xdg-desktop-portal-kde",
+        "/usr/lib/xdg-desktop-portal-kde",
+        "/usr/lib/x86_64-linux-gnu/xdg-desktop-portal-kde",
+        "/usr/lib/aarch64-linux-gnu/xdg-desktop-portal-kde",
+    ])
+}
+
+fn find_gtk_portal_backend() -> Option<PathBuf> {
+    find_first_file(&[
+        "/usr/libexec/xdg-desktop-portal-gtk",
+        "/usr/lib/xdg-desktop-portal-gtk",
+        "/usr/lib/x86_64-linux-gnu/xdg-desktop-portal-gtk",
+        "/usr/lib/aarch64-linux-gnu/xdg-desktop-portal-gtk",
+    ])
+}
+
+fn detect_portal_backend(preferred_desktop: Option<&str>) -> Option<PortalBackend> {
+    let kde = find_kde_portal_backend();
+    let gtk = find_gtk_portal_backend();
+
+    if let Some(desk) = preferred_desktop {
+        let lower = desk.to_ascii_lowercase();
+        if lower.contains("kde") {
+            if let Some(p) = kde {
+                return Some(PortalBackend::Kde(p));
+            }
+        } else if lower.contains("gnome") || lower.contains("gtk") {
+            if let Some(p) = gtk {
+                return Some(PortalBackend::Gtk(p));
+            }
+        }
+    }
+
+    kde.map(PortalBackend::Kde)
+        .or_else(|| gtk.map(PortalBackend::Gtk))
+}
+
+fn has_gtk3_module(filename: &str) -> bool {
+    [
+        "/usr/lib64/gtk-3.0/modules",
+        "/usr/lib/gtk-3.0/modules",
+        "/usr/lib/x86_64-linux-gnu/gtk-3.0/modules",
+        "/usr/lib/aarch64-linux-gnu/gtk-3.0/modules",
+    ]
+    .iter()
+    .any(|dir| Path::new(dir).join(filename).is_file())
+}
+
+fn build_gtk_modules(
+    inherited: Option<&str>,
+    has_window_decorations: bool,
+    has_colorreload: bool,
+) -> Option<String> {
+    let mut parts: Vec<String> = inherited
+        .unwrap_or("")
+        .split(':')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if has_window_decorations && !parts.iter().any(|m| m == "window-decorations-gtk-module") {
+        parts.push("window-decorations-gtk-module".to_string());
+    }
+    if has_colorreload && !parts.iter().any(|m| m == "colorreload-gtk-module") {
+        parts.push("colorreload-gtk-module".to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(":"))
+    }
+}
+
+fn dbus_name_has_owner(bus_name: &str) -> bool {
+    let mut cmd = Command::new("gdbus");
+    apply_session_env(&mut cmd, None);
+    cmd.args([
+        "call",
+        "--session",
+        "--timeout",
+        "2",
+        "--dest",
+        "org.freedesktop.DBus",
+        "--object-path",
+        "/org/freedesktop/DBus",
+        "--method",
+        "org.freedesktop.DBus.NameHasOwner",
+        bus_name,
+    ])
+    .stdin(Stdio::null())
+    .stderr(Stdio::null())
+    .output()
+    .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).contains("true"))
+}
+
+fn wait_for_portal_backends(
+    children: &mut [Child],
+    pending: &[(&'static str, usize)],
+    timeout: Duration,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut remaining: Vec<(&'static str, usize)> = pending.to_vec();
+    let deadline = Instant::now() + timeout;
+    while !remaining.is_empty() && Instant::now() < deadline {
+        remaining.retain(|&(bus_name, child_idx)| {
+            if let Some(child) = children.get_mut(child_idx) {
+                if let Ok(Some(status)) = child.try_wait() {
+                    warn!(bus_name, %status, "portal backend exited before owning D-Bus name");
+                    return false;
+                }
+            }
+            !dbus_name_has_owner(bus_name)
+        });
+        if !remaining.is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    for (bus_name, _) in remaining {
+        warn!(bus_name, "timed out waiting for portal backend to own D-Bus name");
+    }
+}
+
+/// Atomically write `contents` to `path` via a unique sibling temp file and `fs::rename`
+/// so file monitors (`GFileMonitor`/inotify) never observe a truncated write or collide
+/// across concurrent callers.
+fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
+    fs::write(&tmp, contents)
+        .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| {
+            format!("failed to rename {} -> {}", tmp.display(), path.display())
+        });
+    }
+    Ok(())
+}
+
+fn find_xdg_data_path(rel_path: &str) -> Option<PathBuf> {
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| OsString::from("/usr/local/share:/usr/share"));
+    for dir in std::env::split_paths(&data_dirs) {
+        let candidate = dir.join(rel_path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    let fallback = Path::new("/usr/share").join(rel_path);
+    fallback.exists().then_some(fallback)
+}
+
+fn host_config_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+fn prepare_portal_config_dir(portal_config_dir: &Path, backend: Option<&PortalBackend>) {
+    // Seed portal-config/kdeglobals (and kdeglobals.orig for scheme=0 reset) from host
+    // ~/.config/kdeglobals if present, without ever mutating the host config.
+    if let Some(host_cfg) = host_config_dir() {
+        let src_kdeglobals = host_cfg.join("kdeglobals");
+        if src_kdeglobals.is_file() {
+            if let Err(err) = fs::copy(&src_kdeglobals, portal_config_dir.join("kdeglobals")) {
+                warn!(error = %err, "failed to seed isolated kdeglobals");
+            }
+            let _ = fs::copy(&src_kdeglobals, portal_config_dir.join("kdeglobals.orig"));
+        }
+    }
+
+    let portal_conf_dir = portal_config_dir.join("xdg-desktop-portal");
+    if create_private_dir(&portal_conf_dir).is_ok() {
+        let pref = match backend {
+            Some(PortalBackend::Gtk(_)) => "gtk;kde",
+            _ => "kde;gtk",
+        };
+        // Route org.freedesktop.impl.portal.Settings to gtk first when available so our
+        // isolated GSettings keyfile drives live `color-scheme` and `gtk-theme` updates
+        // for GTK3/GTK4/Chromium/Firefox, while KDE handles FileChooser/OpenURI/etc.
+        let settings_pref = if find_gtk_portal_backend().is_some() {
+            "gtk;kde"
+        } else {
+            pref
+        };
+        let conf = format!(
+            "[preferred]\ndefault={pref}\norg.freedesktop.impl.portal.Settings={settings_pref}\n"
+        );
+        if let Err(err) = write_file_atomic(&portal_conf_dir.join("portals.conf"), conf.as_bytes()) {
+            warn!(error = %err, "failed to write isolated portals.conf");
+        }
+    }
+}
+
+fn sync_dbus_activation_env() {
+    let Some(lock) = SESSION_INFO.get() else {
+        return;
+    };
+    let Ok(info) = lock.lock() else {
+        return;
+    };
+    if info.dbus_address.is_none() {
+        return;
+    }
+    let mut cmd = Command::new("dbus-update-activation-environment");
+    let mut vars = vec!["XDG_RUNTIME_DIR", "XDG_CONFIG_DIRS", "GTK_USE_PORTAL"];
+    if info.wayland_socket.is_some() {
+        vars.push("WAYLAND_DISPLAY");
+    }
+    if info.x11_display.is_some() {
+        vars.push("DISPLAY");
+    }
+    if info.xauthority.is_some() {
+        vars.push("XAUTHORITY");
+    }
+    if let Some(ref desk) = info.xdg_current_desktop {
+        vars.push("XDG_CURRENT_DESKTOP");
+        if desk.eq_ignore_ascii_case("kde") {
+            vars.push("QT_QPA_PLATFORMTHEME");
+        }
+    }
+    if info.gtk_modules.is_some() {
+        vars.push("GTK_MODULES");
+    }
+    drop(info);
+
+    apply_session_env(&mut cmd, None);
+    cmd.args(&vars)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = cmd.status();
+}
+
+fn spawn_portal_process(
+    bin: &Path,
+    runtime_dir: &Path,
+    portal_config_dir: &Path,
+    wayland_socket: &OsStr,
+    extra_env: &[(&str, &str)],
+    label: &str,
+) -> Result<Child> {
+    let mut cmd = Command::new(bin);
     cmd.arg("--replace")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     apply_session_env(&mut cmd, Some(wayland_socket));
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("XDG_CONFIG_HOME", portal_config_dir);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
 
     unsafe {
         cmd.pre_exec(|| {
@@ -302,8 +633,248 @@ fn start_xdg_desktop_portal(runtime_dir: &Path, wayland_socket: &OsStr) -> Resul
     let child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {}", bin.display()))?;
-    info!(bin = %bin.display(), pid = child.id(), "isolated xdg-desktop-portal started");
+    info!(bin = %bin.display(), pid = child.id(), "{label}");
     Ok(child)
+}
+
+fn start_portal_backend(
+    backend: &PortalBackend,
+    runtime_dir: &Path,
+    portal_config_dir: &Path,
+    wayland_socket: &OsStr,
+) -> Result<Child> {
+    let (bin, extra): (&Path, &[(&str, &str)]) = match backend {
+        PortalBackend::Kde(p) => (p, &[]),
+        PortalBackend::Gtk(p) => (p, &[("GSETTINGS_BACKEND", "keyfile")]),
+    };
+    spawn_portal_process(
+        bin,
+        runtime_dir,
+        portal_config_dir,
+        wayland_socket,
+        extra,
+        "isolated portal backend started",
+    )
+}
+
+fn find_portal_binary() -> Option<PathBuf> {
+    find_first_file(&[
+        "/usr/libexec/xdg-desktop-portal",
+        "/usr/lib/xdg-desktop-portal",
+        "/usr/lib/xdg-desktop-portal/xdg-desktop-portal",
+    ])
+}
+
+fn start_xdg_desktop_portal(
+    runtime_dir: &Path,
+    portal_config_dir: &Path,
+    wayland_socket: &OsStr,
+) -> Result<Child> {
+    let Some(bin) = find_portal_binary() else {
+        bail!("xdg-desktop-portal binary not found in /usr/libexec or /usr/lib");
+    };
+    spawn_portal_process(
+        &bin,
+        runtime_dir,
+        portal_config_dir,
+        wayland_socket,
+        &[],
+        "isolated xdg-desktop-portal started",
+    )
+}
+
+fn format_gsettings_color_scheme_keyfile(scheme: u32, has_breeze_gtk: bool) -> String {
+    let (cs, theme) = match (scheme, has_breeze_gtk) {
+        (1, true) => ("prefer-dark", "Breeze-Dark"),
+        (1, false) => ("prefer-dark", "Adwaita-dark"),
+        (2, true) => ("prefer-light", "Breeze"),
+        (2, false) => ("prefer-light", "Adwaita"),
+        (_, true) => ("default", "Breeze"),
+        (_, false) => ("default", "Adwaita"),
+    };
+    format!(
+        "[org/gnome/desktop/interface]\ncolor-scheme='{cs}'\ngtk-theme='{theme}'\n"
+    )
+}
+
+/// Update `[General]` `ColorScheme` and `[Colors:Window]` `BackgroundNormal` / `ForegroundNormal`
+/// inside an isolated `kdeglobals` buffer so `xdg-desktop-portal-kde` reports the synced
+/// `org.freedesktop.appearance` `color-scheme` (`1` = dark, `2` = light).
+fn update_kdeglobals_color_scheme(existing: &str, scheme: u32) -> String {
+    let (scheme_name, bg, fg) = match scheme {
+        1 => ("BreezeDark", "35,38,41", "239,240,241"),
+        2 => ("BreezeLight", "239,240,241", "35,38,41"),
+        _ => return existing.to_string(),
+    };
+
+    let mut out = String::with_capacity(existing.len() + 128);
+    let mut section = String::new();
+    let mut saw_general = false;
+    let mut wrote_scheme = false;
+    let mut saw_colors_window = false;
+    let mut wrote_bg = false;
+    let mut wrote_fg = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if section == "General" && !wrote_scheme {
+                out.push_str(&format!("ColorScheme={scheme_name}\n"));
+                wrote_scheme = true;
+            } else if section == "Colors:Window" {
+                if !wrote_bg {
+                    out.push_str(&format!("BackgroundNormal={bg}\n"));
+                    wrote_bg = true;
+                }
+                if !wrote_fg {
+                    out.push_str(&format!("ForegroundNormal={fg}\n"));
+                    wrote_fg = true;
+                }
+            }
+            section = trimmed[1..trimmed.len() - 1].to_string();
+            if section == "General" {
+                saw_general = true;
+            } else if section == "Colors:Window" {
+                saw_colors_window = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if section == "General" && trimmed.starts_with("ColorScheme=") {
+            out.push_str(&format!("ColorScheme={scheme_name}\n"));
+            wrote_scheme = true;
+            continue;
+        }
+        if section == "Colors:Window" && trimmed.starts_with("BackgroundNormal=") {
+            out.push_str(&format!("BackgroundNormal={bg}\n"));
+            wrote_bg = true;
+            continue;
+        }
+        if section == "Colors:Window" && trimmed.starts_with("ForegroundNormal=") {
+            out.push_str(&format!("ForegroundNormal={fg}\n"));
+            wrote_fg = true;
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if section == "General" && !wrote_scheme {
+        out.push_str(&format!("ColorScheme={scheme_name}\n"));
+    } else if section == "Colors:Window" {
+        if !wrote_bg {
+            out.push_str(&format!("BackgroundNormal={bg}\n"));
+        }
+        if !wrote_fg {
+            out.push_str(&format!("ForegroundNormal={fg}\n"));
+        }
+    }
+
+    if !saw_general {
+        out.push_str(&format!("\n[General]\nColorScheme={scheme_name}\n"));
+    }
+    if !saw_colors_window {
+        out.push_str(&format!(
+            "\n[Colors:Window]\nBackgroundNormal={bg}\nForegroundNormal={fg}\n"
+        ));
+    }
+    out
+}
+
+/// KDE `KGlobalSettings::ChangeType` values emitted on `/KGlobalSettings`.
+const KGLOBAL_PALETTE_CHANGED: &str = "0";
+const KGLOBAL_SETTINGS_CHANGED: &str = "4";
+
+/// Apply the client-synced `org.freedesktop.appearance` `color-scheme`
+/// (`0` = no preference, `1` = prefer dark, `2` = prefer light) to the isolated
+/// portal configuration and notify the isolated portal backend live.
+pub fn apply_color_scheme(scheme: u32) {
+    static APPLY_LOCK: Mutex<()> = Mutex::new(());
+
+    if scheme > 2 {
+        warn!(scheme, "ignoring invalid client color-scheme value");
+        return;
+    }
+    let _apply_guard = APPLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (portal_config_dir, has_dbus) = {
+        let Some(lock) = SESSION_INFO.get() else {
+            return;
+        };
+        let Ok(mut info) = lock.lock() else {
+            return;
+        };
+        info.color_scheme = Some(scheme);
+        (info.portal_config_dir.clone(), info.dbus_address.is_some())
+    };
+
+    // Update GSettings keyfile atomically for xdg-desktop-portal-gtk
+    // (drives live `color-scheme` and `gtk-theme` over org.freedesktop.portal.Settings).
+    let glib_dir = portal_config_dir.join("glib-2.0/settings");
+    if create_private_dir(&glib_dir).is_ok() {
+        let has_breeze_gtk = find_xdg_data_path("themes/Breeze-Dark").is_some();
+        let keyfile = format_gsettings_color_scheme_keyfile(scheme, has_breeze_gtk);
+        if let Err(err) = write_file_atomic(&glib_dir.join("keyfile"), keyfile.as_bytes()) {
+            warn!(error = %err, "failed to update isolated GSettings keyfile");
+        }
+    }
+
+    // Update isolated kdeglobals atomically for xdg-desktop-portal-kde and Qt/KDE apps.
+    let kdeglobals_path = portal_config_dir.join("kdeglobals");
+    let updated_kdeglobals = if scheme == 0 {
+        let orig = portal_config_dir.join("kdeglobals.orig");
+        fs::read_to_string(&orig).ok().or_else(|| {
+            find_xdg_data_path("color-schemes/BreezeLight.colors")
+                .and_then(|p| fs::read_to_string(p).ok())
+        })
+    } else {
+        let rel = if scheme == 1 {
+            "color-schemes/BreezeDark.colors"
+        } else {
+            "color-schemes/BreezeLight.colors"
+        };
+        let base = find_xdg_data_path(rel)
+            .and_then(|p| fs::read_to_string(p).ok())
+            .or_else(|| fs::read_to_string(&kdeglobals_path).ok())
+            .unwrap_or_default();
+        Some(update_kdeglobals_color_scheme(&base, scheme))
+    };
+    if let Some(updated) = updated_kdeglobals {
+        if let Err(err) = write_file_atomic(&kdeglobals_path, updated.as_bytes()) {
+            warn!(error = %err, "failed to update isolated kdeglobals");
+        }
+    }
+
+    // Notify KDE portal backend and Qt/KDE apps over the private D-Bus.
+    if has_dbus {
+        for change_type in [KGLOBAL_PALETTE_CHANGED, KGLOBAL_SETTINGS_CHANGED] {
+            let mut cmd = Command::new("gdbus");
+            apply_session_env(&mut cmd, None);
+            let res = cmd
+                .args([
+                    "emit",
+                    "--session",
+                    "--object-path",
+                    "/KGlobalSettings",
+                    "--signal",
+                    "org.kde.KGlobalSettings.notifyChange",
+                    change_type,
+                    "0",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if let Err(err) = res {
+                warn!(error = %err, change_type, "failed to emit KGlobalSettings.notifyChange");
+            }
+        }
+    }
+
+    info!(scheme, "applied synced client color-scheme to isolated portal");
 }
 
 /// Return the isolated session runtime directory if initialized.
@@ -323,6 +894,7 @@ pub fn set_x11_env(display: String, xauthority: Option<PathBuf>) {
             info.xauthority = xauthority;
         }
     }
+    sync_dbus_activation_env();
 }
 
 /// Clear `DISPLAY` and `XAUTHORITY` from the session environment (e.g., if
@@ -489,6 +1061,7 @@ pub fn write_xwayland_auth_shim(
 pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
     cmd.env_remove("DISPLAY")
         .env_remove("XAUTHORITY")
+        .env("GTK_USE_PORTAL", "1")
         .env("PULSE_SINK", crate::audio::VIRTUAL_SINK_NAME)
         .env("PULSE_SOURCE", crate::audio::VIRTUAL_MIC_NAME);
 
@@ -504,6 +1077,24 @@ pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
             if let Some(xauth) = &info.xauthority {
                 cmd.env("XAUTHORITY", xauth);
             }
+            if let Some(desk) = &info.xdg_current_desktop {
+                cmd.env("XDG_CURRENT_DESKTOP", desk);
+                if desk.eq_ignore_ascii_case("kde") && std::env::var_os("QT_QPA_PLATFORMTHEME").is_none() {
+                    cmd.env("QT_QPA_PLATFORMTHEME", "kde");
+                }
+            }
+            if let Some(mods) = &info.gtk_modules {
+                cmd.env("GTK_MODULES", mods);
+            }
+            // Prepend our isolated portal-config dir to XDG_CONFIG_DIRS so Qt/KDE apps
+            // pick up the synced BreezeDark/BreezeLight kdeglobals without mutating ~/.config.
+            let mut config_dirs = OsString::from(&info.portal_config_dir);
+            config_dirs.push(":");
+            match std::env::var_os("XDG_CONFIG_DIRS").filter(|v| !v.is_empty()) {
+                Some(existing) => config_dirs.push(existing),
+                None => config_dirs.push("/etc/xdg"),
+            }
+            cmd.env("XDG_CONFIG_DIRS", config_dirs);
             if let Some(addr) = &info.dbus_address {
                 cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
             } else {
@@ -609,5 +1200,94 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let expected = format!("-auth {} :7 -rootless\n", xauth.display());
         assert_eq!(stdout, expected);
+    }
+
+    #[test]
+    fn build_gtk_modules_preserves_and_deduplicates() {
+        assert_eq!(
+            build_gtk_modules(None, true, true).as_deref(),
+            Some("window-decorations-gtk-module:colorreload-gtk-module")
+        );
+        assert_eq!(build_gtk_modules(None, false, false), None);
+        assert_eq!(
+            build_gtk_modules(Some("colorreload-gtk-module"), true, true).as_deref(),
+            Some("colorreload-gtk-module:window-decorations-gtk-module")
+        );
+        assert_eq!(
+            build_gtk_modules(
+                Some("window-decorations-gtk-module:colorreload-gtk-module"),
+                true,
+                true
+            )
+            .as_deref(),
+            Some("window-decorations-gtk-module:colorreload-gtk-module")
+        );
+    }
+
+    #[test]
+    fn update_kdeglobals_color_scheme_sets_dark_and_light() {
+        let base = "[General]\nFont=Noto Sans,10\nColorScheme=BreezeLight\n\n[Colors:Window]\nBackgroundNormal=239,240,241\n";
+        let dark = update_kdeglobals_color_scheme(base, 1);
+        assert!(dark.contains("ColorScheme=BreezeDark"));
+        assert!(dark.contains("BackgroundNormal=35,38,41"));
+        assert!(dark.contains("ForegroundNormal=239,240,241"));
+        assert!(dark.contains("Font=Noto Sans,10"));
+
+        let light = update_kdeglobals_color_scheme(&dark, 2);
+        assert!(light.contains("ColorScheme=BreezeLight"));
+        assert!(light.contains("BackgroundNormal=239,240,241"));
+
+        // Empty input appends both missing sections cleanly.
+        let from_empty = update_kdeglobals_color_scheme("", 1);
+        assert!(from_empty.contains("[General]\nColorScheme=BreezeDark"));
+        assert!(from_empty.contains("[Colors:Window]\nBackgroundNormal=35,38,41"));
+
+        // scheme=0 leaves existing content unchanged.
+        assert_eq!(update_kdeglobals_color_scheme(base, 0), base);
+    }
+
+    #[test]
+    fn format_gsettings_color_scheme_keyfile_selects_expected_themes() {
+        assert_eq!(
+            format_gsettings_color_scheme_keyfile(1, true),
+            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-dark'\ngtk-theme='Breeze-Dark'\n"
+        );
+        assert_eq!(
+            format_gsettings_color_scheme_keyfile(1, false),
+            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-dark'\ngtk-theme='Adwaita-dark'\n"
+        );
+        assert_eq!(
+            format_gsettings_color_scheme_keyfile(2, true),
+            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-light'\ngtk-theme='Breeze'\n"
+        );
+        assert_eq!(
+            format_gsettings_color_scheme_keyfile(0, false),
+            "[org/gnome/desktop/interface]\ncolor-scheme='default'\ngtk-theme='Adwaita'\n"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_replaces_target_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rw-atomic-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("keyfile");
+
+        write_file_atomic(&target, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+
+        write_file_atomic(&target, b"second").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+
+        let entries: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(entries, vec![OsString::from("keyfile")]);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

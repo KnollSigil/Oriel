@@ -331,7 +331,7 @@ impl ClientApp {
                 let surf_id = wl_surf.id().protocol_id();
                 let window = self.xdg_shell.create_window(
                     wl_surf,
-                    WindowDecorations::ClientOnly,
+                    WindowDecorations::RequestClient,
                     &self.qh,
                 );
                 window.set_title(if title.is_empty() {
@@ -535,6 +535,7 @@ impl ClientApp {
                     } else {
                         DecorationMode::Client
                     }));
+                    win.window.commit();
                 }
             }
             ClientUiEvent::WindowClosed { window_id } => {

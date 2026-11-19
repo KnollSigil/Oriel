@@ -210,15 +210,16 @@ mod cli_ui {
 
 #[cfg(feature = "gtk4")]
 mod gtk4_ui {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Child;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
     use gtk4::gdk_pixbuf::PixbufLoader;
+    use gtk4::gio;
     use gtk4::glib;
     use gtk4::prelude::*;
     use remotewayland_proto::{ControlMessage, LaunchState, RemoteAppEntry, PTY_LAUNCH_ID_BASE};
@@ -315,13 +316,13 @@ mod gtk4_ui {
                 background-color: alpha(currentColor, 0.10);
             }
             flowboxchild:selected {
-                background-color: rgba(53, 132, 228, 0.18);
-                border: 2px solid rgba(53, 132, 228, 0.55);
+                background-color: alpha(@theme_selected_bg_color, 0.18);
+                border: 2px solid alpha(@theme_selected_bg_color, 0.55);
                 color: inherit;
             }
             flowboxchild:focus {
-                background-color: rgba(53, 132, 228, 0.30);
-                border: 2px solid #3584e4;
+                background-color: alpha(@theme_selected_bg_color, 0.30);
+                border: 2px solid @theme_selected_bg_color;
                 color: inherit;
             }
             flowboxchild:selected label,
@@ -334,18 +335,18 @@ mod gtk4_ui {
                 border-radius: 5px;
             }
             .server-list row:selected {
-                background-color: rgba(53, 132, 228, 0.20);
+                background-color: alpha(@theme_selected_bg_color, 0.20);
                 color: inherit;
             }
             .server-list row:selected label {
                 color: inherit;
             }
             .server-list row:focus {
-                outline: 2px solid #3584e4;
+                outline: 2px solid @theme_selected_bg_color;
                 outline-offset: -2px;
             }
             searchentry:focus-within {
-                outline: 2px solid rgba(53, 132, 228, 0.80);
+                outline: 2px solid alpha(@theme_selected_bg_color, 0.80);
                 outline-offset: 1px;
             }
             .compact-btn {
@@ -364,6 +365,229 @@ mod gtk4_ui {
         }
     }
 
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct GtkSettingsIni {
+        prefer_dark: Option<bool>,
+        theme_name: Option<String>,
+        icon_theme_name: Option<String>,
+    }
+
+    fn parse_gtk_settings_ini(content: &str) -> GtkSettingsIni {
+        let mut parsed = GtkSettingsIni::default();
+        let mut in_settings = false;
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                in_settings = line.eq_ignore_ascii_case("[Settings]");
+                continue;
+            }
+            if !in_settings {
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "gtk-application-prefer-dark-theme" => {
+                    if val.eq_ignore_ascii_case("true") || val == "1" {
+                        parsed.prefer_dark = Some(true);
+                    } else if val.eq_ignore_ascii_case("false") || val == "0" {
+                        parsed.prefer_dark = Some(false);
+                    }
+                }
+                "gtk-theme-name" if !val.is_empty() => {
+                    parsed.theme_name = Some(val.to_string());
+                }
+                "gtk-icon-theme-name" if !val.is_empty() => {
+                    parsed.icon_theme_name = Some(val.to_string());
+                }
+                _ => {}
+            }
+        }
+        parsed
+    }
+
+    fn is_gtk4_theme_file(path: &Path) -> bool {
+        matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("colors.css" | "gtk.css" | "settings.ini")
+        )
+    }
+
+    fn gtk4_config_dir() -> Option<PathBuf> {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(xdg).join("gtk-4.0"));
+        }
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|h| PathBuf::from(h).join(".config").join("gtk-4.0"))
+    }
+
+    /// Watch `$XDG_CONFIG_HOME/gtk-4.0` (`colors.css`, `gtk.css`, `settings.ini`) and
+    /// live-reload GTK4 user CSS + settings when the desktop color scheme changes.
+    ///
+    /// KDE Plasma's `kde-gtk-config` updates `gtk-4.0/colors.css` and `settings.ini`
+    /// atomically on every theme/palette change, but GTK4 only loads `gtk.css` once at
+    /// startup (and its portal `color-scheme` signal can fire before `colors.css` is
+    /// rewritten, causing stale-theme flashes or missed same-polarity theme switches).
+    fn install_live_theme_reload(window: &gtk4::ApplicationWindow) {
+        let Some(gtk4_dir) = gtk4_config_dir() else {
+            return;
+        };
+        let Some(display) = gtk4::gdk::Display::default() else {
+            return;
+        };
+
+        let user_css_provider = gtk4::CssProvider::new();
+        // Registered after GTK4's startup user provider at the same priority so reloaded
+        // `@define-color` rules from `gtk.css` / `colors.css` take precedence immediately.
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &user_css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+
+        let gtk_css_path = gtk4_dir.join("gtk.css");
+        let settings_ini_path = gtk4_dir.join("settings.ini");
+        let reloading = Rc::new(Cell::new(false));
+
+        let reload_now: Rc<dyn Fn(bool)> = Rc::new({
+            let user_css_provider = user_css_provider.clone();
+            let gtk_css_path = gtk_css_path.clone();
+            let settings_ini_path = settings_ini_path.clone();
+            let reloading = Rc::clone(&reloading);
+            move |sync_settings: bool| {
+                reloading.set(true);
+                if sync_settings {
+                    if let Ok(content) = std::fs::read_to_string(&settings_ini_path) {
+                        let parsed = parse_gtk_settings_ini(&content);
+                        if let Some(settings) = gtk4::Settings::default() {
+                            if let Some(dark) = parsed.prefer_dark {
+                                if settings.is_gtk_application_prefer_dark_theme() != dark {
+                                    settings.set_gtk_application_prefer_dark_theme(dark);
+                                }
+                            }
+                            if let Some(theme) = parsed.theme_name {
+                                if settings.gtk_theme_name().as_deref() != Some(theme.as_str()) {
+                                    settings.set_gtk_theme_name(Some(&theme));
+                                }
+                            }
+                            if let Some(icon_theme) = parsed.icon_theme_name {
+                                if settings.gtk_icon_theme_name().as_deref()
+                                    != Some(icon_theme.as_str())
+                                {
+                                    settings.set_gtk_icon_theme_name(Some(&icon_theme));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if gtk_css_path.is_file() {
+                    user_css_provider.load_from_path(&gtk_css_path);
+                } else {
+                    user_css_provider.load_from_string("");
+                }
+                reloading.set(false);
+            }
+        });
+
+        // Debounce bursts (e.g. `kde-gtk-config` writing `colors.css` + `settings.ini`
+        // right after `xdg-desktop-portal-kde` emits `SettingChanged`).
+        let pending_reload: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
+        let pending_sync_settings: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let schedule_reload: Rc<dyn Fn(bool)> = Rc::new({
+            let pending_reload = Rc::clone(&pending_reload);
+            let pending_sync_settings = Rc::clone(&pending_sync_settings);
+            let reload_now = Rc::clone(&reload_now);
+            move |sync_settings: bool| {
+                if sync_settings {
+                    pending_sync_settings.set(true);
+                }
+                if let Some(id) = pending_reload.take() {
+                    id.remove();
+                }
+                let pending_inner = Rc::clone(&pending_reload);
+                let sync_inner = Rc::clone(&pending_sync_settings);
+                let reload_inner = Rc::clone(&reload_now);
+                let id = glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                    pending_inner.set(None);
+                    let do_sync = sync_inner.replace(false);
+                    reload_inner(do_sync);
+                });
+                pending_reload.set(Some(id));
+            }
+        });
+
+        let dir_file = gio::File::for_path(&gtk4_dir);
+        let monitor = match dir_file
+            .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+        {
+            Ok(mon) => {
+                let schedule = Rc::clone(&schedule_reload);
+                mon.connect_changed(move |_mon, file, other_file, _event| {
+                    let paths = [file.path(), other_file.and_then(|f| f.path())];
+                    let mut relevant = false;
+                    let mut touched_settings = false;
+                    for path in paths.into_iter().flatten() {
+                        if is_gtk4_theme_file(&path) {
+                            relevant = true;
+                            if path.file_name().and_then(|n| n.to_str()) == Some("settings.ini") {
+                                touched_settings = true;
+                            }
+                        }
+                    }
+                    if relevant {
+                        schedule(touched_settings);
+                    }
+                });
+                Some(mon)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    dir = %gtk4_dir.display(),
+                    error = %err,
+                    "unable to watch gtk-4.0 config directory for live theme reload"
+                );
+                None
+            }
+        };
+
+        // Also re-sync CSS (without overwriting `prefer_dark` from a potentially stale
+        // `settings.ini`) shortly after GTK4's own portal listener flips dark-mode so
+        // light<->dark transitions never settle on a stale `colors.css`.
+        let dark_notify = gtk4::Settings::default().map(|settings| {
+            let schedule = Rc::clone(&schedule_reload);
+            let reloading = Rc::clone(&reloading);
+            let id = settings.connect_gtk_application_prefer_dark_theme_notify(move |_| {
+                if !reloading.get() {
+                    schedule(false);
+                }
+            });
+            (settings, Cell::new(Some(id)))
+        });
+
+        window.connect_destroy(move |_| {
+            if let Some(id) = pending_reload.take() {
+                id.remove();
+            }
+            if let Some(ref mon) = monitor {
+                mon.cancel();
+            }
+            if let Some((ref settings, ref id_cell)) = dark_notify {
+                if let Some(id) = id_cell.take() {
+                    settings.disconnect(id);
+                }
+            }
+            gtk4::style_context_remove_provider_for_display(&display, &user_css_provider);
+        });
+    }
+
     fn build_ui(app: &gtk4::Application) {
         install_css();
 
@@ -373,6 +597,7 @@ mod gtk4_ui {
             .default_width(960)
             .default_height(640)
             .build();
+        install_live_theme_reload(&window);
 
         let initial_hosts = load_hosts();
         let initial_target = initial_hosts.first().map(|h| h.ssh_target.clone());
@@ -2050,5 +2275,55 @@ mod gtk4_ui {
         loader.write(data).ok()?;
         loader.close().ok()?;
         loader.pixbuf()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_gtk_settings_ini_reads_settings_section() {
+            let sample = "\
+                # KDE generated
+                [Other]
+                gtk-application-prefer-dark-theme=true
+
+                [Settings]
+                gtk-application-prefer-dark-theme=false
+                gtk-icon-theme-name=breeze
+                gtk-theme-name=Breeze
+                gtk-font-name=Noto Sans, 10
+            ";
+            assert_eq!(
+                parse_gtk_settings_ini(sample),
+                GtkSettingsIni {
+                    prefer_dark: Some(false),
+                    theme_name: Some("Breeze".into()),
+                    icon_theme_name: Some("breeze".into()),
+                }
+            );
+        }
+
+        #[test]
+        fn parse_gtk_settings_ini_handles_numeric_bools_and_missing_keys() {
+            let sample = "[Settings]\ngtk-application-prefer-dark-theme=1\n";
+            assert_eq!(
+                parse_gtk_settings_ini(sample),
+                GtkSettingsIni {
+                    prefer_dark: Some(true),
+                    theme_name: None,
+                    icon_theme_name: None,
+                }
+            );
+        }
+
+        #[test]
+        fn is_gtk4_theme_file_matches_expected_names() {
+            assert!(is_gtk4_theme_file(Path::new("/home/u/.config/gtk-4.0/colors.css")));
+            assert!(is_gtk4_theme_file(Path::new("/home/u/.config/gtk-4.0/gtk.css")));
+            assert!(is_gtk4_theme_file(Path::new("/home/u/.config/gtk-4.0/settings.ini")));
+            assert!(!is_gtk4_theme_file(Path::new("/home/u/.config/gtk-4.0/bookmarks")));
+            assert!(!is_gtk4_theme_file(Path::new("/home/u/.config/gtk-4.0/colors.css.tmp")));
+        }
     }
 }

@@ -33,12 +33,18 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
+    Mode as KdeDecorationMode, OrgKdeKwinServerDecoration,
+};
+use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDefaultDecorationMode;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{backend::ObjectId, Client, Display, DisplayHandle, Resource};
+use smithay::reexports::wayland_server::{
+    backend::ObjectId, Client, Display, DisplayHandle, Resource, WEnum,
+};
 use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -57,6 +63,7 @@ use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState,
 };
 use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
+use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgPopupSurfaceData,
@@ -71,9 +78,9 @@ use smithay::xwayland::xwm::{
 };
 use smithay::xwayland::{X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler};
 use smithay::{
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_output,
-    delegate_primary_selection, delegate_seat, delegate_shm, delegate_xdg_decoration,
-    delegate_xdg_shell, delegate_xwayland_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_kde_decoration,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
+    delegate_xdg_decoration, delegate_xdg_shell, delegate_xwayland_shell,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -266,6 +273,7 @@ struct TrackedWindow {
     last_width: u32,
     last_height: u32,
     geo_offset: (i32, i32),
+    server_side_decoration: bool,
     announced: bool,
     has_window_entry: bool,
     latest_bgra: Option<(u32, u32, Vec<u8>)>,
@@ -410,6 +418,7 @@ struct AppState {
     shm_state: ShmState,
     xdg_shell_state: XdgShellState,
     xdg_decoration_state: XdgDecorationState,
+    kde_decoration_state: KdeDecorationState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
     primary_selection_state: PrimarySelectionState,
@@ -441,6 +450,8 @@ struct AppState {
     surface_to_window: HashMap<ObjectId, WindowId>,
     /// Cached RGBA buffer per `WlSurface::id()` for surface-tree compositing.
     surface_buffers: HashMap<ObjectId, (u32, u32, Vec<u8>)>,
+    /// KDE server-decoration modes set on a `WlSurface` before `xdg_surface.get_toplevel`.
+    pending_kde_decorations: HashMap<ObjectId, bool>,
     windows: HashMap<WindowId, TrackedWindow>,
     popup_windows: HashMap<WindowId, TrackedPopup>,
     x11_windows: HashMap<WindowId, TrackedX11Window>,
@@ -1025,6 +1036,10 @@ impl AppState {
                             width: tracked.last_width,
                             height: tracked.last_height,
                         });
+                        let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
+                            window_id: tracked.window_id,
+                            server_side: tracked.server_side_decoration,
+                        });
                         if let Some((w, h, bgra)) = &tracked.latest_bgra {
                             let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
                                 window_id: tracked.window_id,
@@ -1217,6 +1232,10 @@ impl AppState {
                 app_id: app_id.clone(),
                 width: win_w,
                 height: win_h,
+            });
+            let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
+                window_id,
+                server_side: tracked.server_side_decoration,
             });
             let mut linked = false;
             for app in self.launched_apps.values_mut() {
@@ -1495,6 +1514,10 @@ impl XdgShellHandler for AppState {
         let wl_surface = surface.wl_surface().clone();
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window.clone(), (0, 0), false);
+        let initial_ssd = self
+            .pending_kde_decorations
+            .remove(&surf_id)
+            .unwrap_or(false);
         self.surface_to_window.insert(surf_id.clone(), window_id);
         self.windows.insert(
             window_id,
@@ -1506,6 +1529,7 @@ impl XdgShellHandler for AppState {
                 last_width: 0,
                 last_height: 0,
                 geo_offset: (0, 0),
+                server_side_decoration: initial_ssd,
                 announced: false,
                 has_window_entry: false,
                 latest_bgra: None,
@@ -1523,6 +1547,7 @@ impl XdgShellHandler for AppState {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let surf_id = surface.wl_surface().id();
         self.surface_buffers.remove(&surf_id);
+        self.pending_kde_decorations.remove(&surf_id);
         if let Some(window_id) = self.surface_to_window.remove(&surf_id) {
             if let Some(tracked) = self.windows.remove(&window_id) {
                 self.space.unmap_elem(&tracked.window);
@@ -2003,7 +2028,7 @@ impl AppState {
             return;
         };
         let mut title = xwin.surface.title();
-        let app_id = xwin.surface.class();
+        let app_id = x11_app_id(&xwin.surface.class(), &xwin.surface.instance());
         if title.is_empty() {
             title = if !app_id.is_empty() {
                 app_id.clone()
@@ -2259,6 +2284,16 @@ impl XWaylandShellHandler for AppState {
     }
 }
 
+fn x11_app_id(class: &str, instance: &str) -> String {
+    if !class.is_empty() && !instance.is_empty() && class.eq_ignore_ascii_case(instance) {
+        instance.to_string()
+    } else if !class.is_empty() {
+        class.to_string()
+    } else {
+        instance.to_string()
+    }
+}
+
 fn x11_resize_edge_to_xdg(edge: X11ResizeEdge) -> u32 {
     match edge {
         X11ResizeEdge::Top => xdg_toplevel::ResizeEdge::Top as u32,
@@ -2369,7 +2404,19 @@ impl XwmHandler for AppState {
         }
 
         let window_id = self.alloc_window_id();
-        let ssd = window.is_decorated();
+        // Smithay's `X11Surface::is_decorated()` returns `true` when the X11 client
+        // draws its own decorations (`_MOTIF_WM_HINTS` decorations == 0), so SSD is the inverse.
+        let is_csd = window.is_decorated();
+        let ssd = !is_csd;
+        debug!(
+            window_id,
+            x11_win,
+            class = %window.class(),
+            instance = %window.instance(),
+            is_csd,
+            ssd,
+            "X11 map_window_request decoration mode"
+        );
         let wl_opt = window.wl_surface();
         if let Some(ref wl) = wl_opt {
             self.surface_to_window.insert(wl.id(), window_id);
@@ -2553,7 +2600,17 @@ impl XwmHandler for AppState {
             return;
         };
         if property == WmWindowProperty::MotifHints {
-            let ssd = window.is_decorated();
+            let is_csd = window.is_decorated();
+            let ssd = !is_csd;
+            debug!(
+                window_id = wid,
+                class = %window.class(),
+                instance = %window.instance(),
+                is_csd,
+                ssd,
+                prev_ssd = xwin.server_side_decoration,
+                "X11 MotifHints updated"
+            );
             if ssd != xwin.server_side_decoration {
                 xwin.server_side_decoration = ssd;
                 if xwin.announced {
@@ -2566,7 +2623,7 @@ impl XwmHandler for AppState {
             return;
         }
         let mut title = window.title();
-        let app_id = window.class();
+        let app_id = x11_app_id(&window.class(), &window.instance());
         if title.is_empty() {
             title = if !app_id.is_empty() {
                 app_id.clone()
@@ -2781,8 +2838,37 @@ impl ServerDndGrabHandler for AppState {
 impl OutputHandler for AppState {}
 impl TabletSeatHandler for AppState {}
 
+impl AppState {
+    fn update_window_decoration_mode(
+        &mut self,
+        surface: &WlSurface,
+        server_side: bool,
+        record_pending: bool,
+    ) {
+        let surf_id = surface.id();
+        if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
+            if let Some(tracked) = self.windows.get_mut(&window_id) {
+                if tracked.server_side_decoration != server_side {
+                    tracked.server_side_decoration = server_side;
+                    if tracked.announced {
+                        let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
+                            window_id,
+                            server_side,
+                        });
+                    }
+                }
+            }
+        } else if record_pending {
+            self.pending_kde_decorations.insert(surf_id, server_side);
+        }
+    }
+}
+
 impl XdgDecorationHandler for AppState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        // Default to CSD until the client explicitly requests SSD via `request_mode`.
+        // Qt/KDE apps (konsole, dolphin, kcalc, kwrite) explicitly call `set_mode(ServerSide)`,
+        // whereas GTK3 apps (e.g., lxterminal) draw their own CSD header/titlebar if not told CSD.
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(DecorationMode::ClientSide);
         });
@@ -2790,18 +2876,13 @@ impl XdgDecorationHandler for AppState {
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        let server_side = mode == DecorationMode::ServerSide;
+        debug!(?mode, server_side, "xdg-decoration request_mode");
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
         });
         toplevel.send_pending_configure();
-
-        let surf_id = toplevel.wl_surface().id();
-        if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
-            let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
-                window_id,
-                server_side: mode == DecorationMode::ServerSide,
-            });
-        }
+        self.update_window_decoration_mode(toplevel.wl_surface(), server_side, false);
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
@@ -2809,6 +2890,40 @@ impl XdgDecorationHandler for AppState {
             state.decoration_mode = Some(DecorationMode::ClientSide);
         });
         toplevel.send_pending_configure();
+        self.update_window_decoration_mode(toplevel.wl_surface(), false, false);
+    }
+}
+
+impl KdeDecorationHandler for AppState {
+    fn kde_decoration_state(&self) -> &KdeDecorationState {
+        &self.kde_decoration_state
+    }
+
+    fn new_decoration(&mut self, surface: &WlSurface, decoration: &OrgKdeKwinServerDecoration) {
+        // Advertise Mode::Server by default (matching KWin) so GTK3 apps loaded with
+        // `window-decorations-gtk-module` (e.g. lxterminal) drop their Adwaita CSD headerbar.
+        debug!(surf_id = ?surface.id(), "kde-decoration new_decoration -> Mode::Server");
+        decoration.mode(KdeDecorationMode::Server);
+        self.update_window_decoration_mode(surface, true, true);
+    }
+
+    fn request_mode(
+        &mut self,
+        surface: &WlSurface,
+        decoration: &OrgKdeKwinServerDecoration,
+        mode: WEnum<KdeDecorationMode>,
+    ) {
+        let WEnum::Value(mode) = mode else {
+            return;
+        };
+        debug!(surf_id = ?surface.id(), ?mode, "kde-decoration request_mode");
+        decoration.mode(mode);
+        self.update_window_decoration_mode(surface, mode == KdeDecorationMode::Server, true);
+    }
+
+    fn release(&mut self, _decoration: &OrgKdeKwinServerDecoration, surface: &WlSurface) {
+        self.pending_kde_decorations.remove(&surface.id());
+        self.update_window_decoration_mode(surface, false, false);
     }
 }
 
@@ -2816,6 +2931,7 @@ delegate_compositor!(AppState);
 delegate_shm!(AppState);
 delegate_xdg_shell!(AppState);
 delegate_xdg_decoration!(AppState);
+delegate_kde_decoration!(AppState);
 delegate_seat!(AppState);
 delegate_data_device!(AppState);
 delegate_primary_selection!(AppState);
@@ -2954,6 +3070,8 @@ fn run_compositor_loop(
     let shm_state = ShmState::new::<AppState>(&dh, vec![]);
     let xdg_shell_state = XdgShellState::new::<AppState>(&dh);
     let xdg_decoration_state = XdgDecorationState::new::<AppState>(&dh);
+    let kde_decoration_state =
+        KdeDecorationState::new::<AppState>(&dh, KdeDefaultDecorationMode::Server);
     let mut seat_state = SeatState::new();
     let data_device_state = DataDeviceState::new::<AppState>(&dh);
     let primary_selection_state = PrimarySelectionState::new::<AppState>(&dh);
@@ -3075,6 +3193,7 @@ fn run_compositor_loop(
         shm_state,
         xdg_shell_state,
         xdg_decoration_state,
+        kde_decoration_state,
         seat_state,
         data_device_state,
         primary_selection_state,
@@ -3104,6 +3223,7 @@ fn run_compositor_loop(
         start_time: Instant::now(),
         surface_to_window: HashMap::new(),
         surface_buffers: HashMap::new(),
+        pending_kde_decorations: HashMap::new(),
         windows: HashMap::new(),
         popup_windows: HashMap::new(),
         x11_windows: HashMap::new(),
@@ -3381,5 +3501,12 @@ mod tests {
             read_selection_fd_bounded(read_fd).as_deref(),
             Some("hello xwayland")
         );
+    }
+
+    #[test]
+    fn x11_app_id_prefers_instance_when_case_variant_of_class() {
+        assert_eq!(x11_app_id("XTerm", "xterm"), "xterm");
+        assert_eq!(x11_app_id("firefox", "Navigator"), "firefox");
+        assert_eq!(x11_app_id("", "xterm"), "xterm");
     }
 }

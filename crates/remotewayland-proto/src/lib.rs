@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -288,6 +288,11 @@ pub enum ControlMessage {
     TerminateApp {
         launch_id: u64,
         force: bool,
+    },
+    /// Client -> Server: XDG `org.freedesktop.appearance` `color-scheme` preference
+    /// (`0` = no preference, `1` = prefer dark, `2` = prefer light).
+    ColorScheme {
+        scheme: u32,
     },
 }
 
@@ -585,13 +590,16 @@ mod tests {
             hotspot_y: 1,
             bgra: [0u8, 0, 0, 255].repeat(4),
         };
+        let scheme = ControlMessage::ColorScheme { scheme: 1 };
 
         write_control_message(&mut tx, &primary).await.unwrap();
         write_control_message(&mut tx, &cursor).await.unwrap();
+        write_control_message(&mut tx, &scheme).await.unwrap();
         drop(tx);
 
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), primary);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), cursor);
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), scheme);
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
     }
 }
