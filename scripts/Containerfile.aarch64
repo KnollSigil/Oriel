@@ -1,0 +1,21 @@
+FROM --platform=linux/arm64 docker.io/library/ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    build-essential \
+    pkg-config \
+    cmake \
+    clang \
+    libclang-dev \
+    libwayland-dev \
+    libxkbcommon-dev \
+    libpipewire-0.3-dev \
+    libopus-dev \
+    libgtk-4-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"

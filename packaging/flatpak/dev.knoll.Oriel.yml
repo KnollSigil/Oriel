@@ -1,0 +1,86 @@
+app-id: dev.knoll.Oriel
+runtime: org.kde.Platform
+runtime-version: '6.11'
+sdk: org.kde.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm21
+command: remotewayland-client
+
+finish-args:
+  # Display / GPU
+  - --socket=wayland
+  - --device=dri
+  - --share=ipc
+  # QUIC to the remote server + ssh
+  - --share=network
+  # Audio: PipeWire (native) with PulseAudio fallback
+  - --socket=pulseaudio
+  - --filesystem=xdg-run/pipewire-0
+  # SSH access for `remotewayland-client connect`
+  - --socket=ssh-auth
+  - --filesystem=~/.ssh:ro
+  # Color scheme / settings portal
+  - --talk-name=org.freedesktop.portal.Desktop
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin
+  env:
+    CARGO_HOME: /run/build/remotewayland/cargo
+    CARGO_NET_OFFLINE: 'true'
+    # qtbridge / qt-build-utils locate Qt through qmake
+    QMAKE: /usr/bin/qmake
+    LIBCLANG_PATH: /usr/lib/sdk/llvm21/lib
+  arch:
+    aarch64:
+      env:
+        CARGO_BUILD_JOBS: '4'
+        # The repo's .cargo/config.toml points at a cross linker; we build natively.
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: gcc
+
+modules:
+  - name: remotewayland
+    buildsystem: simple
+    build-options:
+      env:
+        RUSTFLAGS: ''
+    build-commands:
+      - |
+        set -e
+        # qt-build-utils probes <QT_HOST_LIBEXECS>/qtpaths first, which does not
+        # exist in the KDE SDK (qtpaths lives in /usr/bin). Under qemu-user a
+        # missing file "executes" with status 127 instead of failing, which makes
+        # the probe wrongly succeed on aarch64. Point libexec queries at a dir
+        # that really contains qtpaths via a small qmake wrapper.
+        mkdir -p /tmp/qt-shim
+        ln -sf "$(/usr/bin/qmake -query QT_HOST_LIBEXECS)"/* /tmp/qt-shim/
+        ln -sf /usr/bin/qtpaths /tmp/qt-shim/qtpaths
+        cat > /tmp/qt-shim/qmake <<'WRAP'
+        #!/bin/sh
+        case "$2" in
+          QT_HOST_LIBEXECS|QT_HOST_LIBEXECS/get) echo /tmp/qt-shim ;;
+          *) exec /usr/bin/qmake "$@" ;;
+        esac
+        WRAP
+        chmod +x /tmp/qt-shim/qmake
+        export QMAKE=/tmp/qt-shim/qmake
+        cargo --offline build --release -p remotewayland-client \
+          --no-default-features --features qt
+      - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/remotewayland-client"
+        /app/bin/remotewayland-client
+      - install -Dm644 packaging/flatpak/dev.knoll.Oriel.desktop
+        /app/share/applications/dev.knoll.Oriel.desktop
+      - install -Dm644 packaging/flatpak/dev.knoll.Oriel.metainfo.xml
+        /app/share/metainfo/dev.knoll.Oriel.metainfo.xml
+      - install -Dm644 packaging/flatpak/dev.knoll.Oriel.svg
+        /app/share/icons/hicolor/scalable/apps/dev.knoll.Oriel.svg
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git
+          - .flatpak-builder
+          - build-dir
+          - repo
+      - cargo-sources.json

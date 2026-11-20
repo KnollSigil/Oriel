@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.knoll.Oriel</id>
+  <name>Oriel</name>
+  <summary>Run remote Linux GUI applications as local windows</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>
+      Oriel is the RemoteWayland client: a rootless, low-latency streamer for
+      remote Linux GUI applications with video and bidirectional PipeWire audio
+      over QUIC. Remote windows appear as native local windows.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.knoll.Oriel.desktop</launchable>
+  <provides>
+    <binary>remotewayland-client</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-11-19" />
+  </releases>
+</component>

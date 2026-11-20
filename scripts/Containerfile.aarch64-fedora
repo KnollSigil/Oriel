@@ -1,0 +1,23 @@
+FROM --platform=linux/arm64 registry.fedoraproject.org/fedora:44
+
+RUN dnf install -y \
+    gcc \
+    gcc-c++ \
+    cmake \
+    pkgconf-pkg-config \
+    clang-devel \
+    wayland-devel \
+    libxkbcommon-devel \
+    pipewire-devel \
+    opus-devel \
+    gtk4-devel \
+    qt6-qtbase-devel \
+    qt6-qtbase-private-devel \
+    qt6-qtdeclarative-devel \
+    qt6-qtdeclarative-private-devel \
+    && dnf clean all
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:/usr/lib64/qt6/bin:${PATH}"
+RUN ln -sf /usr/bin/gcc /usr/bin/aarch64-linux-gnu-gcc && \
+    ln -sf /usr/lib64/qt6/bin/qtpaths /usr/lib64/qt6/libexec/qtpaths

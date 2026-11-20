@@ -1,5 +1,7 @@
 /target
-Cargo.lock
 **/*.rs.bk
 *.pem
 *.key
+/build/
+/packaging/flatpak/.generated-*.yml
+/packaging/flatpak/cargo-sources.json

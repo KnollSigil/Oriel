@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Oriel
+GenericName=Remote Application Streamer
+Comment=Run remote Linux GUI applications as local windows over QUIC
+Exec=remotewayland-client
+Icon=dev.knoll.Oriel
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;wayland;streaming;ssh;
+StartupNotify=true

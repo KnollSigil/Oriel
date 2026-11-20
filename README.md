@@ -32,9 +32,17 @@ cargo test -p remotewayland-proto
 
 ### Cross-compiling for `aarch64-unknown-linux-gnu`
 
-Using [`cross`](https://github.com/cross-rs/cross) or a sysroot with `aarch64` GStreamer/PipeWire/Wayland dev libraries:
+Using `podman` (or `docker`) with `qemu-aarch64-static` via [`scripts/build-aarch64.sh`](scripts/build-aarch64.sh):
 
 ```bash
-rustup target add aarch64-unknown-linux-gnu
-cargo build --target aarch64-unknown-linux-gnu -p remotewayland-client
+# Build workspace with GTK4 launcher (Ubuntu 24.04 arm64, default)
+./scripts/build-aarch64.sh
+
+# Build client with Qt Quick/QML launcher (Fedora 44 arm64 for Qt 6.10+)
+./scripts/build-aarch64.sh --qt --client-only
+
+# Build without GUI launcher (Ubuntu 24.04 arm64)
+./scripts/build-aarch64.sh --no-gui --client-only
 ```
+
+Outputs are written to `target/aarch64-unknown-linux-gnu/release/` (Ubuntu 24.04) or `target/aarch64-fedora/aarch64-unknown-linux-gnu/release/` (Fedora 44).
