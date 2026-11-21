@@ -574,7 +574,16 @@ fn sync_dbus_activation_env() {
         return;
     }
     let mut cmd = Command::new("dbus-update-activation-environment");
-    let mut vars = vec!["XDG_RUNTIME_DIR", "XDG_CONFIG_DIRS", "GTK_USE_PORTAL"];
+    let mut vars = vec![
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_DIRS",
+        "GTK_USE_PORTAL",
+        "PULSE_SINK",
+        "PULSE_SOURCE",
+    ];
+    if crate::audio::isolated_pw_runtime_dir().is_some() {
+        vars.extend_from_slice(&["PIPEWIRE_RUNTIME_DIR", "PULSE_RUNTIME_PATH", "PULSE_SERVER"]);
+    }
     if info.wayland_socket.is_some() {
         vars.push("WAYLAND_DISPLAY");
     }

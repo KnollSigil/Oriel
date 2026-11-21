@@ -43,6 +43,7 @@ fn shared_mic_ringbuf() -> &'static Arc<Mutex<VecDeque<u8>>> {
 
 struct IsolatedPwEnv {
     runtime_dir: PathBuf,
+    devices_quit_tx: Mutex<Option<pw::channel::Sender<()>>>,
     daemons: Mutex<Vec<Child>>,
 }
 
@@ -61,6 +62,9 @@ const WIREPLUMBER_VIRTUAL_CONF: &str = r#"wireplumber.profiles = {
     hardware.bluetooth = disabled
     hardware.video-capture = disabled
     support.dbus = disabled
+    support.system-dbus = disabled
+    script.client.access-flatpak = disabled
+    script.client.access-snap = disabled
   }
 }
 "#;
@@ -86,6 +90,11 @@ pub fn ensure_virtual_audio_devices() -> Result<()> {
 /// Terminate the isolated PipeWire/WirePlumber/pipewire-pulse child daemons on shutdown.
 pub fn shutdown_isolated_pipewire() {
     if let Some(Ok(env)) = ISOLATED_PW.get() {
+        if let Ok(mut quit_guard) = env.devices_quit_tx.lock() {
+            if let Some(quit_tx) = quit_guard.take() {
+                let _ = quit_tx.send(());
+            }
+        }
         if let Ok(mut guard) = env.daemons.lock() {
             for child in guard.iter_mut() {
                 let _ = child.kill();
@@ -100,20 +109,23 @@ fn spawn_audio_daemon(
     bin: &str,
     runtime_dir: &Path,
     pulse_dir: &Path,
-    wp_config_dir: Option<&Path>,
+    wp_dirs: Option<(&Path, &Path)>,
 ) -> std::result::Result<Child, String> {
     let mut cmd = Command::new(bin);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir)
         .env("PIPEWIRE_RUNTIME_DIR", runtime_dir)
         .env("PULSE_RUNTIME_PATH", pulse_dir)
+        .env_remove("WIREPLUMBER_CONFIG_DIR")
+        .env_remove("WIREPLUMBER_DATA_DIR")
         .env_remove("DBUS_SESSION_BUS_ADDRESS")
         .env_remove("DISPLAY")
         .env_remove("XAUTHORITY")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(wp_dir) = wp_config_dir {
-        cmd.env("WIREPLUMBER_CONFIG_DIR", wp_dir);
+    if let Some((wp_config_home, wp_state_home)) = wp_dirs {
+        cmd.env("XDG_CONFIG_HOME", wp_config_home)
+            .env("XDG_STATE_HOME", wp_state_home);
     }
     unsafe {
         cmd.pre_exec(|| {
@@ -130,13 +142,16 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
         .map(PathBuf::from)
         .ok_or_else(|| "XDG_RUNTIME_DIR is not set for isolated PipeWire session".to_string())?;
     let pulse_dir = runtime_dir.join("pulse");
-    let wp_config_dir = runtime_dir.join("wireplumber");
-    let wp_conf_d = wp_config_dir.join("wireplumber.conf.d");
+    let wp_config_home = runtime_dir.join("wp-config");
+    let wp_conf_d = wp_config_home.join("wireplumber").join("wireplumber.conf.d");
+    let wp_state_home = runtime_dir.join("wp-state");
 
     crate::session::create_private_dir(&pulse_dir)
         .map_err(|e| format!("failed to create {}: {e}", pulse_dir.display()))?;
     crate::session::create_private_dir(&wp_conf_d)
         .map_err(|e| format!("failed to create {}: {e}", wp_conf_d.display()))?;
+    crate::session::create_private_dir(&wp_state_home)
+        .map_err(|e| format!("failed to create {}: {e}", wp_state_home.display()))?;
 
     let wp_conf_path = wp_conf_d.join("99-remotewayland-virtual.conf");
     std::fs::write(&wp_conf_path, WIREPLUMBER_VIRTUAL_CONF)
@@ -169,10 +184,55 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
     }
     daemons.push(pw_child);
 
-    // 2. Start virtual-only WirePlumber and pipewire-pulse.
-    match spawn_audio_daemon("wireplumber", &runtime_dir, &pulse_dir, Some(&wp_config_dir)) {
+    // 2. Register persistent virtual Audio/Sink (`remotewayland_sink`) and
+    //    Audio/Source (`remotewayland_mic`) before starting WirePlumber so
+    //    they are immediately selected as default devices (and never replaced
+    //    by WirePlumber's fallback `auto_null` sink or torn down across client
+    //    reconnects).
+    let (dev_quit_tx, dev_quit_rx) = pw::channel::channel();
+    let (dev_ready_tx, dev_ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+    if let Err(err) = std::thread::Builder::new()
+        .name("pw-server-devices".to_string())
+        .spawn(move || {
+            if let Err(err) = run_virtual_devices_loop(dev_quit_rx, &dev_ready_tx) {
+                tracing::warn!(error = %err, "server PipeWire virtual devices loop exited");
+            }
+        })
+    {
+        for child in &mut daemons {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(format!("failed to spawn pw-server-devices thread: {err}"));
+    }
+    match dev_ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            for child in &mut daemons {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+        Err(err) => {
+            for child in &mut daemons {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(format!("pw-server-devices thread exited before initializing: {err}"));
+        }
+    }
+
+    // 3. Start virtual-only WirePlumber and pipewire-pulse.
+    match spawn_audio_daemon(
+        "wireplumber",
+        &runtime_dir,
+        &pulse_dir,
+        Some((&wp_config_home, &wp_state_home)),
+    ) {
         Ok(child) => daemons.push(child),
         Err(err) => {
+            let _ = dev_quit_tx.send(());
             for child in &mut daemons {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -183,6 +243,7 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
     match spawn_audio_daemon("pipewire-pulse", &runtime_dir, &pulse_dir, None) {
         Ok(child) => daemons.push(child),
         Err(err) => {
+            let _ = dev_quit_tx.send(());
             for child in &mut daemons {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -191,11 +252,22 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
         }
     }
 
-    // Best-effort wait for PulseAudio compat socket so apps launched immediately see it.
+    // Best-effort wait for PulseAudio compat socket so apps launched immediately see it,
+    // and verify none of the audio daemons (especially wireplumber) exited prematurely.
     let pulse_socket = pulse_dir.join("native");
     let pulse_deadline = Instant::now() + Duration::from_secs(2);
     while !pulse_socket.exists() && Instant::now() < pulse_deadline {
         std::thread::sleep(Duration::from_millis(25));
+    }
+    for child in &mut daemons {
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = dev_quit_tx.send(());
+            for c in &mut daemons {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            return Err(format!("isolated audio daemon exited prematurely with {status}"));
+        }
     }
 
     tracing::info!(
@@ -205,8 +277,159 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
 
     Ok(IsolatedPwEnv {
         runtime_dir,
+        devices_quit_tx: Mutex::new(Some(dev_quit_tx)),
         daemons: Mutex::new(daemons),
     })
+}
+
+fn run_virtual_devices_loop(
+    quit_rx: pw::channel::Receiver<()>,
+    ready_tx: &std::sync::mpsc::Sender<std::result::Result<(), String>>,
+) -> Result<()> {
+    pw::init();
+
+    let mainloop = match pw::main_loop::MainLoopRc::new(None) {
+        Ok(m) => m,
+        Err(e) => {
+            let msg = format!("PipeWire MainLoopRc::new (devices) failed: {e}");
+            let _ = ready_tx.send(Err(msg.clone()));
+            anyhow::bail!("{msg}");
+        }
+    };
+
+    let ml_quit_chan = mainloop.clone();
+    let _quit_receiver = quit_rx.attach(mainloop.loop_(), move |_| {
+        ml_quit_chan.quit();
+    });
+
+    let context = match pw::context::ContextRc::new(&mainloop, None) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("PipeWire ContextRc::new (devices) failed: {e}");
+            let _ = ready_tx.send(Err(msg.clone()));
+            anyhow::bail!("{msg}");
+        }
+    };
+    let core = match context.connect_rc(None) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("PipeWire context.connect_rc (devices) failed: {e}");
+            let _ = ready_tx.send(Err(msg.clone()));
+            anyhow::bail!("{msg}");
+        }
+    };
+
+    // Keep a silent default Audio/Sink alive for the entire server session so WirePlumber
+    // always has a sink clock driving all remote apps even while per-app capture streams
+    // or clients attach/detach.
+    let dummy_sink = pw::stream::StreamBox::new(
+        &core,
+        "remotewayland-sink",
+        properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Duplex",
+            *pw::keys::MEDIA_CLASS => "Audio/Sink",
+            *pw::keys::NODE_NAME => VIRTUAL_SINK_NAME,
+            *pw::keys::NODE_DESCRIPTION => "RemoteWayland Speaker",
+            *pw::keys::AUDIO_CHANNELS => "2",
+            "audio.position" => "FL,FR",
+            "priority.session" => "2000",
+            "priority.driver" => "2000",
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("PipeWire Stream::new (sink) failed: {e}"))?;
+
+    let _dummy_listener = dummy_sink
+        .add_local_listener()
+        .process(|stream, _: &mut ()| {
+            let _ = stream.dequeue_buffer();
+        })
+        .register()
+        .map_err(|e| anyhow::anyhow!("PipeWire stream register (sink) failed: {e}"))?;
+
+    let pod_bytes = build_pcm_format_pod(SINK_CHANNELS)?;
+    let mut params = [Pod::from_bytes(&pod_bytes)
+        .ok_or_else(|| anyhow::anyhow!("invalid SPA Pod bytes for sink"))?];
+
+    dummy_sink
+        .connect(
+            spa::utils::Direction::Input,
+            None,
+            pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+            &mut params,
+        )
+        .map_err(|e| anyhow::anyhow!("PipeWire stream.connect (sink) failed: {e}"))?;
+
+    // Keep the virtual Audio/Source (remotewayland_mic) alive for the entire session so
+    // apps like Audacity see a valid 48kHz source immediately at startup, even before the
+    // client activates host mic capture on demand.
+    let mic_source = pw::stream::StreamBox::new(
+        &core,
+        "remotewayland-mic",
+        properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Duplex",
+            *pw::keys::MEDIA_CLASS => "Audio/Source",
+            *pw::keys::NODE_NAME => VIRTUAL_MIC_NAME,
+            *pw::keys::NODE_DESCRIPTION => "RemoteWayland Microphone",
+            *pw::keys::AUDIO_CHANNELS => "2",
+            "audio.position" => "FL,FR",
+            "priority.session" => "2000",
+            "priority.driver" => "2000",
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("PipeWire Stream::new (mic) failed: {e}"))?;
+
+    let mic_rb = Arc::clone(shared_mic_ringbuf());
+    let _mic_listener = mic_source
+        .add_local_listener_with_user_data(mic_rb)
+        .process(|stream, rb| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let stride = std::mem::size_of::<i16>() * MIC_CHANNELS as usize;
+            let data = &mut datas[0];
+            let written_bytes = if let Some(slice) = data.data() {
+                let target_bytes = (FRAME_SAMPLES * stride).min(slice.len());
+                let mut guard = rb.lock().ok();
+                for byte in &mut slice[..target_bytes] {
+                    *byte = guard
+                        .as_mut()
+                        .and_then(|q| q.pop_front())
+                        .unwrap_or(0);
+                }
+                target_bytes
+            } else {
+                0
+            };
+            let chunk = data.chunk_mut();
+            *chunk.offset_mut() = 0;
+            *chunk.stride_mut() = stride as i32;
+            *chunk.size_mut() = written_bytes as u32;
+        })
+        .register()
+        .map_err(|e| anyhow::anyhow!("PipeWire stream register (mic) failed: {e}"))?;
+
+    let mic_pod_bytes = build_pcm_format_pod(MIC_CHANNELS)?;
+    let mut mic_params = [Pod::from_bytes(&mic_pod_bytes)
+        .ok_or_else(|| anyhow::anyhow!("invalid SPA Pod bytes for mic"))?];
+
+    mic_source
+        .connect(
+            spa::utils::Direction::Output,
+            None,
+            pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+            &mut mic_params,
+        )
+        .map_err(|e| anyhow::anyhow!("PipeWire stream.connect (mic) failed: {e}"))?;
+
+    let _ = ready_tx.send(Ok(()));
+    mainloop.run();
+    Ok(())
 }
 
 /// An Opus-encoded 48kHz stereo audio packet captured from the server's virtual speaker sink.
@@ -314,6 +537,7 @@ struct AppCaptureUserData {
 struct AppCaptureEntry {
     stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<AppCaptureUserData>,
+    cap_node_id: Option<u32>,
     out_ports: Vec<(u32, String)>,
     cap_in_ports: Vec<(u32, String)>,
     linked_in_ports: HashSet<u32>,
@@ -324,7 +548,9 @@ fn try_link_app(core: &pw::core::CoreRc, app_node_id: u32, entry: &mut AppCaptur
     if entry.out_ports.is_empty() || entry.cap_in_ports.is_empty() {
         return;
     }
-    let cap_node_id = entry.stream.node_id();
+    let cap_node_id = entry
+        .cap_node_id
+        .unwrap_or_else(|| entry.stream.node_id());
     if cap_node_id == u32::MAX {
         return;
     }
@@ -363,6 +589,7 @@ fn try_link_app(core: &pw::core::CoreRc, app_node_id: u32, entry: &mut AppCaptur
                 "link.output.port" => out_port_id.to_string(),
                 "link.input.node" => cap_node_id.to_string(),
                 "link.input.port" => cap_port_id.to_string(),
+                "link.passive" => "true",
                 "object.linger" => "false",
             },
         ) {
@@ -410,109 +637,6 @@ fn run_per_app_playback_loop(
         .connect_rc(None)
         .map_err(|e| anyhow::anyhow!("PipeWire context.connect_rc failed: {e}"))?;
 
-    // Keep a silent default Audio/Sink alive so WirePlumber always has a sink clock
-    // driving all remote apps even while per-app capture streams attach/detach.
-    let dummy_sink = pw::stream::StreamBox::new(
-        &core,
-        "remotewayland-sink",
-        properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Duplex",
-            *pw::keys::MEDIA_CLASS => "Audio/Sink",
-            *pw::keys::NODE_NAME => VIRTUAL_SINK_NAME,
-            *pw::keys::NODE_DESCRIPTION => "RemoteWayland Speaker",
-            *pw::keys::AUDIO_CHANNELS => "2",
-            "audio.position" => "FL,FR",
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("PipeWire Stream::new (sink) failed: {e}"))?;
-
-    let _dummy_listener = dummy_sink
-        .add_local_listener()
-        .process(|stream, _: &mut ()| {
-            let _ = stream.dequeue_buffer();
-        })
-        .register()
-        .map_err(|e| anyhow::anyhow!("PipeWire stream register (sink) failed: {e}"))?;
-
-    let pod_bytes = build_pcm_format_pod(SINK_CHANNELS)?;
-    let mut params = [Pod::from_bytes(&pod_bytes)
-        .ok_or_else(|| anyhow::anyhow!("invalid SPA Pod bytes for sink"))?];
-
-    dummy_sink
-        .connect(
-            spa::utils::Direction::Input,
-            None,
-            pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
-            &mut params,
-        )
-        .map_err(|e| anyhow::anyhow!("PipeWire stream.connect (sink) failed: {e}"))?;
-
-    // Keep the virtual Audio/Source (remotewayland_mic) alive for the entire session so
-    // apps like Audacity see a valid 48kHz source immediately at startup, even before the
-    // client activates host mic capture on demand.
-    let mic_source = pw::stream::StreamBox::new(
-        &core,
-        "remotewayland-mic",
-        properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Duplex",
-            *pw::keys::MEDIA_CLASS => "Audio/Source",
-            *pw::keys::NODE_NAME => VIRTUAL_MIC_NAME,
-            *pw::keys::NODE_DESCRIPTION => "RemoteWayland Microphone",
-            *pw::keys::AUDIO_CHANNELS => "2",
-            "audio.position" => "FL,FR",
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("PipeWire Stream::new (mic) failed: {e}"))?;
-
-    let mic_rb = Arc::clone(shared_mic_ringbuf());
-    let _mic_listener = mic_source
-        .add_local_listener_with_user_data(mic_rb)
-        .process(|stream, rb| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
-                return;
-            };
-            let datas = buffer.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-            let stride = std::mem::size_of::<i16>() * MIC_CHANNELS as usize;
-            let data = &mut datas[0];
-            let written_bytes = if let Some(slice) = data.data() {
-                let target_bytes = (FRAME_SAMPLES * stride).min(slice.len());
-                let mut guard = rb.lock().ok();
-                for byte in &mut slice[..target_bytes] {
-                    *byte = guard
-                        .as_mut()
-                        .and_then(|q| q.pop_front())
-                        .unwrap_or(0);
-                }
-                target_bytes
-            } else {
-                0
-            };
-            let chunk = data.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = stride as i32;
-            *chunk.size_mut() = written_bytes as u32;
-        })
-        .register()
-        .map_err(|e| anyhow::anyhow!("PipeWire stream register (mic) failed: {e}"))?;
-
-    let mic_pod_bytes = build_pcm_format_pod(MIC_CHANNELS)?;
-    let mut mic_params = [Pod::from_bytes(&mic_pod_bytes)
-        .ok_or_else(|| anyhow::anyhow!("invalid SPA Pod bytes for mic"))?];
-
-    mic_source
-        .connect(
-            spa::utils::Direction::Output,
-            None,
-            pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
-            &mut mic_params,
-        )
-        .map_err(|e| anyhow::anyhow!("PipeWire stream.connect (mic) failed: {e}"))?;
-
     let registry = core
         .get_registry_rc()
         .map_err(|e| anyhow::anyhow!("PipeWire get_registry_rc failed: {e}"))?;
@@ -539,7 +663,17 @@ fn run_per_app_playback_loop(
                 ObjectType::Node => {
                     let media_class = props.get("media.class").unwrap_or("");
                     let node_name = props.get("node.name").unwrap_or("");
-                    if node_name.starts_with("rw-cap-") || node_name.starts_with("remotewayland") {
+                    if let Some(app_id_str) = node_name.strip_prefix("rw-cap-") {
+                        if let Ok(app_node_id) = app_id_str.parse::<u32>() {
+                            let mut map = apps_global.borrow_mut();
+                            if let Some(entry) = map.get_mut(&app_node_id) {
+                                entry.cap_node_id = Some(obj.id);
+                                try_link_app(&core_global, app_node_id, entry);
+                            }
+                        }
+                        return;
+                    }
+                    if node_name == VIRTUAL_SINK_NAME || node_name == VIRTUAL_MIC_NAME {
                         return;
                     }
                     if media_class == "Stream/Input/Audio" {
@@ -712,6 +846,7 @@ fn run_per_app_playback_loop(
                         AppCaptureEntry {
                             stream: cap_stream,
                             _listener: listener,
+                            cap_node_id: None,
                             out_ports: Vec::new(),
                             cap_in_ports: Vec::new(),
                             linked_in_ports: HashSet::new(),
@@ -735,7 +870,9 @@ fn run_per_app_playback_loop(
                         }
                     } else if dir == Some("in") {
                         for (&app_node_id, entry) in map.iter_mut() {
-                            if entry.stream.node_id() == node_id {
+                            if entry.cap_node_id == Some(node_id)
+                                || entry.stream.node_id() == node_id
+                            {
                                 entry.cap_in_ports.push((obj.id, channel));
                                 try_link_app(&core_global, app_node_id, entry);
                                 break;
@@ -813,5 +950,223 @@ impl AudioMicInjector {
             buf.pop_front();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isolated_pipewire_captures_per_app_playback() {
+        let dir = std::env::temp_dir().join(format!(
+            "rw-audio-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::session::create_private_dir(&dir).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+
+        let mut bridge = start_per_app_playback_capture().expect("start_per_app_playback_capture");
+
+        // Spawn a test application playback stream inside the isolated PipeWire session
+        // that outputs a 440 Hz stereo sine wave.
+        let (app_quit_tx, app_quit_rx) = pw::channel::channel::<()>();
+        let app_thread = std::thread::spawn(move || {
+            pw::init();
+            let mainloop = pw::main_loop::MainLoopRc::new(None).unwrap();
+            let ml_q = mainloop.clone();
+            let _q = app_quit_rx.attach(mainloop.loop_(), move |_| {
+                ml_q.quit();
+            });
+            let context = pw::context::ContextRc::new(&mainloop, None).unwrap();
+            let core = context.connect_rc(None).unwrap();
+            let stream = pw::stream::StreamBox::new(
+                &core,
+                "test-tone-app",
+                properties! {
+                    *pw::keys::MEDIA_TYPE => "Audio",
+                    *pw::keys::MEDIA_CATEGORY => "Playback",
+                    *pw::keys::MEDIA_ROLE => "Music",
+                    *pw::keys::APP_NAME => "TestSynth",
+                    *pw::keys::MEDIA_NAME => "Sine440",
+                    *pw::keys::AUDIO_CHANNELS => "2",
+                    "audio.position" => "FL,FR",
+                },
+            )
+            .unwrap();
+            let mut phase: f32 = 0.0;
+            let _listener = stream
+                .add_local_listener()
+                .process(move |stream, _: &mut ()| {
+                    let Some(mut buffer) = stream.dequeue_buffer() else {
+                        return;
+                    };
+                    let datas = buffer.datas_mut();
+                    if datas.is_empty() {
+                        return;
+                    }
+                    let stride = 4usize; // 2ch * i16
+                    let data = &mut datas[0];
+                    let written = if let Some(slice) = data.data() {
+                        let frames = (FRAME_SAMPLES).min(slice.len() / stride);
+                        for f in 0..frames {
+                            let sample = ((phase * std::f32::consts::TAU).sin() * 12000.0) as i16;
+                            phase = (phase + 440.0 / SAMPLE_RATE as f32).fract();
+                            let le = sample.to_le_bytes();
+                            let off = f * stride;
+                            slice[off] = le[0];
+                            slice[off + 1] = le[1];
+                            slice[off + 2] = le[0];
+                            slice[off + 3] = le[1];
+                        }
+                        frames * stride
+                    } else {
+                        0
+                    };
+                    let chunk = data.chunk_mut();
+                    *chunk.offset_mut() = 0;
+                    *chunk.stride_mut() = stride as i32;
+                    *chunk.size_mut() = written as u32;
+                })
+                .register()
+                .unwrap();
+            let pod_bytes = build_pcm_format_pod(2).unwrap();
+            let mut params = [Pod::from_bytes(&pod_bytes).unwrap()];
+            stream
+                .connect(
+                    spa::utils::Direction::Output,
+                    None,
+                    pw::stream::StreamFlags::AUTOCONNECT
+                        | pw::stream::StreamFlags::MAP_BUFFERS
+                        | pw::stream::StreamFlags::RT_PROCESS,
+                    &mut params,
+                )
+                .unwrap();
+            mainloop.run();
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut ev = tokio::time::timeout(Duration::from_secs(3), bridge.streams.recv())
+                .await
+                .expect("timed out waiting for PlaybackStreamEvent")
+                .expect("streams channel closed");
+            assert_eq!(ev.app_name, "TestSynth");
+
+            let pkt = tokio::time::timeout(Duration::from_secs(3), ev.packets.recv())
+                .await
+                .expect("timed out waiting for EncodedAudioPacket from app stream")
+                .expect("packets channel closed");
+            assert!(!pkt.data.is_empty());
+        });
+
+        let _ = app_quit_tx.send(());
+        let _ = app_thread.join();
+
+        // Now test that an application started BEFORE `start_per_app_playback_capture()`
+        // (or still running across a client disconnect/reconnect) is also captured.
+        drop(bridge);
+
+        let (app2_quit_tx, app2_quit_rx) = pw::channel::channel::<()>();
+        let app2_thread = std::thread::spawn(move || {
+            pw::init();
+            let mainloop = pw::main_loop::MainLoopRc::new(None).unwrap();
+            let ml_q = mainloop.clone();
+            let _q = app2_quit_rx.attach(mainloop.loop_(), move |_| {
+                ml_q.quit();
+            });
+            let context = pw::context::ContextRc::new(&mainloop, None).unwrap();
+            let core = context.connect_rc(None).unwrap();
+            let stream = pw::stream::StreamBox::new(
+                &core,
+                "preexisting-tone-app",
+                properties! {
+                    *pw::keys::MEDIA_TYPE => "Audio",
+                    *pw::keys::MEDIA_CATEGORY => "Playback",
+                    *pw::keys::MEDIA_ROLE => "Music",
+                    *pw::keys::APP_NAME => "PreExistingSynth",
+                    *pw::keys::MEDIA_NAME => "Sine880",
+                    *pw::keys::AUDIO_CHANNELS => "2",
+                    "audio.position" => "FL,FR",
+                },
+            )
+            .unwrap();
+            let mut phase: f32 = 0.0;
+            let _listener = stream
+                .add_local_listener()
+                .process(move |stream, _: &mut ()| {
+                    let Some(mut buffer) = stream.dequeue_buffer() else {
+                        return;
+                    };
+                    let datas = buffer.datas_mut();
+                    if datas.is_empty() {
+                        return;
+                    }
+                    let stride = 4usize;
+                    let data = &mut datas[0];
+                    let written = if let Some(slice) = data.data() {
+                        let frames = (FRAME_SAMPLES).min(slice.len() / stride);
+                        for f in 0..frames {
+                            let sample = ((phase * std::f32::consts::TAU).sin() * 12000.0) as i16;
+                            phase = (phase + 880.0 / SAMPLE_RATE as f32).fract();
+                            let le = sample.to_le_bytes();
+                            let off = f * stride;
+                            slice[off] = le[0];
+                            slice[off + 1] = le[1];
+                            slice[off + 2] = le[0];
+                            slice[off + 3] = le[1];
+                        }
+                        frames * stride
+                    } else {
+                        0
+                    };
+                    let chunk = data.chunk_mut();
+                    *chunk.offset_mut() = 0;
+                    *chunk.stride_mut() = stride as i32;
+                    *chunk.size_mut() = written as u32;
+                })
+                .register()
+                .unwrap();
+            let pod_bytes = build_pcm_format_pod(2).unwrap();
+            let mut params = [Pod::from_bytes(&pod_bytes).unwrap()];
+            stream
+                .connect(
+                    spa::utils::Direction::Output,
+                    None,
+                    pw::stream::StreamFlags::AUTOCONNECT
+                        | pw::stream::StreamFlags::MAP_BUFFERS
+                        | pw::stream::StreamFlags::RT_PROCESS,
+                    &mut params,
+                )
+                .unwrap();
+            mainloop.run();
+        });
+
+        std::thread::sleep(Duration::from_millis(150));
+
+        let mut bridge2 = start_per_app_playback_capture().expect("reconnect start_per_app_playback_capture");
+        rt.block_on(async {
+            let mut ev = tokio::time::timeout(Duration::from_secs(3), bridge2.streams.recv())
+                .await
+                .expect("timed out waiting for PlaybackStreamEvent on reconnect")
+                .expect("streams channel closed");
+            assert_eq!(ev.app_name, "PreExistingSynth");
+
+            let pkt = tokio::time::timeout(Duration::from_secs(3), ev.packets.recv())
+                .await
+                .expect("timed out waiting for EncodedAudioPacket from pre-existing app")
+                .expect("packets channel closed");
+            assert!(!pkt.data.is_empty());
+        });
+
+        let _ = app2_quit_tx.send(());
+        let _ = app2_thread.join();
+        drop(bridge2);
+        shutdown_isolated_pipewire();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
