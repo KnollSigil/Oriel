@@ -44,6 +44,9 @@ modules:
     build-options:
       env:
         RUSTFLAGS: ''
+        # flatpak-builder sets SOURCE_DATE_EPOCH to the current timestamp on every
+        # run, which invalidates every cc-rs build script (ring, cxx, qtbridge, etc.).
+        SOURCE_DATE_EPOCH: '1700000000'
     build-commands:
       - |
         set -e
@@ -64,6 +67,9 @@ modules:
         WRAP
         chmod +x /tmp/qt-shim/qmake
         export QMAKE=/tmp/qt-shim/qmake
+        # Normalize vendored crate timestamps so Cargo does not re-run build.rs
+        # and recompile C/C++ crates when flatpak-builder re-extracts sources.
+        find "${CARGO_HOME}/vendor" -exec touch -h -d '2020-01-01T00:00:00Z' {} +
         cargo --offline build --release -p remotewayland-client \
           --no-default-features --features qt
       - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/remotewayland-client"
@@ -79,6 +85,7 @@ modules:
         path: ../..
         skip:
           - target
+          - build
           - .git
           - .flatpak-builder
           - build-dir

@@ -84,6 +84,7 @@ echo "==> Building ${APP_ID} for ${ARCH}..."
 flatpak-builder \
     --arch="${ARCH}" \
     --force-clean \
+    --delete-build-dirs \
     --user \
     --disable-rofiles-fuse \
     --state-dir="${BUILD_ROOT}/state-${ARCH}" \
