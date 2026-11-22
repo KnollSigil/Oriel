@@ -3316,69 +3316,75 @@ fn run_compositor_loop(
 
     let _ = ready_tx.send(Ok(socket_name.clone()));
 
+    const FRAME_INTERVAL: Duration = Duration::from_millis(16);
     let initial_cmd_deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_frame_tick = Instant::now() - FRAME_INTERVAL;
 
     loop {
-        event_loop.dispatch(Duration::from_millis(16), &mut state)?;
+        let timeout = FRAME_INTERVAL.saturating_sub(last_frame_tick.elapsed());
+        event_loop.dispatch(timeout, &mut state)?;
         if !state.pending_initial_command.is_empty() && Instant::now() >= initial_cmd_deadline {
             warn!("XWayland startup timed out; launching initial command without waiting");
             let cmd = std::mem::take(&mut state.pending_initial_command);
             spawn_gui_command(&state.socket_name, &cmd);
         }
-        let elapsed = state.start_time.elapsed();
-        for tracked in state.windows.values() {
-            tracked.window.send_frame(
-                &state.output,
-                elapsed,
-                Some(Duration::ZERO),
-                |_, _| Some(state.output.clone()),
-            );
-        }
-        for popup in state.popup_windows.values() {
-            send_frames_surface_tree(
-                popup.surface.wl_surface(),
-                &state.output,
-                elapsed,
-                Some(Duration::ZERO),
-                |_, _| Some(state.output.clone()),
-            );
-        }
-        for xwin in state.x11_windows.values() {
-            if let Some(wl) = xwin.surface.wl_surface() {
-                send_frames_surface_tree(
-                    &wl,
+        if last_frame_tick.elapsed() >= FRAME_INTERVAL {
+            last_frame_tick = Instant::now();
+            let elapsed = state.start_time.elapsed();
+            for tracked in state.windows.values() {
+                tracked.window.send_frame(
                     &state.output,
                     elapsed,
                     Some(Duration::ZERO),
                     |_, _| Some(state.output.clone()),
                 );
             }
-        }
-        for xpop in state.x11_popups.values() {
-            if let Some(wl) = xpop.surface.wl_surface() {
+            for popup in state.popup_windows.values() {
                 send_frames_surface_tree(
-                    &wl,
+                    popup.surface.wl_surface(),
                     &state.output,
                     elapsed,
                     Some(Duration::ZERO),
                     |_, _| Some(state.output.clone()),
                 );
             }
-        }
-        if let Some(ref cs) = state.cursor_surface {
-            if cs.alive() {
-                send_frames_surface_tree(
-                    cs,
-                    &state.output,
-                    elapsed,
-                    Some(Duration::ZERO),
-                    |_, _| Some(state.output.clone()),
-                );
-            } else {
-                let id = cs.id();
-                state.surface_buffers.remove(&id);
-                state.cursor_surface = None;
-                state.last_cursor_bitmap = None;
+            for xwin in state.x11_windows.values() {
+                if let Some(wl) = xwin.surface.wl_surface() {
+                    send_frames_surface_tree(
+                        &wl,
+                        &state.output,
+                        elapsed,
+                        Some(Duration::ZERO),
+                        |_, _| Some(state.output.clone()),
+                    );
+                }
+            }
+            for xpop in state.x11_popups.values() {
+                if let Some(wl) = xpop.surface.wl_surface() {
+                    send_frames_surface_tree(
+                        &wl,
+                        &state.output,
+                        elapsed,
+                        Some(Duration::ZERO),
+                        |_, _| Some(state.output.clone()),
+                    );
+                }
+            }
+            if let Some(ref cs) = state.cursor_surface {
+                if cs.alive() {
+                    send_frames_surface_tree(
+                        cs,
+                        &state.output,
+                        elapsed,
+                        Some(Duration::ZERO),
+                        |_, _| Some(state.output.clone()),
+                    );
+                } else {
+                    let id = cs.id();
+                    state.surface_buffers.remove(&id);
+                    state.cursor_surface = None;
+                    state.last_cursor_bitmap = None;
+                }
             }
         }
         state.display_handle.flush_clients()?;

@@ -307,6 +307,12 @@ pub enum ControlMessage {
     KeyboardLeave {
         window_id: WindowId,
     },
+    /// Client -> Server: acknowledges decoding of a video frame (`pts_ns`) for
+    /// end-to-end in-flight frame pacing and low-latency frame dropping.
+    FrameAck {
+        window_id: WindowId,
+        pts_ns: u64,
+    },
 }
 
 /// Header preceding each encoded video access unit on a per-window video stream.
@@ -609,12 +615,17 @@ mod tests {
             pressed_keys: vec![29, 42],
         };
         let kbd_leave = ControlMessage::KeyboardLeave { window_id: 9 };
+        let frame_ack = ControlMessage::FrameAck {
+            window_id: 9,
+            pts_ns: 123_456_789,
+        };
 
         write_control_message(&mut tx, &primary).await.unwrap();
         write_control_message(&mut tx, &cursor).await.unwrap();
         write_control_message(&mut tx, &scheme).await.unwrap();
         write_control_message(&mut tx, &kbd_enter).await.unwrap();
         write_control_message(&mut tx, &kbd_leave).await.unwrap();
+        write_control_message(&mut tx, &frame_ack).await.unwrap();
         drop(tx);
 
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), primary);
@@ -622,6 +633,7 @@ mod tests {
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), scheme);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_enter);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_leave);
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), frame_ack);
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
     }
 

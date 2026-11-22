@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -139,11 +140,9 @@ pub enum ClientUiEvent {
     WindowClosed {
         window_id: WindowId,
     },
-    FrameDecoded {
+    /// Signals that a new decoded frame is available in the per-window latest-frame mailbox.
+    FrameReady {
         window_id: WindowId,
-        width: u32,
-        height: u32,
-        bgra: Vec<u8>,
     },
     CursorUpdate {
         window_id: WindowId,
@@ -183,8 +182,45 @@ enum ActiveCursor {
     },
 }
 
+struct LatestDecodedFrame {
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+}
+
+type LatestFrameMap = Arc<Mutex<HashMap<WindowId, LatestDecodedFrame>>>;
+
 /// Sender handle used by background tasks to wake and message the Wayland event loop.
-pub type UiSender = CalloopSender<ClientUiEvent>;
+/// Video frames are coalesced per window into a 1-slot latest-frame mailbox so stale
+/// decoded frames never accumulate in the UI channel.
+#[derive(Clone)]
+pub struct UiSender {
+    tx: CalloopSender<ClientUiEvent>,
+    latest_frames: LatestFrameMap,
+}
+
+impl UiSender {
+    pub fn send(&self, event: ClientUiEvent) -> Result<(), std::sync::mpsc::SendError<ClientUiEvent>> {
+        self.tx.send(event)
+    }
+
+    pub fn push_frame(&self, window_id: WindowId, width: u32, height: u32, bgra: Vec<u8>) {
+        let should_notify = {
+            let mut map = self.latest_frames.lock().unwrap();
+            map.insert(window_id, LatestDecodedFrame { width, height, bgra })
+                .is_none()
+        };
+        if should_notify {
+            let _ = self.tx.send(ClientUiEvent::FrameReady { window_id });
+        }
+    }
+}
+
+/// Receiver pair passed into `run_event_loop`.
+pub struct UiReceiver {
+    rx: Channel<ClientUiEvent>,
+    latest_frames: LatestFrameMap,
+}
 
 /// Holds an `xdg_toplevel_icon_v1` and its backing `wl_shm` buffers.
 /// `Drop` destroys the icon object before releasing the backing buffers, as required
@@ -260,6 +296,7 @@ struct ClientApp {
     windows: HashMap<WindowId, RemoteWindow>,
     popups: HashMap<WindowId, RemotePopup>,
     surface_to_remote: HashMap<u32, WindowId>,
+    latest_frames: LatestFrameMap,
 
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
     last_clipboard: String,
@@ -678,13 +715,17 @@ impl ClientApp {
                     self.surface_to_remote
                         .remove(&rp.popup.wl_surface().id().protocol_id());
                 }
+                self.latest_frames.lock().unwrap().remove(&window_id);
             }
-            ClientUiEvent::FrameDecoded {
-                window_id,
-                width,
-                height,
-                bgra,
-            } => {
+            ClientUiEvent::FrameReady { window_id } => {
+                let Some(LatestDecodedFrame {
+                    width,
+                    height,
+                    bgra,
+                }) = self.latest_frames.lock().unwrap().remove(&window_id)
+                else {
+                    return;
+                };
                 if let Some(win) = self.windows.get_mut(&window_id) {
                     if !win.configured {
                         win.pending_frame = Some((width, height, bgra));
@@ -1692,15 +1733,27 @@ delegate_xdg_popup!(ClientApp);
 delegate_registry!(ClientApp);
 
 /// Create a `calloop` channel pair for sending `ClientUiEvent`s to the Wayland event loop.
-pub fn create_ui_channel() -> (UiSender, Channel<ClientUiEvent>) {
-    channel::channel()
+pub fn create_ui_channel() -> (UiSender, UiReceiver) {
+    let (tx, rx) = channel::channel();
+    let latest_frames = Arc::new(Mutex::new(HashMap::new()));
+    (
+        UiSender {
+            tx,
+            latest_frames: latest_frames.clone(),
+        },
+        UiReceiver { rx, latest_frames },
+    )
 }
 
 /// Run the native `smithay-client-toolkit` Wayland event loop on the current thread.
 pub fn run_event_loop(
-    ui_rx: Channel<ClientUiEvent>,
+    ui_rx: UiReceiver,
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
 ) -> Result<()> {
+    let UiReceiver {
+        rx: ui_rx,
+        latest_frames,
+    } = ui_rx;
     let conn = Connection::connect_to_env().context("failed to connect to local Wayland display")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("failed to initialize Wayland registry queue")?;
@@ -1768,6 +1821,7 @@ pub fn run_event_loop(
         windows: HashMap::new(),
         popups: HashMap::new(),
         surface_to_remote: HashMap::new(),
+        latest_frames,
         ctrl_tx,
         last_clipboard: String::new(),
         last_primary: String::new(),
@@ -1779,4 +1833,28 @@ pub fn run_event_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_sender_push_frame_coalesces_to_latest_without_duplicate_wakeups() {
+        let (tx, rx) = create_ui_channel();
+        tx.push_frame(7, 2, 2, vec![1; 16]);
+        tx.push_frame(7, 2, 2, vec![2; 16]);
+        tx.push_frame(7, 4, 4, vec![3; 64]);
+
+        // Only the newest frame should be stored in the 1-slot mailbox.
+        let latest = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
+        assert_eq!((latest.width, latest.height), (4, 4));
+        assert_eq!(latest.bgra[0], 3);
+
+        // Next push after removal re-arms the mailbox.
+        tx.push_frame(7, 1, 1, vec![9; 4]);
+        let next = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
+        assert_eq!((next.width, next.height), (1, 1));
+        assert_eq!(next.bgra[0], 9);
+    }
 }

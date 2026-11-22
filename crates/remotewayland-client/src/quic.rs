@@ -262,7 +262,10 @@ pub async fn run_client(
     let (theme_tx, mut theme_rx) = mpsc::unbounded_channel::<u32>();
     let color_scheme_task = tokio::spawn(watch_local_color_scheme(theme_tx));
 
-    // Task: forward local input/resize/close/theme messages to server control stream.
+    // Per-window decoded video frame acknowledgments for end-to-end in-flight frame pacing.
+    let (frame_ack_tx, mut frame_ack_rx) = mpsc::unbounded_channel::<(WindowId, u64)>();
+
+    // Task: forward local input/resize/close/theme/frame-ack messages to server control stream.
     let (ctrl_closed_tx, mut ctrl_closed_rx) = tokio::sync::oneshot::channel::<()>();
     let writer_task = tokio::spawn(async move {
         loop {
@@ -272,6 +275,10 @@ pub async fn run_client(
                     None => break,
                 },
                 Some(scheme) = theme_rx.recv() => ControlMessage::ColorScheme { scheme },
+                Some((window_id, pts_ns)) = frame_ack_rx.recv() => ControlMessage::FrameAck {
+                    window_id,
+                    pts_ns,
+                },
             };
             if let Err(err) = write_control_message(&mut send, &msg).await {
                 warn!(error = %err, "failed to send control message");
@@ -288,9 +295,11 @@ pub async fn run_client(
     // Task: accept per-window video and audio playback unidirectional streams.
     let uni_conn = conn.clone();
     let uni_tx = ui_tx.clone();
+    let uni_ack_tx = frame_ack_tx.clone();
     let uni_task = tokio::spawn(async move {
         while let Ok(mut recv_uni) = uni_conn.accept_uni().await {
             let tx = uni_tx.clone();
+            let ack_tx = uni_ack_tx.clone();
             tokio::spawn(async move {
                 match read_stream_header(&mut recv_uni).await {
                     Ok(StreamHeader::Video {
@@ -301,12 +310,13 @@ pub async fn run_client(
                         while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
                             match decoder.decode(hdr.width, hdr.height, hdr.is_keyframe, &payload) {
                                 Ok(frame) => {
-                                    let _ = tx.send(ClientUiEvent::FrameDecoded {
+                                    tx.push_frame(
                                         window_id,
-                                        width: frame.width,
-                                        height: frame.height,
-                                        bgra: frame.bgra,
-                                    });
+                                        frame.width,
+                                        frame.height,
+                                        frame.bgra,
+                                    );
+                                    let _ = ack_tx.send((window_id, hdr.pts_ns));
                                 }
                                 Err(err) => warn!(window_id, error = %err, "video decode error"),
                             }

@@ -1,12 +1,12 @@
 //! QUIC server transport and ephemeral TLS/token authentication.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use quinn::{Endpoint, SendStream, ServerConfig, TransportConfig};
+use quinn::{Endpoint, ServerConfig, TransportConfig};
 use remotewayland_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_stream_header,
     write_audio_packet, write_control_message, write_stream_header, write_video_frame,
@@ -14,7 +14,7 @@ use remotewayland_proto::{
     VideoFrameHeader, WindowId, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tracing::{info, warn};
 
 use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
@@ -346,12 +346,7 @@ async fn handle_connection(
         (None, None)
     };
 
-    struct WindowVideoStream {
-        encoder: VideoEncoder,
-        stream: SendStream,
-    }
-
-    let mut video_streams: HashMap<WindowId, WindowVideoStream> = HashMap::new();
+    let mut video_pipelines: HashMap<WindowId, WindowVideoPipeline> = HashMap::new();
     let mut popup_encoders: HashMap<WindowId, VideoEncoder> = HashMap::new();
     let session_start = Instant::now();
 
@@ -444,9 +439,7 @@ async fn handle_connection(
                         }).await?;
                     }
                     Ok(CompositorEvent::WindowClosed { window_id }) => {
-                        if let Some(mut vs) = video_streams.remove(&window_id) {
-                            let _ = vs.stream.finish();
-                        }
+                        video_pipelines.remove(&window_id);
                         popup_encoders.remove(&window_id);
                         write_control_message(&mut send, &ControlMessage::WindowClosed { window_id }).await?;
                     }
@@ -472,28 +465,19 @@ async fn handle_connection(
                         }).await?;
                     }
                     Ok(CompositorEvent::FrameCommitted { window_id, width, height, bgra }) => {
-                        if let std::collections::hash_map::Entry::Vacant(e) = video_streams.entry(window_id) {
-                            let mut stream = conn.open_uni().await.context("failed to open video uni stream")?;
-                            write_stream_header(&mut stream, &StreamHeader::Video { window_id, codec: selected_codec }).await?;
-                            e.insert(WindowVideoStream {
-                                encoder: VideoEncoder::new(),
-                                stream,
-                            });
-                        }
-                        if let Some(vs) = video_streams.get_mut(&window_id) {
-                            let pts_ns = session_start.elapsed().as_nanos() as u64;
-                            let frame = vs.encoder.encode_bgra(width, height, pts_ns, &bgra);
-                            let hdr = VideoFrameHeader {
-                                pts_ns: frame.pts_ns,
-                                width: frame.width,
-                                height: frame.height,
-                                is_keyframe: frame.is_keyframe,
-                                payload_len: frame.data.len() as u32,
-                            };
-                            if let Err(err) = write_video_frame(&mut vs.stream, &hdr, &frame.data).await {
-                                warn!(window_id, error = %err, "failed to write video frame");
-                            }
-                        }
+                        let pipeline = video_pipelines.entry(window_id).or_insert_with(|| {
+                            spawn_window_video_pipeline(
+                                window_id,
+                                conn.clone(),
+                                selected_codec,
+                                session_start,
+                            )
+                        });
+                        pipeline.push_frame(RawVideoFrame {
+                            width,
+                            height,
+                            bgra,
+                        });
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "compositor event receiver lagged");
@@ -569,6 +553,11 @@ async fn handle_connection(
                     Some(ControlMessage::ColorScheme { scheme }) => {
                         let _ = color_scheme_tx.send(Some(scheme));
                     }
+                    Some(ControlMessage::FrameAck { window_id, pts_ns }) => {
+                        if let Some(pipeline) = video_pipelines.get(&window_id) {
+                            pipeline.ack_frame(pts_ns);
+                        }
+                    }
                     Some(other) => {
                         info!(?other, "received control message");
                     }
@@ -578,7 +567,193 @@ async fn handle_connection(
         }
     }
 
+    for (_, pipeline) in video_pipelines.drain() {
+        pipeline.task.abort();
+    }
+
     Ok(())
+}
+
+/// Maximum number of unacknowledged video frames allowed in flight per window.
+/// Keeps end-to-end latency bounded when UI updates outpace network bandwidth or decoding.
+const MAX_IN_FLIGHT_FRAMES: usize = 2;
+
+/// Safety timeout for waiting on a `FrameAck` so a stalled ack can never permanently deadlock a stream.
+const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct RawVideoFrame {
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+}
+
+struct WindowVideoPipeline {
+    latest_frame: Arc<Mutex<Option<RawVideoFrame>>>,
+    notify: Arc<Notify>,
+    ack_tx: watch::Sender<u64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WindowVideoPipeline {
+    fn push_frame(&self, frame: RawVideoFrame) {
+        *self.latest_frame.lock().unwrap() = Some(frame);
+        self.notify.notify_one();
+    }
+
+    fn ack_frame(&self, pts_ns: u64) {
+        self.ack_tx.send_modify(|cur| {
+            if pts_ns > *cur {
+                *cur = pts_ns;
+            }
+        });
+    }
+}
+
+fn spawn_window_video_pipeline(
+    window_id: WindowId,
+    conn: quinn::Connection,
+    selected_codec: VideoCodec,
+    session_start: Instant,
+) -> WindowVideoPipeline {
+    let latest_frame = Arc::new(Mutex::new(None));
+    let notify = Arc::new(Notify::new());
+    let (ack_tx, ack_rx) = watch::channel(0u64);
+    let task = tokio::spawn(run_window_video_pipeline(
+        window_id,
+        conn,
+        selected_codec,
+        session_start,
+        latest_frame.clone(),
+        notify.clone(),
+        ack_rx,
+    ));
+    WindowVideoPipeline {
+        latest_frame,
+        notify,
+        ack_tx,
+        task,
+    }
+}
+
+fn prune_acked_pts(in_flight_pts: &mut VecDeque<u64>, acked_pts: u64) {
+    while in_flight_pts.front().is_some_and(|&pts| pts <= acked_pts) {
+        in_flight_pts.pop_front();
+    }
+}
+
+async fn run_window_video_pipeline(
+    window_id: WindowId,
+    conn: quinn::Connection,
+    selected_codec: VideoCodec,
+    session_start: Instant,
+    latest_frame: Arc<Mutex<Option<RawVideoFrame>>>,
+    notify: Arc<Notify>,
+    mut ack_rx: watch::Receiver<u64>,
+) {
+    let mut stream = match conn.open_uni().await {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(window_id, error = %err, "failed to open video uni stream");
+            return;
+        }
+    };
+    if let Err(err) = write_stream_header(
+        &mut stream,
+        &StreamHeader::Video {
+            window_id,
+            codec: selected_codec,
+        },
+    )
+    .await
+    {
+        warn!(window_id, error = %err, "failed to write video StreamHeader");
+        return;
+    }
+
+    let mut encoder = Some(VideoEncoder::new());
+    let mut in_flight_pts: VecDeque<u64> = VecDeque::new();
+    let mut last_pts_ns: u64 = 0;
+
+    loop {
+        // 1. Wait until a new frame is available in the 1-slot mailbox.
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if latest_frame.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::select! {
+                _ = notified => {}
+                res = ack_rx.changed() => {
+                    if res.is_err() {
+                        let _ = stream.finish();
+                        return;
+                    }
+                    prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
+                }
+            }
+        }
+
+        // 2. Enforce end-to-end in-flight frame cap before taking/encoding the newest frame.
+        //    Any newer frames arriving while waiting overwrite `latest_frame` in place.
+        prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
+        while in_flight_pts.len() >= MAX_IN_FLIGHT_FRAMES {
+            match tokio::time::timeout(FRAME_ACK_TIMEOUT, ack_rx.changed()).await {
+                Ok(Ok(())) => {
+                    prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
+                }
+                Ok(Err(_)) => {
+                    let _ = stream.finish();
+                    return;
+                }
+                Err(_) => {
+                    in_flight_pts.pop_front();
+                }
+            }
+        }
+
+        // 3. Take the latest frame AFTER acquiring credit so stale intermediate frames are skipped.
+        let Some(raw) = latest_frame.lock().unwrap().take() else {
+            continue;
+        };
+
+        let raw_pts = session_start.elapsed().as_nanos() as u64;
+        let pts_ns = raw_pts.max(last_pts_ns.saturating_add(1));
+        last_pts_ns = pts_ns;
+
+        // 4. Encode off the async runtime thread so control/input latency stays unaffected.
+        let mut enc = encoder.take().unwrap();
+        let encoded_res = tokio::task::spawn_blocking(move || {
+            let frame = enc.encode_bgra(raw.width, raw.height, pts_ns, &raw.bgra);
+            (enc, frame)
+        })
+        .await;
+        let (enc, frame) = match encoded_res {
+            Ok(pair) => pair,
+            Err(err) => {
+                warn!(window_id, error = %err, "video encoder task panicked");
+                let _ = stream.finish();
+                return;
+            }
+        };
+        encoder = Some(enc);
+
+        // 5. Write encoded frame to the per-window QUIC stream.
+        let hdr = VideoFrameHeader {
+            pts_ns: frame.pts_ns,
+            width: frame.width,
+            height: frame.height,
+            is_keyframe: frame.is_keyframe,
+            payload_len: frame.data.len() as u32,
+        };
+        if let Err(err) = write_video_frame(&mut stream, &hdr, &frame.data).await {
+            warn!(window_id, error = %err, "failed to write video frame");
+            return;
+        }
+        in_flight_pts.push_back(pts_ns);
+        prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
+    }
 }
 
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {
@@ -613,5 +788,18 @@ mod tests {
         assert!(!consume_token(&map, "expired"));
         assert!(!consume_token(&map, "nonexistent"));
         assert!(map.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_acked_pts_pops_up_to_acked_timestamp() {
+        let mut q = VecDeque::from([10, 20, 30, 40]);
+        prune_acked_pts(&mut q, 5);
+        assert_eq!(q, VecDeque::from([10, 20, 30, 40]));
+
+        prune_acked_pts(&mut q, 20);
+        assert_eq!(q, VecDeque::from([30, 40]));
+
+        prune_acked_pts(&mut q, 100);
+        assert!(q.is_empty());
     }
 }
