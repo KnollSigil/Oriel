@@ -4,7 +4,7 @@
 //! isolated `WAYLAND_DISPLAY` socket, tracks `xdg_toplevel` and `xdg_popup`
 //! windows, extracts committed SHM frames, and forwards input/configure events.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -24,7 +24,7 @@ use smithay::backend::input::KeyState;
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::{PopupKind, PopupManager, Space, Window};
 use smithay::input::keyboard::{
-    FilterResult, KeyboardTarget, KeysymHandle, ModifiersState, XkbConfig,
+    FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent,
@@ -218,6 +218,13 @@ pub enum CompositorCommand {
         window_id: WindowId,
         keycode: u32,
         pressed: bool,
+    },
+    KeyboardEnter {
+        window_id: WindowId,
+        pressed_keys: Vec<u32>,
+    },
+    KeyboardLeave {
+        window_id: WindowId,
     },
     SetClipboardText {
         text: String,
@@ -598,6 +605,29 @@ impl AppState {
         hit
     }
 
+    fn keyboard_focus_target_for_window(
+        &mut self,
+        window_id: WindowId,
+    ) -> Option<KeyboardFocusTarget> {
+        if let Some(tracked) = self.windows.get(&window_id) {
+            tracked
+                .window
+                .toplevel()
+                .map(|t| KeyboardFocusTarget::Wayland(t.wl_surface().clone()))
+        } else if let Some(popup) = self.popup_windows.get(&window_id) {
+            Some(KeyboardFocusTarget::Wayland(
+                popup.surface.wl_surface().clone(),
+            ))
+        } else if let Some(xw) = self.x11_windows.get(&window_id) {
+            self.last_focused_x11_window_id = Some(window_id);
+            Some(KeyboardFocusTarget::X11(xw.surface.clone()))
+        } else if let Some(xp) = self.x11_popups.get(&window_id) {
+            Some(KeyboardFocusTarget::X11(xp.surface.clone()))
+        } else {
+            None
+        }
+    }
+
     fn handle_command(&mut self, cmd: CompositorCommand) {
         let serial = SERIAL_COUNTER.next_serial();
         let time_ms = self.start_time.elapsed().as_millis() as u32;
@@ -832,21 +862,7 @@ impl AppState {
             } => {
                 self.focused_window_id = window_id;
                 if let Some(keyboard) = self.seat.get_keyboard() {
-                    if let Some(tracked) = self.windows.get(&window_id) {
-                        if let Some(toplevel) = tracked.window.toplevel() {
-                            let target = KeyboardFocusTarget::Wayland(toplevel.wl_surface().clone());
-                            if keyboard.current_focus().as_ref() != Some(&target) {
-                                keyboard.set_focus(self, Some(target), serial);
-                            }
-                        }
-                    } else if let Some(xw) = self.x11_windows.get(&window_id) {
-                        self.last_focused_x11_window_id = Some(window_id);
-                        let target = KeyboardFocusTarget::X11(xw.surface.clone());
-                        if keyboard.current_focus().as_ref() != Some(&target) {
-                            keyboard.set_focus(self, Some(target), serial);
-                        }
-                    } else if let Some(xp) = self.x11_popups.get(&window_id) {
-                        let target = KeyboardFocusTarget::X11(xp.surface.clone());
+                    if let Some(target) = self.keyboard_focus_target_for_window(window_id) {
                         if keyboard.current_focus().as_ref() != Some(&target) {
                             keyboard.set_focus(self, Some(target), serial);
                         }
@@ -856,15 +872,42 @@ impl AppState {
                     } else {
                         KeyState::Released
                     };
-                    let xkb_keycode = keycode.saturating_add(8);
+                    let xkb_keycode = Keycode::from(keycode.saturating_add(8));
+                    // Guard against duplicate presses that would double-increment XKB modifier refcounts.
+                    if pressed && keyboard.pressed_keys().contains(&xkb_keycode) {
+                        return;
+                    }
                     keyboard.input::<(), _>(
                         self,
-                        xkb_keycode.into(),
+                        xkb_keycode,
                         state,
                         serial,
                         time_ms,
                         |_, _, _| FilterResult::Forward,
                     );
+                }
+            }
+            CompositorCommand::KeyboardEnter {
+                window_id,
+                pressed_keys,
+            } => {
+                self.focused_window_id = window_id;
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    let target = self.keyboard_focus_target_for_window(window_id);
+                    sync_keyboard_enter(self, &keyboard, target, &pressed_keys, serial, time_ms);
+                }
+            }
+            CompositorCommand::KeyboardLeave { window_id } => {
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    let target = self.keyboard_focus_target_for_window(window_id);
+                    let focus_matches = match (keyboard.current_focus(), target.as_ref()) {
+                        (Some(curr), Some(t)) => curr == *t,
+                        (_, None) => self.focused_window_id == window_id,
+                        (None, Some(_)) => true,
+                    };
+                    if focus_matches {
+                        clear_keyboard_focus_and_keys(self, &keyboard, serial, time_ms);
+                    }
                 }
             }
             CompositorCommand::SetClipboardText { text } => {
@@ -3416,6 +3459,77 @@ fn apply_gui_env(proc: &mut Command, socket_name: &OsString) {
     crate::session::apply_session_env(proc, Some(socket_name.as_os_str()));
 }
 
+fn sync_keyboard_enter<D: SeatHandler + 'static>(
+    state: &mut D,
+    keyboard: &KeyboardHandle<D>,
+    target: Option<D::KeyboardFocus>,
+    evdev_pressed_keys: &[u32],
+    serial: Serial,
+    time_ms: u32,
+) {
+    let desired_keys: HashSet<Keycode> = evdev_pressed_keys
+        .iter()
+        .copied()
+        .map(|kc| Keycode::from(kc.saturating_add(8)))
+        .collect();
+    let current_keys = keyboard.pressed_keys();
+
+    if current_keys != desired_keys {
+        // Temporarily unset focus while syncing held keys so Smithay updates its
+        // internal pressed_keys, forwarded_pressed_keys, and XKB modifier state
+        // without emitting spurious wl_keyboard::key press/release events to any client.
+        if keyboard.current_focus().is_some() {
+            keyboard.set_focus(state, None, serial);
+        }
+        for kc in current_keys.difference(&desired_keys) {
+            keyboard.input::<(), _>(
+                state,
+                *kc,
+                KeyState::Released,
+                serial,
+                time_ms,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+        for kc in desired_keys.difference(&current_keys) {
+            keyboard.input::<(), _>(
+                state,
+                *kc,
+                KeyState::Pressed,
+                serial,
+                time_ms,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+    }
+
+    if let Some(target) = target {
+        if keyboard.current_focus().as_ref() != Some(&target) {
+            keyboard.set_focus(state, Some(target), serial);
+        }
+    }
+}
+
+fn clear_keyboard_focus_and_keys<D: SeatHandler + 'static>(
+    state: &mut D,
+    keyboard: &KeyboardHandle<D>,
+    serial: Serial,
+    time_ms: u32,
+) {
+    keyboard.set_focus(state, None, serial);
+    let held: Vec<Keycode> = keyboard.pressed_keys().into_iter().collect();
+    for kc in held {
+        keyboard.input::<(), _>(
+            state,
+            kc,
+            KeyState::Released,
+            serial,
+            time_ms,
+            |_, _, _| FilterResult::Forward,
+        );
+    }
+}
+
 fn blit_rgba_over(
     dst: &mut [u8],
     dst_w: u32,
@@ -3508,5 +3622,166 @@ mod tests {
         assert_eq!(x11_app_id("XTerm", "xterm"), "xterm");
         assert_eq!(x11_app_id("firefox", "Navigator"), "firefox");
         assert_eq!(x11_app_id("", "xterm"), "xterm");
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MockKeyboardTarget(u32);
+
+    impl IsAlive for MockKeyboardTarget {
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum RecordedKeyboardEvent {
+        Enter(u32, Vec<u32>),
+        Leave(u32),
+        Key(u32, u32, KeyState),
+        Modifiers(u32, bool, bool, bool, bool),
+    }
+
+    struct MockSeatState {
+        seat_state: SeatState<Self>,
+        events: Vec<RecordedKeyboardEvent>,
+    }
+
+    impl SeatHandler for MockSeatState {
+        type KeyboardFocus = MockKeyboardTarget;
+        type PointerFocus = WlSurface;
+        type TouchFocus = WlSurface;
+
+        fn seat_state(&mut self) -> &mut SeatState<Self> {
+            &mut self.seat_state
+        }
+    }
+
+    impl KeyboardTarget<MockSeatState> for MockKeyboardTarget {
+        fn enter(
+            &self,
+            _seat: &Seat<MockSeatState>,
+            data: &mut MockSeatState,
+            keys: Vec<KeysymHandle<'_>>,
+            _serial: Serial,
+        ) {
+            let mut raw: Vec<u32> = keys.into_iter().map(|k| k.raw_code().raw()).collect();
+            raw.sort_unstable();
+            data.events.push(RecordedKeyboardEvent::Enter(self.0, raw));
+        }
+
+        fn leave(
+            &self,
+            _seat: &Seat<MockSeatState>,
+            data: &mut MockSeatState,
+            _serial: Serial,
+        ) {
+            data.events.push(RecordedKeyboardEvent::Leave(self.0));
+        }
+
+        fn key(
+            &self,
+            _seat: &Seat<MockSeatState>,
+            data: &mut MockSeatState,
+            key: KeysymHandle<'_>,
+            state: KeyState,
+            _serial: Serial,
+            _time: u32,
+        ) {
+            data.events
+                .push(RecordedKeyboardEvent::Key(self.0, key.raw_code().raw(), state));
+        }
+
+        fn modifiers(
+            &self,
+            _seat: &Seat<MockSeatState>,
+            data: &mut MockSeatState,
+            modifiers: ModifiersState,
+            _serial: Serial,
+        ) {
+            data.events.push(RecordedKeyboardEvent::Modifiers(
+                self.0,
+                modifiers.ctrl,
+                modifiers.shift,
+                modifiers.alt,
+                modifiers.logo,
+            ));
+        }
+    }
+
+    #[test]
+    fn keyboard_enter_syncs_held_modifiers_without_spurious_key_presses() {
+        // evdev keycodes: KEY_LEFTCTRL = 29, KEY_LEFTSHIFT = 42, KEY_LEFTALT = 56
+        const KEY_LEFTCTRL: u32 = 29;
+        const KEY_LEFTSHIFT: u32 = 42;
+        const KEY_LEFTALT: u32 = 56;
+
+        let mut seat_state = SeatState::new();
+        let mut seat = seat_state.new_seat("seat0");
+        let keyboard = seat.add_keyboard(XkbConfig::default(), 200, 25).unwrap();
+        let mut state = MockSeatState {
+            seat_state,
+            events: Vec::new(),
+        };
+
+        // 1. Enter window 1 with Ctrl + Shift already held (including duplicate Ctrl to test dedup).
+        sync_keyboard_enter(
+            &mut state,
+            &keyboard,
+            Some(MockKeyboardTarget(1)),
+            &[KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTCTRL],
+            SERIAL_COUNTER.next_serial(),
+            10,
+        );
+
+        let mods = keyboard.modifier_state();
+        assert!(mods.ctrl && mods.shift && !mods.alt && !mods.logo);
+        assert_eq!(
+            state.events,
+            vec![
+                RecordedKeyboardEvent::Enter(1, vec![KEY_LEFTCTRL + 8, KEY_LEFTSHIFT + 8]),
+                RecordedKeyboardEvent::Modifiers(1, true, true, false, false),
+            ]
+        );
+        state.events.clear();
+
+        // 2. Single release of Ctrl immediately clears ctrl (proving no XKB refcount drift).
+        keyboard.input::<(), _>(
+            &mut state,
+            Keycode::from(KEY_LEFTCTRL + 8),
+            KeyState::Released,
+            SERIAL_COUNTER.next_serial(),
+            20,
+            |_, _, _| FilterResult::Forward,
+        );
+        let mods = keyboard.modifier_state();
+        assert!(!mods.ctrl && mods.shift);
+        state.events.clear();
+
+        // 3. Leave window 1 while Shift is still held: no spurious key release forwarded,
+        // and keyboard state is reset cleanly.
+        clear_keyboard_focus_and_keys(&mut state, &keyboard, SERIAL_COUNTER.next_serial(), 30);
+        assert_eq!(state.events, vec![RecordedKeyboardEvent::Leave(1)]);
+        assert!(keyboard.pressed_keys().is_empty());
+        assert!(!keyboard.modifier_state().shift);
+        state.events.clear();
+
+        // 4. Re-enter window 2 with Alt held (e.g., Alt+Tab): receives Enter + Modifiers(alt=true),
+        // with zero spurious Key(Alt, Pressed) events.
+        sync_keyboard_enter(
+            &mut state,
+            &keyboard,
+            Some(MockKeyboardTarget(2)),
+            &[KEY_LEFTALT],
+            SERIAL_COUNTER.next_serial(),
+            40,
+        );
+        assert!(keyboard.modifier_state().alt);
+        assert_eq!(
+            state.events,
+            vec![
+                RecordedKeyboardEvent::Enter(2, vec![KEY_LEFTALT + 8]),
+                RecordedKeyboardEvent::Modifiers(2, false, false, true, false),
+            ]
+        );
     }
 }

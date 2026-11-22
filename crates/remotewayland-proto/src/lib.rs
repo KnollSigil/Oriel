@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -295,6 +295,17 @@ pub enum ControlMessage {
     /// (`0` = no preference, `1` = prefer dark, `2` = prefer light).
     ColorScheme {
         scheme: u32,
+    },
+    /// Client -> Server: local keyboard focus entered a remote window with the
+    /// given evdev keycodes already depressed (mirrors `wl_keyboard::enter`).
+    KeyboardEnter {
+        window_id: WindowId,
+        pressed_keys: Vec<u32>,
+    },
+    /// Client -> Server: local keyboard focus left a remote window
+    /// (mirrors `wl_keyboard::leave`).
+    KeyboardLeave {
+        window_id: WindowId,
     },
 }
 
@@ -593,15 +604,24 @@ mod tests {
             bgra: [0u8, 0, 0, 255].repeat(4),
         };
         let scheme = ControlMessage::ColorScheme { scheme: 1 };
+        let kbd_enter = ControlMessage::KeyboardEnter {
+            window_id: 9,
+            pressed_keys: vec![29, 42],
+        };
+        let kbd_leave = ControlMessage::KeyboardLeave { window_id: 9 };
 
         write_control_message(&mut tx, &primary).await.unwrap();
         write_control_message(&mut tx, &cursor).await.unwrap();
         write_control_message(&mut tx, &scheme).await.unwrap();
+        write_control_message(&mut tx, &kbd_enter).await.unwrap();
+        write_control_message(&mut tx, &kbd_leave).await.unwrap();
         drop(tx);
 
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), primary);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), cursor);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), scheme);
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_enter);
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_leave);
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
     }
 

@@ -253,7 +253,6 @@ struct ClientApp {
     last_button_serial: u32,
     last_input_serial: u32,
     last_pointer_enter_serial: u32,
-    pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u32>,
     last_cursor: ActiveCursor,
     border_resize_active: bool,
@@ -1136,13 +1135,17 @@ impl KeyboardHandler for ClientApp {
         _: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
         serial: u32,
-        _: &[u32],
+        raw: &[u32],
         _: &[Keysym],
     ) {
         self.last_input_serial = serial;
         let surf_id = surface.id().protocol_id();
         if let Some(&window_id) = self.surface_to_remote.get(&surf_id) {
             self.focused_window_id = window_id;
+            let _ = self.ctrl_tx.send(ControlMessage::KeyboardEnter {
+                window_id,
+                pressed_keys: raw.to_vec(),
+            });
         }
     }
 
@@ -1159,13 +1162,7 @@ impl KeyboardHandler for ClientApp {
             .get(&surface.id().protocol_id())
             .copied()
             .unwrap_or(self.focused_window_id);
-        for keycode in self.pressed_keys.drain() {
-            let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
-                window_id,
-                keycode,
-                pressed: false,
-            });
-        }
+        let _ = self.ctrl_tx.send(ControlMessage::KeyboardLeave { window_id });
     }
 
     fn press_key(
@@ -1177,7 +1174,6 @@ impl KeyboardHandler for ClientApp {
         event: KeyEvent,
     ) {
         self.last_input_serial = serial;
-        self.pressed_keys.insert(event.raw_code);
         let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
             window_id: self.focused_window_id,
             keycode: event.raw_code,
@@ -1194,7 +1190,6 @@ impl KeyboardHandler for ClientApp {
         event: KeyEvent,
     ) {
         self.last_input_serial = serial;
-        self.pressed_keys.remove(&event.raw_code);
         let _ = self.ctrl_tx.send(ControlMessage::KeyEvent {
             window_id: self.focused_window_id,
             keycode: event.raw_code,
@@ -1767,7 +1762,6 @@ pub fn run_event_loop(
         last_button_serial: 0,
         last_input_serial: 0,
         last_pointer_enter_serial: 0,
-        pressed_keys: HashSet::new(),
         pressed_buttons: HashSet::new(),
         last_cursor: ActiveCursor::Named(CursorIcon::Default),
         border_resize_active: false,

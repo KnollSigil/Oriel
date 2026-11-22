@@ -544,6 +544,12 @@ async fn handle_connection(
                     Some(ControlMessage::KeyEvent { window_id, keycode, pressed }) => {
                         let _ = cmd_tx.send(CompositorCommand::KeyEvent { window_id, keycode, pressed });
                     }
+                    Some(ControlMessage::KeyboardEnter { window_id, pressed_keys }) => {
+                        let _ = cmd_tx.send(CompositorCommand::KeyboardEnter { window_id, pressed_keys });
+                    }
+                    Some(ControlMessage::KeyboardLeave { window_id }) => {
+                        let _ = cmd_tx.send(CompositorCommand::KeyboardLeave { window_id });
+                    }
                     Some(ControlMessage::ListApps) => {
                         let apps = tokio::task::spawn_blocking(crate::apps::discover_apps)
                             .await
