@@ -128,15 +128,83 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Compute the local `0600` Unix tunnel socket path for a connected host session
-/// under `$XDG_RUNTIME_DIR/remotewayland/pty-<sanitized>.sock` (no `/tmp` fallback).
-pub fn pty_tunnel_socket_path(session_key: &str) -> Result<PathBuf> {
-    let raw = std::env::var_os("XDG_RUNTIME_DIR")
-        .context("XDG_RUNTIME_DIR is not set; cannot create private PTY tunnel socket")?;
-    let base = PathBuf::from(&raw);
-    verify_private_dir(&base)?;
+fn parse_flatpak_info_app_id(contents: &str) -> Option<String> {
+    let mut in_application = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_application = line == "[Application]";
+            continue;
+        }
+        if !in_application {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "name" {
+                let id = v.trim();
+                if is_valid_flatpak_app_id(id) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
 
-    let dir = base.join("remotewayland");
+fn is_valid_flatpak_app_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && !id.starts_with('.')
+        && !id.ends_with('.')
+        && !id.contains("..")
+        && id.contains('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// Return the Flatpak application ID when running inside a Flatpak sandbox, or `None` otherwise.
+fn flatpak_app_id() -> Option<String> {
+    if !Path::new("/.flatpak-info").exists() {
+        return None;
+    }
+    // Prefer the read-only kernel-mounted `/.flatpak-info` over the mutable `FLATPAK_ID` env var.
+    if let Some(id) = fs::read_to_string("/.flatpak-info")
+        .ok()
+        .and_then(|contents| parse_flatpak_info_app_id(&contents))
+    {
+        return Some(id);
+    }
+    std::env::var("FLATPAK_ID")
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| is_valid_flatpak_app_id(id))
+}
+
+fn pty_tunnel_socket_path_with(
+    runtime_dir: &Path,
+    flatpak_id: Option<&str>,
+    session_key: &str,
+) -> Result<PathBuf> {
+    verify_private_dir(runtime_dir)?;
+
+    let dir = match flatpak_id {
+        Some(app_id) => {
+            if !is_valid_flatpak_app_id(app_id) {
+                bail!("invalid Flatpak application ID '{app_id}'");
+            }
+            // Flatpak bind-mounts `$XDG_RUNTIME_DIR/app/$FLATPAK_ID` from the host at the
+            // exact same path across all instances of the app AND on the host itself, whereas
+            // `$XDG_RUNTIME_DIR` itself is a private per-sandbox tmpfs.
+            let app_dir = runtime_dir.join("app").join(app_id);
+            ensure_private_dir(&app_dir)?;
+            app_dir.join("remotewayland")
+        }
+        None => runtime_dir.join("remotewayland"),
+    };
     ensure_private_dir(&dir)?;
 
     let mut sanitized: String = session_key
@@ -153,6 +221,18 @@ pub fn pty_tunnel_socket_path(session_key: &str) -> Result<PathBuf> {
         sanitized.push_str("default");
     }
     Ok(dir.join(format!("pty-{sanitized}.sock")))
+}
+
+/// Compute the local `0600` Unix tunnel socket path for a connected host session
+/// under `$XDG_RUNTIME_DIR/remotewayland/pty-<sanitized>.sock` (or
+/// `$XDG_RUNTIME_DIR/app/$FLATPAK_ID/remotewayland/pty-<sanitized>.sock` inside Flatpak,
+/// with no `/tmp` fallback).
+pub fn pty_tunnel_socket_path(session_key: &str) -> Result<PathBuf> {
+    let raw = std::env::var_os("XDG_RUNTIME_DIR")
+        .context("XDG_RUNTIME_DIR is not set; cannot create private PTY tunnel socket")?;
+    let base = PathBuf::from(&raw);
+    let fp_id = flatpak_app_id();
+    pty_tunnel_socket_path_with(&base, fp_id.as_deref(), session_key)
 }
 
 enum BridgeOutcome {
@@ -555,24 +635,37 @@ fn escape_kconfig_value(val: &str) -> String {
     out
 }
 
-fn format_konsole_command(exe: &Path, socket_path: &Path) -> Result<String> {
-    let exe_str = exe
-        .to_str()
-        .context("remotewayland-client executable path is not valid UTF-8")?;
+fn format_konsole_command_with_prefix(
+    cmd_prefix: &[String],
+    socket_path: &Path,
+) -> Result<String> {
+    if cmd_prefix.is_empty() {
+        bail!("Konsole command prefix cannot be empty");
+    }
     let sock_str = socket_path
         .to_str()
         .context("PTY socket path is not valid UTF-8")?;
-    for token in [exe_str, sock_str] {
+    for token in cmd_prefix.iter().map(String::as_str).chain([sock_str]) {
         if token.chars().any(|c| matches!(c, '\0' | '\n' | '\r')) {
             bail!("path contains control characters unsupported in Konsole profile");
         }
     }
-    let shell_cmd = [exe_str, "pty-attach", "--socket", sock_str]
+    let shell_cmd = cmd_prefix
         .iter()
-        .map(|p| quote_konsole_arg(p))
+        .map(String::as_str)
+        .chain(["pty-attach", "--socket", sock_str])
+        .map(quote_konsole_arg)
         .collect::<Vec<_>>()
         .join(" ");
     Ok(escape_kconfig_value(&shell_cmd))
+}
+
+#[cfg(test)]
+fn format_konsole_command(exe: &Path, socket_path: &Path) -> Result<String> {
+    let exe_str = exe
+        .to_str()
+        .context("remotewayland-client executable path is not valid UTF-8")?;
+    format_konsole_command_with_prefix(&[exe_str.to_string()], socket_path)
 }
 
 fn parse_konsole_default_profile(konsolerc: &str) -> Option<String> {
@@ -658,16 +751,23 @@ fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 fn prepare_konsole_remote_profile(
-    exe: &Path,
+    cmd_prefix: &[String],
     socket_path: &Path,
+    flatpak: bool,
 ) -> Result<KonsoleProfileOverlay> {
-    prepare_konsole_remote_profile_with_env(exe, socket_path, &XdgEnv::from_process())
+    prepare_konsole_remote_profile_with_env(
+        cmd_prefix,
+        socket_path,
+        &XdgEnv::from_process(),
+        flatpak,
+    )
 }
 
 fn prepare_konsole_remote_profile_with_env(
-    exe: &Path,
+    cmd_prefix: &[String],
     socket_path: &Path,
     env: &XdgEnv,
+    flatpak: bool,
 ) -> Result<KonsoleProfileOverlay> {
     let parent_dir = socket_path
         .parent()
@@ -688,8 +788,24 @@ fn prepare_konsole_remote_profile_with_env(
         ensure_private_dir(dir)?;
     }
 
-    let orig_config_home = env.effective_config_home();
-    let orig_data_home = env.effective_data_home();
+    // Inside Flatpak, XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_*_DIRS point to sandbox-private
+    // paths (`~/.var/app/<id>/...`, `/app/share`). Use the host user's standard XDG
+    // directories so host Konsole inherits their themes and profiles instead.
+    let (orig_config_home, orig_data_home, existing_config_dirs, existing_data_dirs) = if flatpak {
+        (
+            env.home.as_ref().map(|h| h.join(".config")),
+            env.home.as_ref().map(|h| h.join(".local").join("share")),
+            None,
+            None,
+        )
+    } else {
+        (
+            env.effective_config_home(),
+            env.effective_data_home(),
+            env.config_dirs.as_ref(),
+            env.data_dirs.as_ref(),
+        )
+    };
 
     let parent_profile = orig_config_home
         .as_deref()
@@ -697,7 +813,7 @@ fn prepare_konsole_remote_profile_with_env(
         .and_then(|content| parse_konsole_default_profile(&content))
         .unwrap_or_else(|| "FALLBACK/".to_string());
 
-    let cmd = format_konsole_command(exe, socket_path)?;
+    let cmd = format_konsole_command_with_prefix(cmd_prefix, socket_path)?;
     let profile_contents =
         format!("[General]\nCommand={cmd}\nName=RemoteWayland\nParent={parent_profile}\n");
     write_private_file_atomic(
@@ -711,14 +827,10 @@ fn prepare_konsole_remote_profile_with_env(
         konsolerc_contents.as_bytes(),
     )?;
 
-    let config_dirs = join_xdg_dirs(
-        orig_config_home.as_deref(),
-        env.config_dirs.as_ref(),
-        "/etc/xdg",
-    );
+    let config_dirs = join_xdg_dirs(orig_config_home.as_deref(), existing_config_dirs, "/etc/xdg");
     let data_dirs = join_xdg_dirs(
         orig_data_home.as_deref(),
-        env.data_dirs.as_ref(),
+        existing_data_dirs,
         "/usr/local/share:/usr/share",
     );
 
@@ -810,13 +922,127 @@ fn resolve_terminal_candidates(
     }
 }
 
+/// Probe which candidate terminal executables exist on the host via `flatpak-spawn --host`
+/// in a single batched invocation with a bounded timeout, preserving candidate priority order.
+fn host_existing_executables(candidates: &[String]) -> Vec<String> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut child = match Command::new("flatpak-spawn")
+        .arg("--host")
+        .arg("--")
+        .args([
+            "sh",
+            "-c",
+            "for t in \"$@\"; do command -v -- \"$t\" >/dev/null 2>&1 && printf '%s\\n' \"$t\"; done",
+            "_",
+        ])
+        .args(candidates)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to invoke flatpak-spawn --host for terminal probe");
+            return Vec::new();
+        }
+    };
+
+    let Some(mut stdout_pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let stdout = match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(out) => out,
+        Err(_) => {
+            tracing::warn!("flatpak-spawn --host terminal probe timed out");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Vec::new();
+        }
+    };
+
+    match child.wait() {
+        Ok(status) if status.success() => {
+            let found: std::collections::HashSet<&str> = stdout.lines().collect();
+            candidates
+                .iter()
+                .filter(|c| found.contains(c.as_str()))
+                .cloned()
+                .collect()
+        }
+        Ok(status) => {
+            tracing::warn!(%status, "flatpak-spawn --host terminal probe failed");
+            Vec::new()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to wait for flatpak-spawn --host terminal probe");
+            Vec::new()
+        }
+    }
+}
+
+/// Build the argv prefix used by a local terminal emulator to invoke `remotewayland-client`.
+fn client_attach_prefix(flatpak_id: Option<&str>) -> Result<Vec<String>> {
+    if let Some(app_id) = flatpak_id {
+        return Ok(vec![
+            "flatpak".to_string(),
+            "run".to_string(),
+            "--command=remotewayland-client".to_string(),
+            app_id.to_string(),
+        ]);
+    }
+    let exe = std::env::current_exe().context("failed to locate remotewayland-client binary")?;
+    let exe_str = exe
+        .to_str()
+        .context("remotewayland-client executable path is not valid UTF-8")?;
+    Ok(vec![exe_str.to_string()])
+}
+
 /// Return installed local terminal emulators in priority order (index 0 is the default).
 #[cfg(any(feature = "gtk4", feature = "qt", test))]
 pub fn available_local_terminals() -> Vec<String> {
-    terminal_candidates()
-        .into_iter()
-        .filter(|term| executable_exists(term))
-        .collect()
+    let candidates = terminal_candidates();
+    if flatpak_app_id().is_some() {
+        host_existing_executables(&candidates)
+    } else {
+        candidates
+            .into_iter()
+            .filter(|term| executable_exists(term))
+            .collect()
+    }
+}
+
+/// Wrap the `flatpak run` attach prefix for Konsole's profile overlay so the overridden
+/// `XDG_DATA_HOME` (pointing at our temporary overlay dir) does not prevent `flatpak run`
+/// from finding `--user` installations under `~/.local/share/flatpak`.
+fn konsole_overlay_attach_prefix(attach_prefix: &[String], is_flatpak: bool) -> Vec<String> {
+    if !is_flatpak {
+        return attach_prefix.to_vec();
+    }
+    let mut wrapped = vec![
+        "env".to_string(),
+        "-u".to_string(),
+        "XDG_CONFIG_HOME".to_string(),
+        "-u".to_string(),
+        "XDG_CONFIG_DIRS".to_string(),
+        "-u".to_string(),
+        "XDG_DATA_HOME".to_string(),
+        "-u".to_string(),
+        "XDG_DATA_DIRS".to_string(),
+    ];
+    wrapped.extend(attach_prefix.iter().cloned());
+    wrapped
 }
 
 fn spawn_local_terminal_with_args(
@@ -825,16 +1051,24 @@ fn spawn_local_terminal_with_args(
     initial_mode: InitialTabMode,
     preferred_terminal: Option<&str>,
 ) -> Result<std::process::Child> {
-    let exe = std::env::current_exe().context("failed to locate remotewayland-client binary")?;
+    let fp_id = flatpak_app_id();
+    let is_flatpak = fp_id.is_some();
+    let attach_prefix = client_attach_prefix(fp_id.as_deref())?;
     let env_term = std::env::var("TERMINAL").ok();
-    let candidates = resolve_terminal_candidates(preferred_terminal, env_term.as_deref())?;
+    let all_candidates = resolve_terminal_candidates(preferred_terminal, env_term.as_deref())?;
+    let candidates = if is_flatpak {
+        host_existing_executables(&all_candidates)
+    } else {
+        all_candidates
+            .into_iter()
+            .filter(|term| executable_exists(term))
+            .collect()
+    };
     let mut last_err: Option<(String, std::io::Error)> = None;
 
     for term in candidates {
-        if !executable_exists(&term) {
-            continue;
-        }
-        let mut proc = Command::new(&term);
+        let mut env_overrides: Vec<(String, String)> = Vec::new();
+        let mut term_args: Vec<String> = Vec::new();
         let base = terminal_basename(&term);
         match base {
             "konsole" => {
@@ -842,16 +1076,26 @@ fn spawn_local_terminal_with_args(
                     // Scope XDG_CONFIG_HOME / XDG_DATA_HOME to this `--separate` Konsole
                     // instance so New Tab defaults to a remote PTY while `pty-attach` talks
                     // only over `--socket` and never leaks these vars to the remote shell.
-                    match prepare_konsole_remote_profile(&exe, sock) {
+                    let konsole_prefix = konsole_overlay_attach_prefix(&attach_prefix, is_flatpak);
+                    match prepare_konsole_remote_profile(&konsole_prefix, sock, is_flatpak) {
                         Ok(overlay) => {
-                            proc.env("XDG_CONFIG_HOME", &overlay.config_home)
-                                .env("XDG_CONFIG_DIRS", &overlay.config_dirs)
-                                .env("XDG_DATA_HOME", &overlay.data_home)
-                                .env("XDG_DATA_DIRS", &overlay.data_dirs)
-                                .arg("--separate")
-                                .args(["--profile", "RemoteWayland"]);
+                            env_overrides.push((
+                                "XDG_CONFIG_HOME".to_string(),
+                                overlay.config_home.to_string_lossy().into_owned(),
+                            ));
+                            env_overrides.push(("XDG_CONFIG_DIRS".to_string(), overlay.config_dirs));
+                            env_overrides.push((
+                                "XDG_DATA_HOME".to_string(),
+                                overlay.data_home.to_string_lossy().into_owned(),
+                            ));
+                            env_overrides.push(("XDG_DATA_DIRS".to_string(), overlay.data_dirs));
+                            term_args.push("--separate".to_string());
+                            term_args.push("--profile".to_string());
+                            term_args.push("RemoteWayland".to_string());
                             if initial_mode == InitialTabMode::CustomCommand {
-                                proc.arg("-e").arg(&exe).args(attach_args);
+                                term_args.push("-e".to_string());
+                                term_args.extend(konsole_prefix.iter().cloned());
+                                term_args.extend(attach_args.iter().cloned());
                             }
                         }
                         Err(err) => {
@@ -859,23 +1103,52 @@ fn spawn_local_terminal_with_args(
                                 error = %err,
                                 "failed to prepare Konsole remote profile overlay; falling back to -e"
                             );
-                            proc.arg("-e").arg(&exe).args(attach_args);
+                            term_args.push("-e".to_string());
+                            term_args.extend(attach_prefix.iter().cloned());
+                            term_args.extend(attach_args.iter().cloned());
                         }
                     }
                 } else {
-                    proc.arg("-e").arg(&exe).args(attach_args);
+                    term_args.push("-e".to_string());
+                    term_args.extend(attach_prefix.iter().cloned());
+                    term_args.extend(attach_args.iter().cloned());
                 }
             }
             "gnome-terminal" => {
-                proc.arg("--").arg(&exe).args(attach_args);
+                term_args.push("--".to_string());
+                term_args.extend(attach_prefix.iter().cloned());
+                term_args.extend(attach_args.iter().cloned());
             }
             "wezterm" => {
-                proc.arg("start").arg("--").arg(&exe).args(attach_args);
+                term_args.push("start".to_string());
+                term_args.push("--".to_string());
+                term_args.extend(attach_prefix.iter().cloned());
+                term_args.extend(attach_args.iter().cloned());
             }
             _ => {
-                proc.arg("-e").arg(&exe).args(attach_args);
+                term_args.push("-e".to_string());
+                term_args.extend(attach_prefix.iter().cloned());
+                term_args.extend(attach_args.iter().cloned());
             }
         }
+
+        let mut proc = if is_flatpak {
+            let mut cmd = Command::new("flatpak-spawn");
+            cmd.arg("--host");
+            for (k, v) in &env_overrides {
+                cmd.arg(format!("--env={k}={v}"));
+            }
+            cmd.arg("--").arg(&term).args(&term_args);
+            cmd
+        } else {
+            let mut cmd = Command::new(&term);
+            for (k, v) in &env_overrides {
+                cmd.env(k, v);
+            }
+            cmd.args(&term_args);
+            cmd
+        };
+
         match proc.spawn() {
             Ok(child) => return Ok(child),
             Err(err) => last_err = Some((term, err)),
@@ -1000,9 +1273,9 @@ mod tests {
         };
 
         let sock = dir.join("pty-test.sock");
-        let exe = Path::new("/usr/local/bin/remotewayland-client");
+        let exe = vec!["/usr/local/bin/remotewayland-client".to_string()];
 
-        let overlay = prepare_konsole_remote_profile_with_env(exe, &sock, &env).unwrap();
+        let overlay = prepare_konsole_remote_profile_with_env(&exe, &sock, &env, false).unwrap();
         assert_eq!(
             overlay.config_dirs,
             format!("{}:/etc/xdg", fake_cfg.display())
@@ -1084,6 +1357,103 @@ mod tests {
             None
         ));
         assert!(executable_exists_in_path(exec.to_str().unwrap(), None));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_flatpak_info_app_id_reads_application_name_and_validates() {
+        let sample = "\
+[Application]
+name=dev.knoll.Oriel
+runtime=runtime/org.kde.Platform/x86_64/6.11
+
+[Instance]
+name=other
+";
+        assert_eq!(
+            parse_flatpak_info_app_id(sample).as_deref(),
+            Some("dev.knoll.Oriel")
+        );
+        assert_eq!(
+            parse_flatpak_info_app_id("[Application]\nname=../evil\n"),
+            None
+        );
+        assert_eq!(
+            parse_flatpak_info_app_id("[Instance]\nname=dev.knoll.Oriel\n"),
+            None
+        );
+        assert!(is_valid_flatpak_app_id("dev.knoll.Oriel"));
+        assert!(!is_valid_flatpak_app_id("."));
+        assert!(!is_valid_flatpak_app_id(".."));
+        assert!(!is_valid_flatpak_app_id("--flag"));
+        assert!(!is_valid_flatpak_app_id("no_dot_id"));
+        assert!(!is_valid_flatpak_app_id(".leading.dot"));
+        assert!(!is_valid_flatpak_app_id("trailing.dot."));
+    }
+
+    #[test]
+    fn pty_tunnel_socket_path_uses_shared_flatpak_app_dir() {
+        let dir = std::env::temp_dir().join(format!("rw-fp-sock-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let native = pty_tunnel_socket_path_with(&dir, None, "user@host").unwrap();
+        assert_eq!(native, dir.join("remotewayland/pty-user_host.sock"));
+
+        let fp = pty_tunnel_socket_path_with(&dir, Some("dev.knoll.Oriel"), "user@host").unwrap();
+        assert_eq!(
+            fp,
+            dir.join("app/dev.knoll.Oriel/remotewayland/pty-user_host.sock")
+        );
+
+        assert!(pty_tunnel_socket_path_with(&dir, Some("../bad"), "user@host").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flatpak_konsole_profile_uses_flatpak_run_and_host_xdg_dirs() {
+        let dir = std::env::temp_dir().join(format!("rw-fp-konsole-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let env = XdgEnv {
+            home: Some(PathBuf::from("/home/alice")),
+            config_home: Some(PathBuf::from("/home/alice/.var/app/dev.knoll.Oriel/config")),
+            config_dirs: Some(OsString::from("/app/etc/xdg:/etc/xdg")),
+            data_home: Some(PathBuf::from("/home/alice/.var/app/dev.knoll.Oriel/data")),
+            data_dirs: Some(OsString::from("/app/share:/usr/share")),
+        };
+
+        let sock = dir.join("pty-host.sock");
+        let prefix = client_attach_prefix(Some("dev.knoll.Oriel")).unwrap();
+        assert_eq!(
+            prefix,
+            vec![
+                "flatpak",
+                "run",
+                "--command=remotewayland-client",
+                "dev.knoll.Oriel"
+            ]
+        );
+
+        let konsole_prefix = konsole_overlay_attach_prefix(&prefix, true);
+        let overlay =
+            prepare_konsole_remote_profile_with_env(&konsole_prefix, &sock, &env, true).unwrap();
+        assert_eq!(overlay.config_dirs, "/home/alice/.config:/etc/xdg");
+        assert_eq!(
+            overlay.data_dirs,
+            "/home/alice/.local/share:/usr/local/share:/usr/share"
+        );
+
+        let profile = fs::read_to_string(
+            overlay.data_home.join("konsole").join("RemoteWayland.profile"),
+        )
+        .unwrap();
+        assert!(profile.contains(&format!(
+            "Command=env -u XDG_CONFIG_HOME -u XDG_CONFIG_DIRS -u XDG_DATA_HOME -u XDG_DATA_DIRS flatpak run --command=remotewayland-client dev.knoll.Oriel pty-attach --socket {}",
+            sock.display()
+        )));
 
         let _ = fs::remove_dir_all(&dir);
     }

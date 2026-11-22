@@ -22,6 +22,8 @@ finish-args:
   - --filesystem=~/.ssh:ro
   # Color scheme / settings portal
   - --talk-name=org.freedesktop.portal.Desktop
+  # Spawn local host terminal emulators for remote PTY sessions
+  - --talk-name=org.freedesktop.Flatpak
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin
