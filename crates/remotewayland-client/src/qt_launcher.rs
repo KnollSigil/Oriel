@@ -17,7 +17,10 @@ use qtbridge::{qobject, QApp, QListModel, QListModelBase, QModelItem, QThreadHan
 use remotewayland_proto::{ControlMessage, LaunchState, RemoteAppEntry, PTY_LAUNCH_ID_BASE};
 use tokio::sync::mpsc;
 
-use crate::hosts::{load_hosts, parse_uri, save_hosts, ssh_bootstrap, HostProfile};
+use crate::hosts::{
+    load_client_settings, load_hosts, parse_uri, save_client_settings, save_hosts, ssh_bootstrap,
+    ClientSettings, HostProfile, RenderScaleCap,
+};
 use crate::pty::{
     available_local_terminals, pty_tunnel_socket_path, spawn_local_terminal_pty_socket,
     spawn_local_terminal_pty_socket_with_terminal, terminal_basename,
@@ -192,6 +195,7 @@ pub struct HostItem {
     pub port: i32,
     pub server_bin: String,
     pub audio_enabled: bool,
+    pub max_scale_index: i32,
 }
 define_list_model!(HostListModel, HostItem, key = ssh_target);
 
@@ -254,10 +258,13 @@ pub struct LauncherBackend {
     program_count: i32,
     mic_summary: String,
     selected_mic_index: i32,
+    global_max_scale_index: i32,
 
     // Internal Rust state
     hosts: Vec<HostProfile>,
     sessions: HashMap<String, HostSession>,
+    global_max_scale: RenderScaleCap,
+    cli_max_scale: Option<RenderScaleCap>,
     next_launch_id: u64,
     next_attempt_id: u64,
     grid_apps: Vec<RemoteAppEntry>,
@@ -294,6 +301,7 @@ impl LauncherBackend {
     qproperty!("programCount", Member = program_count, Notify = state_changed);
     qproperty!("micSummary", Member = mic_summary, Notify = mic_changed);
     qproperty!("selectedMicIndex", Member = selected_mic_index, Notify = mic_changed);
+    qproperty!("globalMaxScaleIndex", Member = global_max_scale_index, Notify = scale_changed);
 
     #[qsignal]
     fn state_changed(&mut self);
@@ -306,6 +314,9 @@ impl LauncherBackend {
 
     #[qsignal]
     fn mic_changed(&mut self);
+
+    #[qsignal]
+    fn scale_changed(&mut self);
 
     #[qslot]
     fn select_host(&mut self, ssh_target: String) {
@@ -373,6 +384,7 @@ impl LauncherBackend {
         server_bin: String,
         port: i32,
         audio_enabled: bool,
+        max_scale_index: i32,
     ) {
         let new_target = ssh_target.trim().to_string();
         if new_target.is_empty() {
@@ -381,6 +393,8 @@ impl LauncherBackend {
         if !old_target.is_empty() && old_target != new_target {
             self.teardown_session(&old_target, true);
         }
+        let max_scale =
+            RenderScaleCap::option_from_index(usize::try_from(max_scale_index).unwrap_or(0));
         let changed = upsert_host_profile(
             &mut self.hosts,
             &mut self.active_target,
@@ -390,13 +404,35 @@ impl LauncherBackend {
             &server_bin,
             port,
             audio_enabled,
+            max_scale,
         );
         if changed {
             if let Err(err) = save_hosts(&self.hosts) {
                 tracing::warn!(error = %err, "failed to save hosts.json");
             }
+            if let Some(sess) = self.sessions.get(&new_target) {
+                if let Some(ui_tx) = &sess.ui_tx {
+                    let cap = self.effective_max_scale(max_scale);
+                    let _ = ui_tx.send(ClientUiEvent::SetMaxScale { cap });
+                }
+            }
             self.rebuild_app_grid_from_active();
             self.sync_all_views();
+        }
+    }
+
+    #[qslot]
+    fn select_global_max_scale(&mut self, index: i32) {
+        let idx = usize::try_from(index).unwrap_or(0);
+        let cap = RenderScaleCap::from_index(idx);
+        if self.global_max_scale != cap {
+            self.global_max_scale = cap;
+            self.global_max_scale_index = cap.to_index() as i32;
+            if let Err(err) = save_client_settings(&ClientSettings { max_scale: cap }) {
+                tracing::warn!(error = %err, "failed to save settings.json");
+            }
+            self.broadcast_max_scale();
+            self.scale_changed();
         }
     }
 
@@ -569,6 +605,7 @@ impl LauncherBackend {
     fn initialize(
         &mut self,
         qt_handle: Arc<QThreadHandle<LauncherBackend>>,
+        cli_max_scale: Option<RenderScaleCap>,
         hosts_model: Rc<RefCell<HostListModel>>,
         apps_model: Rc<RefCell<AppGridModel>>,
         programs_model: Rc<RefCell<ProgramListModel>>,
@@ -576,6 +613,9 @@ impl LauncherBackend {
         terminals_model: Rc<RefCell<TerminalListModel>>,
     ) {
         self.qt_handle = Some(qt_handle);
+        self.cli_max_scale = cli_max_scale;
+        self.global_max_scale = load_client_settings().max_scale;
+        self.global_max_scale_index = self.global_max_scale.to_index() as i32;
         self.hosts_model = hosts_model;
         self.apps_model = apps_model;
         self.programs_model = programs_model;
@@ -609,7 +649,25 @@ impl LauncherBackend {
         self.terminals_model.borrow_mut().replace_all(terms);
 
         self.rebuild_mics_model();
+        self.scale_changed();
         self.sync_all_views();
+    }
+
+    fn effective_max_scale(&self, host_override: Option<RenderScaleCap>) -> RenderScaleCap {
+        self.cli_max_scale
+            .or(host_override)
+            .unwrap_or(self.global_max_scale)
+    }
+
+    fn broadcast_max_scale(&self) {
+        for host in &self.hosts {
+            if let Some(sess) = self.sessions.get(&host.ssh_target) {
+                if let Some(ui_tx) = &sess.ui_tx {
+                    let cap = self.effective_max_scale(host.max_scale);
+                    let _ = ui_tx.send(ClientUiEvent::SetMaxScale { cap });
+                }
+            }
+        }
     }
 
     fn disconnect_all(&mut self) {
@@ -780,6 +838,7 @@ impl LauncherBackend {
             },
         );
 
+        let effective_max_scale = self.effective_max_scale(profile.max_scale);
         let target_bg = target.clone();
         let handle_done = Arc::clone(&qt_handle);
         std::thread::spawn(move || {
@@ -834,6 +893,7 @@ impl LauncherBackend {
                         fp,
                         token,
                         profile.audio_enabled,
+                        1.0,
                         ui_tx_net.clone(),
                         ctrl_rx,
                         Some(net_tx.clone()),
@@ -850,7 +910,7 @@ impl LauncherBackend {
                 std::thread::Builder::new()
                     .name("rw-wayland-ui".into())
                     .spawn(move || {
-                        let _ = window::run_event_loop(ui_rx, ctrl_tx_ui);
+                        let _ = window::run_event_loop(ui_rx, ctrl_tx_ui, effective_max_scale);
                     })
                     .map_err(|e| format!("failed to spawn Wayland UI thread: {e}"))?;
 
@@ -1165,6 +1225,7 @@ impl LauncherBackend {
                     port: i32::from(h.port),
                     server_bin: h.server_bin.clone().unwrap_or_default(),
                     audio_enabled: h.audio_enabled,
+                    max_scale_index: RenderScaleCap::option_to_index(h.max_scale) as i32,
                 }
             })
             .collect()
@@ -1300,6 +1361,7 @@ fn upsert_host_profile(
     server_bin: &str,
     port: i32,
     audio_enabled: bool,
+    max_scale: Option<RenderScaleCap>,
 ) -> bool {
     let ssh_target = ssh_target.trim().to_string();
     if ssh_target.is_empty() {
@@ -1332,6 +1394,7 @@ fn upsert_host_profile(
         server_bin,
         port,
         audio_enabled,
+        max_scale,
     };
 
     if !old_target.is_empty() {
@@ -1414,7 +1477,7 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-pub fn run() -> Result<()> {
+pub fn run(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
     // Prefer KDE's native desktop style on Plasma if the user hasn't explicitly overridden it.
     if std::env::var_os("QT_QUICK_CONTROLS_STYLE").is_none()
         && std::env::var("XDG_CURRENT_DESKTOP")
@@ -1437,6 +1500,7 @@ pub fn run() -> Result<()> {
 
     backend.borrow_mut().initialize(
         qt_handle,
+        cli_max_scale,
         Rc::clone(&hosts_model),
         Rc::clone(&apps_model),
         Rc::clone(&programs_model),
@@ -1515,10 +1579,10 @@ mod tests {
         let mut active = String::new();
 
         assert!(!upsert_host_profile(
-            &mut hosts, &mut active, "", "Box", "   ", "", 7443, true
+            &mut hosts, &mut active, "", "Box", "   ", "", 7443, true, None
         ));
         assert!(upsert_host_profile(
-            &mut hosts, &mut active, "", "", "alice@host1", "  ", 0, true
+            &mut hosts, &mut active, "", "", "alice@host1", "  ", 0, true, None
         ));
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].label, "alice@host1");
@@ -1526,9 +1590,18 @@ mod tests {
         assert_eq!(active, "alice@host1");
 
         assert!(upsert_host_profile(
-            &mut hosts, &mut active, "", "Box 2", "bob@host2", "/opt/rw", 9000, false
+            &mut hosts,
+            &mut active,
+            "",
+            "Box 2",
+            "bob@host2",
+            "/opt/rw",
+            9000,
+            false,
+            Some(RenderScaleCap::Scale150),
         ));
         assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[1].max_scale, Some(RenderScaleCap::Scale150));
 
         // Renaming host1 onto host2 deduplicates instead of creating two bob@host2 entries.
         assert!(upsert_host_profile(
@@ -1539,12 +1612,14 @@ mod tests {
             "bob@host2",
             "",
             8443,
-            true
+            true,
+            Some(RenderScaleCap::Scale200),
         ));
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].label, "Merged");
         assert_eq!(hosts[0].ssh_target, "bob@host2");
         assert_eq!(hosts[0].port, 8443);
+        assert_eq!(hosts[0].max_scale, Some(RenderScaleCap::Scale200));
         assert_eq!(active, "bob@host2");
 
         assert!(remove_host_profile(&mut hosts, &mut active, "bob@host2"));

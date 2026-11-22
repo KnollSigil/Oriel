@@ -64,9 +64,17 @@ use wayland_client::{
     },
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::{self, WpFractionalScaleManagerV1},
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
     zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::{self, WpViewport},
+    wp_viewporter::{self, WpViewporter},
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
@@ -77,6 +85,7 @@ use wayland_protocols::xdg::toplevel_icon::v1::client::{
     xdg_toplevel_icon_v1::XdgToplevelIconV1,
 };
 
+use crate::hosts::RenderScaleCap;
 use crate::icon::{decode_icon_argb8888, match_app_icon, AppIconEntry};
 
 /// Events sent from the QUIC/GStreamer receiver tasks to the Wayland UI thread.
@@ -108,6 +117,8 @@ pub enum ClientUiEvent {
         window_id: WindowId,
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         bgra: Vec<u8>,
     },
     StartMove {
@@ -153,6 +164,8 @@ pub enum ClientUiEvent {
         window_id: WindowId,
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         hotspot_x: i32,
         hotspot_y: i32,
         bgra: Vec<u8>,
@@ -166,6 +179,9 @@ pub enum ClientUiEvent {
     AppIconsUpdated {
         entries: Vec<AppIconEntry>,
     },
+    SetMaxScale {
+        cap: RenderScaleCap,
+    },
     Disconnected,
 }
 
@@ -176,6 +192,8 @@ enum ActiveCursor {
     Bitmap {
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         hotspot_x: i32,
         hotspot_y: i32,
         bgra: Vec<u8>,
@@ -185,6 +203,8 @@ enum ActiveCursor {
 struct LatestDecodedFrame {
     width: u32,
     height: u32,
+    logical_width: u32,
+    logical_height: u32,
     bgra: Vec<u8>,
 }
 
@@ -204,11 +224,28 @@ impl UiSender {
         self.tx.send(event)
     }
 
-    pub fn push_frame(&self, window_id: WindowId, width: u32, height: u32, bgra: Vec<u8>) {
+    pub fn push_frame(
+        &self,
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+        logical_width: u32,
+        logical_height: u32,
+        bgra: Vec<u8>,
+    ) {
         let should_notify = {
             let mut map = self.latest_frames.lock().unwrap();
-            map.insert(window_id, LatestDecodedFrame { width, height, bgra })
-                .is_none()
+            map.insert(
+                window_id,
+                LatestDecodedFrame {
+                    width,
+                    height,
+                    logical_width,
+                    logical_height,
+                    bgra,
+                },
+            )
+            .is_none()
         };
         if should_notify {
             let _ = self.tx.send(ClientUiEvent::FrameReady { window_id });
@@ -236,8 +273,21 @@ impl Drop for AppliedWindowIcon {
     }
 }
 
+struct PendingFrame {
+    width: u32,
+    height: u32,
+    logical_width: u32,
+    logical_height: u32,
+    bgra: Vec<u8>,
+}
+
 struct RemoteWindow {
     window: Window,
+    viewport: Option<WpViewport>,
+    fractional_scale: Option<WpFractionalScaleV1>,
+    raw_scale: f64,
+    effective_scale: f64,
+    has_fractional_scale: bool,
     app_id: String,
     applied_icon: Option<AppliedWindowIcon>,
     has_pixel_icon: bool,
@@ -248,15 +298,35 @@ struct RemoteWindow {
     fullscreen: bool,
     activated: bool,
     tiled: bool,
-    pending_frame: Option<(u32, u32, Vec<u8>)>,
+    pending_frame: Option<PendingFrame>,
     pending_resize_prev: Option<((u32, u32), Instant)>,
+}
+
+impl Drop for RemoteWindow {
+    fn drop(&mut self) {
+        if let Some(fs) = self.fractional_scale.take() {
+            fs.destroy();
+        }
+        if let Some(vp) = self.viewport.take() {
+            vp.destroy();
+        }
+    }
 }
 
 struct RemotePopup {
     popup: Popup,
+    viewport: Option<WpViewport>,
     configured: bool,
-    pending_frame: Option<(u32, u32, Vec<u8>)>,
+    pending_frame: Option<PendingFrame>,
     next_token: u32,
+}
+
+impl Drop for RemotePopup {
+    fn drop(&mut self) {
+        if let Some(vp) = self.viewport.take() {
+            vp.destroy();
+        }
+    }
 }
 
 struct ClientApp {
@@ -269,6 +339,10 @@ struct ClientApp {
     data_device_manager_state: Option<DataDeviceManagerState>,
     primary_selection_manager_state: Option<PrimarySelectionManagerState>,
     toplevel_icon_manager: Option<XdgToplevelIconManagerV1>,
+    fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
+    viewporter: Option<WpViewporter>,
+    max_scale: RenderScaleCap,
+    last_sent_display_scale: f64,
     pool: SlotPool,
     icon_pool: SlotPool,
     app_icons: Vec<AppIconEntry>,
@@ -280,6 +354,7 @@ struct ClientApp {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     themed_pointer: Option<ThemedPointer>,
     custom_cursor_surface: Option<wl_surface::WlSurface>,
+    custom_cursor_viewport: Option<WpViewport>,
     data_device: Option<DataDevice>,
     copy_paste_source: Option<CopyPasteSource>,
     primary_selection_device: Option<PrimarySelectionDevice>,
@@ -319,12 +394,16 @@ impl ClientApp {
             ActiveCursor::Bitmap {
                 width,
                 height,
+                logical_width,
+                logical_height,
                 hotspot_x,
                 hotspot_y,
                 bgra,
             } => {
                 let w = *width;
                 let h = *height;
+                let lw = (*logical_width).max(1);
+                let lh = (*logical_height).max(1);
                 let byte_len = w
                     .checked_mul(h)
                     .and_then(|px| px.checked_mul(4))
@@ -346,6 +425,12 @@ impl ClientApp {
                     .custom_cursor_surface
                     .get_or_insert_with(|| self.compositor_state.create_surface(&self.qh))
                     .clone();
+                if self.custom_cursor_viewport.is_none() {
+                    if let Some(vp_mgr) = &self.viewporter {
+                        self.custom_cursor_viewport =
+                            Some(vp_mgr.get_viewport(&surf, &self.qh, ()));
+                    }
+                }
                 let stride = (w * 4) as i32;
                 if let Ok((buffer, canvas)) = self.pool.create_buffer(
                     w as i32,
@@ -354,6 +439,14 @@ impl ClientApp {
                     wl_shm::Format::Argb8888,
                 ) {
                     canvas[..byte_len].copy_from_slice(&bgra[..byte_len]);
+                    if let Some(vp) = &self.custom_cursor_viewport {
+                        surf.set_buffer_scale(1);
+                        vp.set_destination(lw as i32, lh as i32);
+                    } else if w % lw == 0 && h % lh == 0 && (w / lw) == (h / lh) {
+                        surf.set_buffer_scale((w / lw).max(1) as i32);
+                    } else {
+                        surf.set_buffer_scale(1);
+                    }
                     tp.pointer().set_cursor(
                         self.last_pointer_enter_serial,
                         Some(&surf),
@@ -486,6 +579,16 @@ impl ClientApp {
                 }
                 let wl_surf = self.compositor_state.create_surface(&self.qh);
                 let surf_id = wl_surf.id().protocol_id();
+                let viewport = self
+                    .viewporter
+                    .as_ref()
+                    .map(|vp| vp.get_viewport(&wl_surf, &self.qh, ()));
+                let fractional_scale = self
+                    .fractional_scale_manager
+                    .as_ref()
+                    .map(|fsm| fsm.get_fractional_scale(&wl_surf, &self.qh, window_id));
+                let initial_raw = self.current_max_output_scale();
+                let initial_effective = self.max_scale.apply(initial_raw);
                 let window = self.xdg_shell.create_window(
                     wl_surf,
                     WindowDecorations::RequestClient,
@@ -506,6 +609,11 @@ impl ClientApp {
                     window_id,
                     RemoteWindow {
                         window,
+                        viewport,
+                        fractional_scale,
+                        raw_scale: initial_raw,
+                        effective_scale: initial_effective,
+                        has_fractional_scale: false,
                         app_id,
                         applied_icon: None,
                         has_pixel_icon: false,
@@ -578,11 +686,16 @@ impl ClientApp {
                 ) {
                     Ok(popup) => {
                         let surf_id = popup.wl_surface().id().protocol_id();
+                        let viewport = self
+                            .viewporter
+                            .as_ref()
+                            .map(|vp| vp.get_viewport(popup.wl_surface(), &self.qh, ()));
                         self.surface_to_remote.insert(surf_id, window_id);
                         self.popups.insert(
                             window_id,
                             RemotePopup {
                                 popup,
+                                viewport,
                                 configured: false,
                                 pending_frame: None,
                                 next_token: 1,
@@ -622,18 +735,29 @@ impl ClientApp {
                 window_id,
                 width,
                 height,
+                logical_width,
+                logical_height,
                 bgra,
             } => {
                 if let Some(rp) = self.popups.get_mut(&window_id) {
                     if !rp.configured {
-                        rp.pending_frame = Some((width, height, bgra));
+                        rp.pending_frame = Some(PendingFrame {
+                            width,
+                            height,
+                            logical_width,
+                            logical_height,
+                            bgra,
+                        });
                     } else {
                         let surf = rp.popup.wl_surface().clone();
                         draw_shm_surface(
                             &mut self.pool,
                             &surf,
+                            rp.viewport.as_ref(),
                             width,
                             height,
+                            logical_width,
+                            logical_height,
                             &bgra,
                             wl_shm::Format::Argb8888,
                         );
@@ -721,6 +845,8 @@ impl ClientApp {
                 let Some(LatestDecodedFrame {
                     width,
                     height,
+                    logical_width,
+                    logical_height,
                     bgra,
                 }) = self.latest_frames.lock().unwrap().remove(&window_id)
                 else {
@@ -728,11 +854,19 @@ impl ClientApp {
                 };
                 if let Some(win) = self.windows.get_mut(&window_id) {
                     if !win.configured {
-                        win.pending_frame = Some((width, height, bgra));
+                        win.pending_frame = Some(PendingFrame {
+                            width,
+                            height,
+                            logical_width,
+                            logical_height,
+                            bgra,
+                        });
                     } else {
+                        let lw = logical_width.max(1);
+                        let lh = logical_height.max(1);
                         if let Some((prev_size, since)) = win.pending_resize_prev {
-                            if (width, height) == prev_size
-                                && (width, height) != (win.width, win.height)
+                            if (lw, lh) == prev_size
+                                && (lw, lh) != (win.width, win.height)
                                 && since.elapsed() < Duration::from_millis(250)
                             {
                                 return;
@@ -741,13 +875,16 @@ impl ClientApp {
                         }
                         win.window
                             .xdg_surface()
-                            .set_window_geometry(0, 0, width as i32, height as i32);
+                            .set_window_geometry(0, 0, lw as i32, lh as i32);
                         let surf = win.window.wl_surface().clone();
                         draw_shm_surface(
                             &mut self.pool,
                             &surf,
+                            win.viewport.as_ref(),
                             width,
                             height,
+                            lw,
+                            lh,
                             &bgra,
                             wl_shm::Format::Argb8888,
                         );
@@ -775,6 +912,8 @@ impl ClientApp {
                 window_id,
                 width,
                 height,
+                logical_width,
+                logical_height,
                 hotspot_x,
                 hotspot_y,
                 bgra,
@@ -783,6 +922,8 @@ impl ClientApp {
                     self.last_cursor = ActiveCursor::Bitmap {
                         width,
                         height,
+                        logical_width,
+                        logical_height,
                         hotspot_x,
                         hotspot_y,
                         bgra,
@@ -836,12 +977,106 @@ impl ClientApp {
                     self.apply_window_icon(window_id, true);
                 }
             }
+            ClientUiEvent::SetMaxScale { cap } => {
+                if self.max_scale != cap {
+                    self.max_scale = cap;
+                    self.reapply_scale_cap();
+                }
+            }
             ClientUiEvent::Disconnected => {
                 debug!("server disconnected; exiting Wayland client loop");
                 self.exit = true;
             }
         }
         let _ = self.conn.flush();
+    }
+
+    fn current_max_output_scale(&self) -> f64 {
+        self.output_state
+            .outputs()
+            .filter_map(|o| self.output_state.info(&o))
+            .map(|info| info.scale_factor.max(1) as f64)
+            .fold(1.0, f64::max)
+    }
+
+    fn maybe_send_display_scale(&mut self) {
+        let raw_max = self
+            .windows
+            .values()
+            .map(|w| w.raw_scale)
+            .fold(self.current_max_output_scale(), f64::max);
+        let effective = self.max_scale.apply(raw_max);
+        if (effective - self.last_sent_display_scale).abs() > 0.005 {
+            self.last_sent_display_scale = effective;
+            debug!(scale_factor = effective, "sending DisplayScale to server");
+            let _ = self.ctrl_tx.send(ControlMessage::DisplayScale {
+                scale_factor: effective,
+            });
+        }
+    }
+
+    fn update_window_scale(&mut self, window_id: WindowId, raw_scale: f64, from_fractional: bool) {
+        let Some(win) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if !from_fractional && win.has_fractional_scale {
+            return;
+        }
+        if from_fractional {
+            win.has_fractional_scale = true;
+        }
+        win.raw_scale = raw_scale.max(1.0);
+        let new_effective = self.max_scale.apply(win.raw_scale);
+        if (new_effective - win.effective_scale).abs() > 0.005 {
+            win.effective_scale = new_effective;
+            if win.configured {
+                debug!(
+                    window_id,
+                    raw_scale = win.raw_scale,
+                    effective_scale = new_effective,
+                    "window scale changed -> WindowConfigured"
+                );
+                let _ = self.ctrl_tx.send(ControlMessage::WindowConfigured {
+                    window_id,
+                    width: win.width,
+                    height: win.height,
+                    scale_factor: new_effective,
+                    maximized: win.maximized,
+                    fullscreen: win.fullscreen,
+                    activated: win.activated,
+                    tiled: win.tiled,
+                });
+            }
+        }
+        self.maybe_send_display_scale();
+    }
+
+    fn reapply_scale_cap(&mut self) {
+        let cap = self.max_scale;
+        for (&window_id, win) in &mut self.windows {
+            let new_effective = cap.apply(win.raw_scale);
+            if (new_effective - win.effective_scale).abs() > 0.005 {
+                win.effective_scale = new_effective;
+                if win.configured {
+                    debug!(
+                        window_id,
+                        effective_scale = new_effective,
+                        "scale cap changed -> WindowConfigured"
+                    );
+                    let _ = self.ctrl_tx.send(ControlMessage::WindowConfigured {
+                        window_id,
+                        width: win.width,
+                        height: win.height,
+                        scale_factor: new_effective,
+                        maximized: win.maximized,
+                        fullscreen: win.fullscreen,
+                        activated: win.activated,
+                        tiled: win.tiled,
+                    });
+                }
+            }
+        }
+        self.maybe_send_display_scale();
     }
 }
 
@@ -875,14 +1110,19 @@ fn border_resize_edge(
 fn draw_shm_surface(
     pool: &mut SlotPool,
     surface: &wl_surface::WlSurface,
+    viewport: Option<&WpViewport>,
     width: u32,
     height: u32,
+    logical_width: u32,
+    logical_height: u32,
     bgra: &[u8],
     format: wl_shm::Format,
 ) {
     if width == 0 || height == 0 {
         return;
     }
+    let lw = logical_width.max(1);
+    let lh = logical_height.max(1);
     let stride = (width * 4) as i32;
     let needed = (width * height * 4) as usize;
     if bgra.len() < needed {
@@ -890,6 +1130,14 @@ fn draw_shm_surface(
     }
     if let Ok((buffer, canvas)) = pool.create_buffer(width as i32, height as i32, stride, format) {
         canvas[..needed].copy_from_slice(&bgra[..needed]);
+        if let Some(vp) = viewport {
+            surface.set_buffer_scale(1);
+            vp.set_destination(lw as i32, lh as i32);
+        } else if width % lw == 0 && height % lh == 0 && (width / lw) == (height / lh) {
+            surface.set_buffer_scale((width / lw).max(1) as i32);
+        } else {
+            surface.set_buffer_scale(1);
+        }
         if buffer.attach_to(surface).is_ok() {
             surface.damage_buffer(0, 0, width as i32, height as i32);
             surface.commit();
@@ -902,9 +1150,13 @@ impl CompositorHandler for ClientApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        let surf_id = surface.id().protocol_id();
+        if let Some(&window_id) = self.surface_to_remote.get(&surf_id) {
+            self.update_window_scale(window_id, new_factor.max(1) as f64, false);
+        }
     }
 
     fn transform_changed(
@@ -948,9 +1200,15 @@ impl OutputHandler for ClientApp {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.maybe_send_display_scale();
+    }
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.maybe_send_display_scale();
+    }
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.maybe_send_display_scale();
+    }
 }
 
 impl WindowHandler for ClientApp {
@@ -1007,17 +1265,22 @@ impl WindowHandler for ClientApp {
             win.pending_resize_prev = Some((old_size, Instant::now()));
         }
 
-        if let Some((fw, fh, bgra)) = win.pending_frame.take() {
+        if let Some(frame) = win.pending_frame.take() {
+            let lw = frame.logical_width.max(1);
+            let lh = frame.logical_height.max(1);
             win.window
                 .xdg_surface()
-                .set_window_geometry(0, 0, fw as i32, fh as i32);
+                .set_window_geometry(0, 0, lw as i32, lh as i32);
             let surf = win.window.wl_surface().clone();
             draw_shm_surface(
                 &mut self.pool,
                 &surf,
-                fw,
-                fh,
-                &bgra,
+                win.viewport.as_ref(),
+                frame.width,
+                frame.height,
+                lw,
+                lh,
+                &frame.bgra,
                 wl_shm::Format::Argb8888,
             );
         } else if first {
@@ -1026,6 +1289,9 @@ impl WindowHandler for ClientApp {
             draw_shm_surface(
                 &mut self.pool,
                 &surf,
+                win.viewport.as_ref(),
+                new_w,
+                new_h,
                 new_w,
                 new_h,
                 &blank,
@@ -1033,11 +1299,13 @@ impl WindowHandler for ClientApp {
             );
         }
 
-        if state_changed {
+        let scale_factor = win.effective_scale;
+        if state_changed || first {
             debug!(
                 window_id,
                 new_w,
                 new_h,
+                scale_factor,
                 maximized,
                 fullscreen,
                 activated,
@@ -1048,7 +1316,7 @@ impl WindowHandler for ClientApp {
                 window_id,
                 width: new_w,
                 height: new_h,
-                scale_factor: 1.0,
+                scale_factor,
                 maximized,
                 fullscreen,
                 activated,
@@ -1074,14 +1342,17 @@ impl PopupHandler for ClientApp {
             return;
         };
         rp.configured = true;
-        if let Some((fw, fh, bgra)) = rp.pending_frame.take() {
+        if let Some(frame) = rp.pending_frame.take() {
             let surf = rp.popup.wl_surface().clone();
             draw_shm_surface(
                 &mut self.pool,
                 &surf,
-                fw,
-                fh,
-                &bgra,
+                rp.viewport.as_ref(),
+                frame.width,
+                frame.height,
+                frame.logical_width,
+                frame.logical_height,
+                &frame.bgra,
                 wl_shm::Format::Argb8888,
             );
         }
@@ -1712,6 +1983,58 @@ impl Dispatch<XdgToplevelIconV1, ()> for ClientApp {
     }
 }
 
+impl Dispatch<WpFractionalScaleManagerV1, ()> for ClientApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: wp_fractional_scale_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, WindowId> for ClientApp {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        window_id: &WindowId,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            let raw_scale = (scale as f64 / 120.0).max(1.0);
+            state.update_window_scale(*window_id, raw_scale, true);
+        }
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for ClientApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewporter,
+        _event: wp_viewporter::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpViewport, ()> for ClientApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewport,
+        _event: wp_viewport::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl ProvidesRegistryState for ClientApp {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -1749,6 +2072,7 @@ pub fn create_ui_channel() -> (UiSender, UiReceiver) {
 pub fn run_event_loop(
     ui_rx: UiReceiver,
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
+    max_scale: RenderScaleCap,
 ) -> Result<()> {
     let UiReceiver {
         rx: ui_rx,
@@ -1782,6 +2106,9 @@ pub fn run_event_loop(
     let data_device_manager_state = DataDeviceManagerState::bind(&globals, &qh).ok();
     let primary_selection_manager_state = PrimarySelectionManagerState::bind(&globals, &qh).ok();
     let toplevel_icon_manager: Option<XdgToplevelIconManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let fractional_scale_manager: Option<WpFractionalScaleManagerV1> =
+        globals.bind(&qh, 1..=1, ()).ok();
+    let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
     let pool = SlotPool::new(1920 * 1080 * 4, &shm).context("failed to create SlotPool")?;
     let icon_pool =
         SlotPool::new(128 * 128 * 4 * 4, &shm).context("failed to create icon SlotPool")?;
@@ -1796,6 +2123,10 @@ pub fn run_event_loop(
         data_device_manager_state,
         primary_selection_manager_state,
         toplevel_icon_manager,
+        fractional_scale_manager,
+        viewporter,
+        max_scale,
+        last_sent_display_scale: 0.0,
         pool,
         icon_pool,
         app_icons: Vec::new(),
@@ -1806,6 +2137,7 @@ pub fn run_event_loop(
         keyboard: None,
         themed_pointer: None,
         custom_cursor_surface: None,
+        custom_cursor_viewport: None,
         data_device: None,
         copy_paste_source: None,
         primary_selection_device: None,
@@ -1842,19 +2174,25 @@ mod tests {
     #[test]
     fn ui_sender_push_frame_coalesces_to_latest_without_duplicate_wakeups() {
         let (tx, rx) = create_ui_channel();
-        tx.push_frame(7, 2, 2, vec![1; 16]);
-        tx.push_frame(7, 2, 2, vec![2; 16]);
-        tx.push_frame(7, 4, 4, vec![3; 64]);
+        tx.push_frame(7, 4, 4, 2, 2, vec![1; 64]);
+        tx.push_frame(7, 4, 4, 2, 2, vec![2; 64]);
+        tx.push_frame(7, 8, 8, 4, 4, vec![3; 256]);
 
         // Only the newest frame should be stored in the 1-slot mailbox.
         let latest = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
-        assert_eq!((latest.width, latest.height), (4, 4));
+        assert_eq!(
+            (latest.width, latest.height, latest.logical_width, latest.logical_height),
+            (8, 8, 4, 4)
+        );
         assert_eq!(latest.bgra[0], 3);
 
         // Next push after removal re-arms the mailbox.
-        tx.push_frame(7, 1, 1, vec![9; 4]);
+        tx.push_frame(7, 2, 2, 1, 1, vec![9; 16]);
         let next = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
-        assert_eq!((next.width, next.height), (1, 1));
+        assert_eq!(
+            (next.width, next.height, next.logical_width, next.logical_height),
+            (2, 2, 1, 1)
+        );
         assert_eq!(next.bgra[0], 9);
     }
 }

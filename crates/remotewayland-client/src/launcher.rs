@@ -4,19 +4,21 @@
 
 use anyhow::Result;
 
+use crate::hosts::RenderScaleCap;
+
 #[cfg(feature = "qt")]
-pub fn run_launcher() -> Result<()> {
-    crate::qt_launcher::run()
+pub fn run_launcher(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
+    crate::qt_launcher::run(cli_max_scale)
 }
 
 #[cfg(all(feature = "gtk4", not(feature = "qt")))]
-pub fn run_launcher() -> Result<()> {
-    gtk4_ui::run()
+pub fn run_launcher(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
+    gtk4_ui::run(cli_max_scale)
 }
 
 #[cfg(all(not(feature = "gtk4"), not(feature = "qt")))]
-pub fn run_launcher() -> Result<()> {
-    cli_ui::run()
+pub fn run_launcher(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
+    cli_ui::run(cli_max_scale)
 }
 
 #[cfg(all(not(feature = "gtk4"), not(feature = "qt")))]
@@ -27,12 +29,16 @@ mod cli_ui {
     use remotewayland_proto::{ControlMessage, RemoteAppEntry};
     use tokio::sync::mpsc;
 
-    use crate::hosts::{load_hosts, parse_uri, save_hosts, ssh_bootstrap, HostProfile};
+    use crate::hosts::{
+        load_client_settings, load_hosts, parse_uri, save_hosts, ssh_bootstrap, HostProfile,
+        RenderScaleCap,
+    };
     use crate::pty::{pty_tunnel_socket_path, spawn_local_terminal_pty_socket};
     use crate::quic::{self, LauncherNetEvent};
     use crate::window::{self, ClientUiEvent};
 
-    pub fn run() -> Result<()> {
+    pub fn run(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
+        let global_max_scale = load_client_settings().max_scale;
         println!("RemoteWayland Launcher (built without `gtk4` feature; using interactive CLI)");
         let mut hosts = load_hosts();
 
@@ -66,6 +72,7 @@ mod cli_ui {
                     server_bin: None,
                     port: 7443,
                     audio_enabled: true,
+                    max_scale: None,
                 };
                 hosts.push(profile.clone());
                 let _ = save_hosts(&hosts);
@@ -86,6 +93,7 @@ mod cli_ui {
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         let (net_tx, mut net_rx) = mpsc::unbounded_channel::<LauncherNetEvent>();
 
+        let effective_max_scale = cli_max_scale.or(target.max_scale).unwrap_or(global_max_scale);
         let ui_tx_net = ui_tx.clone();
         let pty_sock_net = pty_sock.clone();
         std::thread::Builder::new()
@@ -101,6 +109,7 @@ mod cli_ui {
                         fp,
                         token,
                         target.audio_enabled,
+                        1.0,
                         ui_tx_net.clone(),
                         ctrl_rx,
                         Some(net_tx),
@@ -119,7 +128,9 @@ mod cli_ui {
             .spawn({
                 let ctrl_tx = ctrl_tx.clone();
                 move || {
-                    if let Err(err) = window::run_event_loop(ui_rx, ctrl_tx) {
+                    if let Err(err) =
+                        window::run_event_loop(ui_rx, ctrl_tx, effective_max_scale)
+                    {
                         tracing::error!(error = %err, "Wayland UI loop exited");
                     }
                 }
@@ -231,7 +242,10 @@ mod gtk4_ui {
     use remotewayland_proto::{ControlMessage, LaunchState, RemoteAppEntry, PTY_LAUNCH_ID_BASE};
     use tokio::sync::mpsc;
 
-    use crate::hosts::{load_hosts, parse_uri, save_hosts, ssh_bootstrap, HostProfile};
+    use crate::hosts::{
+        load_client_settings, load_hosts, parse_uri, save_client_settings, save_hosts,
+        ssh_bootstrap, ClientSettings, HostProfile, RenderScaleCap,
+    };
     use crate::pty::{
         available_local_terminals, pty_tunnel_socket_path, spawn_local_terminal_pty_socket,
         spawn_local_terminal_pty_socket_with_terminal, terminal_basename,
@@ -283,6 +297,8 @@ mod gtk4_ui {
         hosts: Vec<HostProfile>,
         sessions: HashMap<String, HostSession>,
         active_target: Option<String>,
+        global_max_scale: RenderScaleCap,
+        cli_max_scale: Option<RenderScaleCap>,
         next_launch_id: u64,
         grid_apps: Vec<RemoteAppEntry>,
         grid_search: Vec<SearchIndexEntry>,
@@ -302,14 +318,30 @@ mod gtk4_ui {
             let key = self.active_target.as_ref()?;
             self.sessions.get(key)
         }
+
+        fn effective_max_scale(&self, host_override: Option<RenderScaleCap>) -> RenderScaleCap {
+            self.cli_max_scale
+                .or(host_override)
+                .unwrap_or(self.global_max_scale)
+        }
+
+        fn broadcast_max_scale(&self) {
+            for host in &self.hosts {
+                if let Some(sess) = self.sessions.get(&host.ssh_target) {
+                    if let Some(ui_tx) = &sess.ui_tx {
+                        let cap = self.effective_max_scale(host.max_scale);
+                        let _ = ui_tx.send(ClientUiEvent::SetMaxScale { cap });
+                    }
+                }
+            }
+        }
     }
 
-    pub fn run() -> Result<()> {
+    pub fn run(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
         let app = gtk4::Application::builder()
             .application_id("org.remotewayland.Launcher")
             .build();
-
-        app.connect_activate(build_ui);
+        app.connect_activate(move |app| build_ui(app, cli_max_scale));
         app.run_with_args(&Vec::<String>::new());
         Ok(())
     }
@@ -639,7 +671,7 @@ mod gtk4_ui {
         });
     }
 
-    fn build_ui(app: &gtk4::Application) {
+    fn build_ui(app: &gtk4::Application, cli_max_scale: Option<RenderScaleCap>) {
         install_css();
 
         let window = gtk4::ApplicationWindow::builder()
@@ -659,10 +691,13 @@ mod gtk4_ui {
             & 0xFFFF_FFFF)
             << 16
             | 1;
+        let initial_settings = load_client_settings();
         let state = Rc::new(RefCell::new(AppUi {
             hosts: initial_hosts,
             sessions: HashMap::new(),
             active_target: initial_target,
+            global_max_scale: initial_settings.max_scale,
+            cli_max_scale,
             next_launch_id: seed_id,
             grid_apps: Vec::new(),
             grid_search: Vec::new(),
@@ -887,7 +922,32 @@ mod gtk4_ui {
             .child(&mic_list_box)
             .build();
 
+        let scale_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let scale_lbl = gtk4::Label::new(Some("Render Scale Cap"));
+        scale_lbl.set_halign(gtk4::Align::Start);
+        scale_lbl.set_hexpand(true);
+        scale_lbl.add_css_class("dim-label");
+        let scale_dropdown =
+            gtk4::DropDown::from_strings(&["Uncapped", "2.0x", "1.5x", "1.0x"]);
+        scale_dropdown.set_selected(initial_settings.max_scale.to_index() as u32);
+        scale_dropdown.connect_selected_notify({
+            let state = Rc::clone(&state);
+            move |dd| {
+                let cap = RenderScaleCap::from_index(dd.selected() as usize);
+                let mut st = state.borrow_mut();
+                if st.global_max_scale != cap {
+                    st.global_max_scale = cap;
+                    let _ = save_client_settings(&ClientSettings { max_scale: cap });
+                    st.broadcast_max_scale();
+                }
+            }
+        });
+        scale_row.append(&scale_lbl);
+        scale_row.append(&scale_dropdown);
+
         settings_box.append(&settings_title);
+        settings_box.append(&scale_row);
+        settings_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         settings_box.append(&mic_header);
         settings_box.append(&mic_scroll);
         settings_popover.set_child(Some(&settings_box));
@@ -1448,6 +1508,7 @@ mod gtk4_ui {
                         },
                     );
 
+                    let effective_max_scale = st.effective_max_scale(profile.max_scale);
                     std::thread::spawn(move || {
                         let res = (|| -> anyhow::Result<ConnectResult> {
                             let uri = ssh_bootstrap(
@@ -1474,6 +1535,7 @@ mod gtk4_ui {
                                         fp,
                                         token,
                                         profile.audio_enabled,
+                                        1.0,
                                         ui_tx_net.clone(),
                                         ctrl_rx,
                                         Some(net_tx.clone()),
@@ -1492,7 +1554,11 @@ mod gtk4_ui {
 
                             let ctrl_tx_ui = ctrl_tx.clone();
                             std::thread::spawn(move || {
-                                let _ = window::run_event_loop(ui_rx, ctrl_tx_ui);
+                                let _ = window::run_event_loop(
+                                    ui_rx,
+                                    ctrl_tx_ui,
+                                    effective_max_scale,
+                                );
                             });
 
                             let _ = ctrl_tx.send(ControlMessage::ListApps);
@@ -2454,6 +2520,15 @@ mod gtk4_ui {
                         .placeholder_text("server_bin")
                         .width_chars(12)
                         .build();
+                    let e_scale = gtk4::DropDown::from_strings(&[
+                        "Global",
+                        "Uncapped",
+                        "2.0x",
+                        "1.5x",
+                        "1.0x",
+                    ]);
+                    e_scale.set_tooltip_text(Some("Render scale cap override"));
+                    e_scale.set_selected(RenderScaleCap::option_to_index(profile.max_scale) as u32);
 
                     let save_btn = gtk4::Button::with_label("Save");
                     let rm_btn = gtk4::Button::with_label("Remove");
@@ -2470,6 +2545,7 @@ mod gtk4_ui {
                         let e_target = e_target.clone();
                         let e_port = e_port.clone();
                         let e_bin = e_bin.clone();
+                        let e_scale = e_scale.clone();
                         move |_| {
                             let new_target = e_target.text().trim().to_string();
                             if new_target.is_empty() {
@@ -2483,6 +2559,8 @@ mod gtk4_ui {
                             } else {
                                 Some(bin_raw)
                             };
+                            let new_max_scale =
+                                RenderScaleCap::option_from_index(e_scale.selected() as usize);
                             let target_changed = new_target != orig_target;
                             {
                                 let mut st = state.borrow_mut();
@@ -2497,6 +2575,7 @@ mod gtk4_ui {
                                     h.ssh_target = new_target.clone();
                                     h.port = new_port;
                                     h.server_bin = new_bin;
+                                    h.max_scale = new_max_scale;
                                 }
                                 if target_changed {
                                     if let Some(sess) = st.sessions.remove(&orig_target) {
@@ -2506,6 +2585,11 @@ mod gtk4_ui {
                                     }
                                     if st.active_target.as_deref() == Some(&orig_target) {
                                         st.active_target = Some(new_target);
+                                    }
+                                } else if let Some(sess) = st.sessions.get(&orig_target) {
+                                    if let Some(tx) = &sess.ui_tx {
+                                        let cap = st.effective_max_scale(new_max_scale);
+                                        let _ = tx.send(ClientUiEvent::SetMaxScale { cap });
                                     }
                                 }
                                 let _ = save_hosts(&st.hosts);
@@ -2556,6 +2640,7 @@ mod gtk4_ui {
                     row.append(&e_target);
                     row.append(&e_port);
                     row.append(&e_bin);
+                    row.append(&e_scale);
                     row.append(&save_btn);
                     row.append(&rm_btn);
                     list_box.append(&row);
@@ -2592,6 +2677,14 @@ mod gtk4_ui {
             .placeholder_text("server_bin")
             .width_chars(12)
             .build();
+        let add_scale = gtk4::DropDown::from_strings(&[
+            "Global",
+            "Uncapped",
+            "2.0x",
+            "1.5x",
+            "1.0x",
+        ]);
+        add_scale.set_tooltip_text(Some("Render scale cap override"));
         let add_commit_btn = gtk4::Button::with_label("Add");
 
         add_commit_btn.connect_clicked({
@@ -2602,6 +2695,7 @@ mod gtk4_ui {
             let add_target = add_target.clone();
             let add_port = add_port.clone();
             let add_bin = add_bin.clone();
+            let add_scale = add_scale.clone();
             move |_| {
                 let target = add_target.text().trim().to_string();
                 if target.is_empty() {
@@ -2620,12 +2714,14 @@ mod gtk4_ui {
                 } else {
                     Some(bin_raw)
                 };
+                let max_scale = RenderScaleCap::option_from_index(add_scale.selected() as usize);
                 let profile = HostProfile {
                     label,
                     ssh_target: target.clone(),
                     server_bin,
                     port,
                     audio_enabled: true,
+                    max_scale,
                 };
                 {
                     let mut st = state.borrow_mut();
@@ -2636,6 +2732,7 @@ mod gtk4_ui {
                 add_label.set_text("");
                 add_target.set_text("");
                 add_bin.set_text("");
+                add_scale.set_selected(0);
                 rebuild_sidebar();
                 populate_manage();
             }
@@ -2645,6 +2742,7 @@ mod gtk4_ui {
         add_row.append(&add_target);
         add_row.append(&add_port);
         add_row.append(&add_bin);
+        add_row.append(&add_scale);
         add_row.append(&add_commit_btn);
         content.append(&add_row);
 

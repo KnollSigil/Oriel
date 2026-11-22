@@ -8,6 +8,98 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Maximum render scale cap for remote HiDPI windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderScaleCap {
+    #[default]
+    Uncapped,
+    Scale200,
+    Scale150,
+    Scale100,
+}
+
+impl RenderScaleCap {
+    pub const ALL: [RenderScaleCap; 4] = [
+        RenderScaleCap::Uncapped,
+        RenderScaleCap::Scale200,
+        RenderScaleCap::Scale150,
+        RenderScaleCap::Scale100,
+    ];
+
+    pub fn as_max_factor(self) -> Option<f64> {
+        match self {
+            Self::Uncapped => None,
+            Self::Scale200 => Some(2.0),
+            Self::Scale150 => Some(1.5),
+            Self::Scale100 => Some(1.0),
+        }
+    }
+
+    pub fn apply(self, raw_scale: f64) -> f64 {
+        let s = if raw_scale.is_finite() && raw_scale >= 1.0 {
+            raw_scale
+        } else {
+            1.0
+        };
+        match self.as_max_factor() {
+            Some(cap) => s.min(cap).max(1.0),
+            None => s.min(4.0),
+        }
+    }
+
+    pub fn to_index(self) -> usize {
+        match self {
+            Self::Uncapped => 0,
+            Self::Scale200 => 1,
+            Self::Scale150 => 2,
+            Self::Scale100 => 3,
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            1 => Self::Scale200,
+            2 => Self::Scale150,
+            3 => Self::Scale100,
+            _ => Self::Uncapped,
+        }
+    }
+
+    /// Encode an optional per-host override (`None` = Use Global Default) as a combo index `0..=4`.
+    pub fn option_to_index(opt: Option<Self>) -> usize {
+        match opt {
+            None => 0,
+            Some(cap) => cap.to_index() + 1,
+        }
+    }
+
+    /// Decode a per-host combo index `0..=4` back to `Option<RenderScaleCap>`.
+    pub fn option_from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => None,
+            n => Some(Self::from_index(n - 1)),
+        }
+    }
+
+    pub fn parse_cli(s: &str) -> Result<Self> {
+        let norm = s.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "uncapped" | "none" | "auto" | "0" => Ok(Self::Uncapped),
+            "2" | "2.0" | "2x" | "2.0x" | "200%" => Ok(Self::Scale200),
+            "1.5" | "1.5x" | "150%" => Ok(Self::Scale150),
+            "1" | "1.0" | "1x" | "1.0x" | "100%" => Ok(Self::Scale100),
+            _ => bail!("invalid --max-scale '{s}': expected uncapped, 2.0, 1.5, or 1.0"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientSettings {
+    #[serde(default)]
+    pub max_scale: RenderScaleCap,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostProfile {
     pub label: String,
@@ -18,6 +110,8 @@ pub struct HostProfile {
     pub port: u16,
     #[serde(default = "default_true")]
     pub audio_enabled: bool,
+    #[serde(default)]
+    pub max_scale: Option<RenderScaleCap>,
 }
 
 fn default_port() -> u16 {
@@ -26,6 +120,35 @@ fn default_port() -> u16 {
 
 fn default_true() -> bool {
     true
+}
+
+pub fn settings_config_path() -> PathBuf {
+    if let Some(cfg) = std::env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(cfg).join("remotewayland/settings.json")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".config/remotewayland/settings.json")
+    } else {
+        PathBuf::from("remotewayland-settings.json")
+    }
+}
+
+pub fn load_client_settings() -> ClientSettings {
+    let path = settings_config_path();
+    let Ok(data) = fs::read_to_string(path) else {
+        return ClientSettings::default();
+    };
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+pub fn save_client_settings(settings: &ClientSettings) -> Result<()> {
+    let path = settings_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(settings)?;
+    fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 pub fn hosts_config_path() -> PathBuf {
@@ -161,5 +284,43 @@ fn shell_escape(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_scale_cap_apply_and_cli_parsing() {
+        assert_eq!(RenderScaleCap::Uncapped.apply(1.5), 1.5);
+        assert_eq!(RenderScaleCap::Uncapped.apply(3.0), 3.0);
+        assert_eq!(RenderScaleCap::Uncapped.apply(0.5), 1.0);
+        assert_eq!(RenderScaleCap::Scale200.apply(2.5), 2.0);
+        assert_eq!(RenderScaleCap::Scale200.apply(1.25), 1.25);
+        assert_eq!(RenderScaleCap::Scale150.apply(2.0), 1.5);
+        assert_eq!(RenderScaleCap::Scale100.apply(2.0), 1.0);
+
+        assert_eq!(RenderScaleCap::parse_cli("uncapped").unwrap(), RenderScaleCap::Uncapped);
+        assert_eq!(RenderScaleCap::parse_cli("2.0x").unwrap(), RenderScaleCap::Scale200);
+        assert_eq!(RenderScaleCap::parse_cli("1.5").unwrap(), RenderScaleCap::Scale150);
+        assert_eq!(RenderScaleCap::parse_cli("100%").unwrap(), RenderScaleCap::Scale100);
+        assert!(RenderScaleCap::parse_cli("3.5").is_err());
+
+        for cap in RenderScaleCap::ALL {
+            assert_eq!(RenderScaleCap::from_index(cap.to_index()), cap);
+            assert_eq!(
+                RenderScaleCap::option_from_index(RenderScaleCap::option_to_index(Some(cap))),
+                Some(cap)
+            );
+        }
+        assert_eq!(RenderScaleCap::option_from_index(0), None);
+    }
+
+    #[test]
+    fn host_profile_deserializes_without_max_scale() {
+        let json = r#"{"label":"Box","ssh_target":"u@h","port":7443,"audio_enabled":true}"#;
+        let profile: HostProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.max_scale, None);
     }
 }

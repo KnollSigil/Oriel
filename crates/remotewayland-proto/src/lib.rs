@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum allowed encoded video frame payload size (64 MiB) to accommodate 4K/5K HiDPI frames.
+pub const MAX_VIDEO_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum UTF-8 selection payload size (4 MiB) read from clipboard or primary selection pipes.
 pub const MAX_SELECTION_BYTES: usize = 4 * 1024 * 1024;
@@ -124,6 +127,9 @@ pub enum ControlMessage {
         token: String,
         supported_codecs: Vec<VideoCodec>,
         enable_audio_bridge: bool,
+        /// Initial effective display scale factor (>= 1.0) so the server can configure
+        /// its virtual output and XWayland DPI before the first app launches.
+        initial_scale: f64,
     },
     /// Server -> Client authentication result.
     AuthResponse {
@@ -162,6 +168,8 @@ pub enum ControlMessage {
         window_id: WindowId,
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         is_keyframe: bool,
         bgra: Vec<u8>,
     },
@@ -258,11 +266,13 @@ pub enum ControlMessage {
         visible: bool,
         shape_name: String,
     },
-    /// Server -> Client: surface-based cursor bitmap (`Argb8888` BGRA bytes + hotspot).
+    /// Server -> Client: surface-based cursor bitmap (`Argb8888` BGRA bytes + logical hotspot).
     CursorBitmap {
         window_id: WindowId,
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         hotspot_x: i32,
         hotspot_y: i32,
         bgra: Vec<u8>,
@@ -313,6 +323,11 @@ pub enum ControlMessage {
         window_id: WindowId,
         pts_ns: u64,
     },
+    /// Client -> Server: updates the session's active display scale factor (>= 1.0)
+    /// used for virtual `wl_output` fallback and global XWayland HiDPI scaling.
+    DisplayScale {
+        scale_factor: f64,
+    },
 }
 
 /// Header preceding each encoded video access unit on a per-window video stream.
@@ -321,6 +336,8 @@ pub struct VideoFrameHeader {
     pub pts_ns: u64,
     pub width: u32,
     pub height: u32,
+    pub logical_width: u32,
+    pub logical_height: u32,
     pub is_keyframe: bool,
     pub payload_len: u32,
 }
@@ -475,7 +492,7 @@ pub async fn read_video_frame<R: AsyncRead + Unpin>(
     reader.read_exact(&mut hdr_buf).await?;
     let header: VideoFrameHeader =
         bincode::deserialize(&hdr_buf).context("failed to deserialize VideoFrameHeader")?;
-    if header.payload_len as usize > MAX_CONTROL_FRAME_BYTES {
+    if header.payload_len as usize > MAX_VIDEO_FRAME_BYTES {
         bail!("video payload too large: {}", header.payload_len);
     }
     let mut payload = vec![0u8; header.payload_len as usize];
@@ -556,8 +573,10 @@ mod tests {
 
         let frame_hdr = VideoFrameHeader {
             pts_ns: 16_666_666,
-            width: 800,
-            height: 600,
+            width: 1200,
+            height: 900,
+            logical_width: 800,
+            logical_height: 600,
             is_keyframe: true,
             payload_len: 4,
         };
@@ -603,11 +622,13 @@ mod tests {
         };
         let cursor = ControlMessage::CursorBitmap {
             window_id: 9,
-            width: 2,
-            height: 2,
+            width: 4,
+            height: 4,
+            logical_width: 2,
+            logical_height: 2,
             hotspot_x: 1,
             hotspot_y: 1,
-            bgra: [0u8, 0, 0, 255].repeat(4),
+            bgra: [0u8, 0, 0, 255].repeat(16),
         };
         let scheme = ControlMessage::ColorScheme { scheme: 1 };
         let kbd_enter = ControlMessage::KeyboardEnter {
@@ -619,6 +640,7 @@ mod tests {
             window_id: 9,
             pts_ns: 123_456_789,
         };
+        let display_scale = ControlMessage::DisplayScale { scale_factor: 1.5 };
 
         write_control_message(&mut tx, &primary).await.unwrap();
         write_control_message(&mut tx, &cursor).await.unwrap();
@@ -626,6 +648,7 @@ mod tests {
         write_control_message(&mut tx, &kbd_enter).await.unwrap();
         write_control_message(&mut tx, &kbd_leave).await.unwrap();
         write_control_message(&mut tx, &frame_ack).await.unwrap();
+        write_control_message(&mut tx, &display_scale).await.unwrap();
         drop(tx);
 
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), primary);
@@ -634,6 +657,7 @@ mod tests {
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_enter);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_leave);
         assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), frame_ack);
+        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), display_scale);
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
     }
 

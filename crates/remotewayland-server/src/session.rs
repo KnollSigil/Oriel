@@ -918,6 +918,27 @@ pub fn clear_x11_env() {
     }
 }
 
+/// Apply the active XWayland `DISPLAY` and `XAUTHORITY` to `cmd`.
+/// Returns `true` if an XWayland display is currently active.
+pub fn apply_x11_env(cmd: &mut Command) -> bool {
+    let Some(lock) = SESSION_INFO.get() else {
+        return false;
+    };
+    let Ok(info) = lock.lock() else {
+        return false;
+    };
+    let Some(disp) = &info.x11_display else {
+        return false;
+    };
+    cmd.env("DISPLAY", disp);
+    if let Some(xauth) = &info.xauthority {
+        cmd.env("XAUTHORITY", xauth);
+    } else {
+        cmd.env_remove("XAUTHORITY");
+    }
+    true
+}
+
 /// Fill `buf` with cryptographically secure random bytes via `getrandom(2)`.
 pub fn fill_random_bytes(buf: &mut [u8]) -> Result<()> {
     let mut filled = 0;

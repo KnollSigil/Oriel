@@ -169,6 +169,7 @@ async fn handle_connection(
             token,
             supported_codecs,
             enable_audio_bridge,
+            initial_scale,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 write_control_message(
@@ -216,8 +217,12 @@ async fn handle_connection(
                 %remote,
                 ?selected_codec,
                 enable_audio_bridge,
+                initial_scale,
                 "client authenticated; starting compositor/media loop"
             );
+            let _ = cmd_tx.send(CompositorCommand::SetDisplayScale {
+                scale_factor: initial_scale,
+            });
             let _ = cmd_tx.send(CompositorCommand::SyncWindows);
             pty_mgr.sync_states();
             (selected_codec, enable_audio_bridge)
@@ -393,7 +398,14 @@ async fn handle_connection(
                             window_id, x, y, width, height
                         }).await?;
                     }
-                    Ok(CompositorEvent::PopupFrame { window_id, width, height, bgra }) => {
+                    Ok(CompositorEvent::PopupFrame {
+                        window_id,
+                        width,
+                        height,
+                        logical_width,
+                        logical_height,
+                        bgra,
+                    }) => {
                         let enc = popup_encoders.entry(window_id).or_insert_with(VideoEncoder::new);
                         let pts_ns = session_start.elapsed().as_nanos() as u64;
                         let frame = enc.encode_bgra(width, height, pts_ns, &bgra);
@@ -401,6 +413,8 @@ async fn handle_connection(
                             window_id,
                             width: frame.width,
                             height: frame.height,
+                            logical_width,
+                            logical_height,
                             is_keyframe: frame.is_keyframe,
                             bgra: frame.data,
                         }).await?;
@@ -448,9 +462,25 @@ async fn handle_connection(
                             window_id, visible, shape_name
                         }).await?;
                     }
-                    Ok(CompositorEvent::CursorBitmap { window_id, width, height, hotspot_x, hotspot_y, bgra }) => {
+                    Ok(CompositorEvent::CursorBitmap {
+                        window_id,
+                        width,
+                        height,
+                        logical_width,
+                        logical_height,
+                        hotspot_x,
+                        hotspot_y,
+                        bgra,
+                    }) => {
                         write_control_message(&mut send, &ControlMessage::CursorBitmap {
-                            window_id, width, height, hotspot_x, hotspot_y, bgra
+                            window_id,
+                            width,
+                            height,
+                            logical_width,
+                            logical_height,
+                            hotspot_x,
+                            hotspot_y,
+                            bgra,
                         }).await?;
                     }
                     Ok(CompositorEvent::ClipboardText { text }) => {
@@ -464,7 +494,14 @@ async fn handle_connection(
                             launch_id, name, state
                         }).await?;
                     }
-                    Ok(CompositorEvent::FrameCommitted { window_id, width, height, bgra }) => {
+                    Ok(CompositorEvent::FrameCommitted {
+                        window_id,
+                        width,
+                        height,
+                        logical_width,
+                        logical_height,
+                        bgra,
+                    }) => {
                         let pipeline = video_pipelines.entry(window_id).or_insert_with(|| {
                             spawn_window_video_pipeline(
                                 window_id,
@@ -476,6 +513,8 @@ async fn handle_connection(
                         pipeline.push_frame(RawVideoFrame {
                             width,
                             height,
+                            logical_width,
+                            logical_height,
                             bgra,
                         });
                     }
@@ -491,21 +530,25 @@ async fn handle_connection(
                         window_id,
                         width,
                         height,
+                        scale_factor,
                         maximized,
                         fullscreen,
                         activated,
                         tiled,
-                        ..
                     }) => {
                         let _ = cmd_tx.send(CompositorCommand::ConfigureWindow {
                             window_id,
                             width,
                             height,
+                            scale_factor,
                             maximized,
                             fullscreen,
                             activated,
                             tiled,
                         });
+                    }
+                    Some(ControlMessage::DisplayScale { scale_factor }) => {
+                        let _ = cmd_tx.send(CompositorCommand::SetDisplayScale { scale_factor });
                     }
                     Some(ControlMessage::WindowClosed { window_id }) => {
                         let _ = cmd_tx.send(CompositorCommand::CloseWindow { window_id });
@@ -584,6 +627,8 @@ const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 struct RawVideoFrame {
     width: u32,
     height: u32,
+    logical_width: u32,
+    logical_height: u32,
     bgra: Vec<u8>,
 }
 
@@ -722,6 +767,8 @@ async fn run_window_video_pipeline(
         let pts_ns = raw_pts.max(last_pts_ns.saturating_add(1));
         last_pts_ns = pts_ns;
 
+        let logical_width = raw.logical_width;
+        let logical_height = raw.logical_height;
         // 4. Encode off the async runtime thread so control/input latency stays unaffected.
         let mut enc = encoder.take().unwrap();
         let encoded_res = tokio::task::spawn_blocking(move || {
@@ -744,6 +791,8 @@ async fn run_window_video_pipeline(
             pts_ns: frame.pts_ns,
             width: frame.width,
             height: frame.height,
+            logical_width,
+            logical_height,
             is_keyframe: frame.is_keyframe,
             payload_len: frame.data.len() as u32,
         };

@@ -720,6 +720,27 @@ ApplicationWindow {
                                     width: parent.width
                                     spacing: 8
 
+                                    Label {
+                                        text: "Render Scale Cap"
+                                        font.bold: true
+                                        Layout.fillWidth: true
+                                    }
+
+                                    ComboBox {
+                                        id: globalScaleCombo
+                                        Layout.fillWidth: true
+                                        model: ["Uncapped", "2.0x", "1.5x", "1.0x"]
+                                        currentIndex: backend.globalMaxScaleIndex
+                                        onActivated: (idx) => backend.select_global_max_scale(idx)
+                                    }
+
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        implicitHeight: 1
+                                        color: root.palette.mid
+                                        opacity: 0.35
+                                    }
+
                                     RowLayout {
                                         Layout.fillWidth: true
                                         Label {
@@ -1091,10 +1112,11 @@ ApplicationWindow {
             portSpin.value = 7443
             serverBinField.text = ""
             audioCheck.checked = true
+            hostScaleCombo.currentIndex = 0
             labelField.forceActiveFocus()
         }
 
-        function loadHost(label, sshTarget, port, serverBin, audioEnabled) {
+        function loadHost(label, sshTarget, port, serverBin, audioEnabled, maxScaleIndex) {
             selectedTarget = sshTarget
             isNewHost = false
             labelField.text = label
@@ -1102,6 +1124,7 @@ ApplicationWindow {
             portSpin.value = port > 0 ? port : 7443
             serverBinField.text = serverBin
             audioCheck.checked = audioEnabled
+            hostScaleCombo.currentIndex = maxScaleIndex >= 0 ? maxScaleIndex : 0
         }
 
         onOpened: startNewHost()
@@ -1151,10 +1174,11 @@ ApplicationWindow {
                             required property int port
                             required property string server_bin
                             required property bool audio_enabled
+                            required property int max_scale_index
 
                             width: manageHostList.width
                             highlighted: !manageDialog.isNewHost && manageDialog.selectedTarget === ssh_target
-                            onClicked: manageDialog.loadHost(label, ssh_target, port, server_bin, audio_enabled)
+                            onClicked: manageDialog.loadHost(label, ssh_target, port, server_bin, audio_enabled, max_scale_index)
 
                             contentItem: ColumnLayout {
                                 spacing: 1
@@ -1258,6 +1282,17 @@ ApplicationWindow {
                         placeholderText: "remotewayland-server (optional)"
                     }
 
+                    Label {
+                        text: "Render Scale Cap"
+                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+                    }
+                    ComboBox {
+                        id: hostScaleCombo
+                        Layout.fillWidth: true
+                        model: ["Use Global Default", "Uncapped", "2.0x", "1.5x", "1.0x"]
+                        currentIndex: 0
+                    }
+
                     Item { implicitWidth: 1; implicitHeight: 1 }
                     CheckBox {
                         id: audioCheck
@@ -1300,7 +1335,8 @@ ApplicationWindow {
                                 savedTarget,
                                 serverBinField.text,
                                 portSpin.value,
-                                audioCheck.checked
+                                audioCheck.checked,
+                                hostScaleCombo.currentIndex
                             )
                             manageDialog.selectedTarget = savedTarget
                             manageDialog.isNewHost = false

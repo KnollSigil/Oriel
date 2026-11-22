@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use crate::hosts::{parse_uri, ssh_bootstrap};
+use crate::hosts::{load_client_settings, parse_uri, ssh_bootstrap, RenderScaleCap};
 use crate::window::ClientUiEvent;
 
 #[derive(Debug, Parser)]
@@ -54,6 +54,10 @@ struct Cli {
     /// Host PipeWire microphone source name or serial to use (default: system default).
     #[arg(long)]
     mic: Option<String>,
+
+    /// Cap remote window render scale (uncapped, 2.0, 1.5, or 1.0).
+    #[arg(long)]
+    max_scale: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,6 +86,10 @@ enum ClientSubcommand {
         /// Host PipeWire microphone source name or serial to use (default: system default).
         #[arg(long)]
         mic: Option<String>,
+
+        /// Cap remote window render scale (uncapped, 2.0, 1.5, or 1.0).
+        #[arg(long)]
+        max_scale: Option<String>,
 
         /// Optional remote GUI application command to launch immediately upon connecting.
         #[arg(last = true)]
@@ -149,9 +157,14 @@ fn main() -> Result<()> {
             port,
             no_audio,
             mic,
+            max_scale,
             command,
         }) => {
             audio::set_mic_target(mic);
+            let scale_cap = match max_scale {
+                Some(s) => RenderScaleCap::parse_cli(&s)?,
+                None => load_client_settings().max_scale,
+            };
             let uri = ssh_bootstrap(&target, server_bin.as_deref(), port)?;
             if terminal {
                 let cmd_str = if command.is_empty() {
@@ -169,19 +182,50 @@ fn main() -> Result<()> {
                 Some(command.join(" "))
             };
             let pty_sock = pty::pty_tunnel_socket_path(&target).ok();
-            run_gui_session(server, fingerprint, token, !no_audio, initial_exec, pty_sock)
+            run_gui_session(
+                server,
+                fingerprint,
+                token,
+                !no_audio,
+                scale_cap,
+                initial_exec,
+                pty_sock,
+            )
         }
         None => {
             audio::set_mic_target(cli.mic);
+            let cli_max_scale = cli
+                .max_scale
+                .as_deref()
+                .map(RenderScaleCap::parse_cli)
+                .transpose()?;
+            let effective_scale_cap =
+                cli_max_scale.unwrap_or_else(|| load_client_settings().max_scale);
             if let Some(uri) = cli.uri {
                 let (server, fingerprint, token) = parse_uri(&uri)?;
-                run_gui_session(server, fingerprint, token, true, None, None)
+                run_gui_session(
+                    server,
+                    fingerprint,
+                    token,
+                    true,
+                    effective_scale_cap,
+                    None,
+                    None,
+                )
             } else if let (Some(server), Some(fp), Some(token)) =
                 (cli.server, cli.fingerprint, cli.token)
             {
-                run_gui_session(server, fp, token, true, None, None)
+                run_gui_session(
+                    server,
+                    fp,
+                    token,
+                    true,
+                    effective_scale_cap,
+                    None,
+                    None,
+                )
             } else {
-                launcher::run_launcher()
+                launcher::run_launcher(cli_max_scale)
             }
         }
     }
@@ -192,6 +236,7 @@ fn run_gui_session(
     fingerprint: String,
     token: String,
     enable_audio: bool,
+    max_scale: RenderScaleCap,
     initial_exec: Option<String>,
     pty_socket_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
@@ -219,6 +264,7 @@ fn run_gui_session(
                     fingerprint,
                     token,
                     enable_audio,
+                    1.0,
                     ui_tx.clone(),
                     ctrl_rx,
                     None,
@@ -233,5 +279,5 @@ fn run_gui_session(
         })
         .context("failed to spawn client network thread")?;
 
-    window::run_event_loop(ui_rx, ctrl_tx)
+    window::run_event_loop(ui_rx, ctrl_tx, max_scale)
 }

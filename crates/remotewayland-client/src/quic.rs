@@ -97,6 +97,7 @@ pub async fn connect_and_auth(
     fingerprint_sha256: String,
     token: String,
     enable_audio_bridge: bool,
+    initial_scale: f64,
 ) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream)> {
     let verifier = Arc::new(PinnedCertVerifier::new(fingerprint_sha256));
     let mut rustls_config = rustls::ClientConfig::builder()
@@ -136,6 +137,7 @@ pub async fn connect_and_auth(
             token,
             supported_codecs: vec![VideoCodec::Lz4Delta],
             enable_audio_bridge,
+            initial_scale,
         },
     )
     .await?;
@@ -187,13 +189,20 @@ pub async fn run_client(
     fingerprint_sha256: String,
     token: String,
     enable_audio_bridge: bool,
+    initial_scale: f64,
     ui_tx: UiSender,
     mut ctrl_rx: mpsc::UnboundedReceiver<ControlMessage>,
     launcher_tx: Option<mpsc::UnboundedSender<LauncherNetEvent>>,
     pty_socket_path: Option<PathBuf>,
 ) -> Result<()> {
-    let (conn, mut send, mut recv) =
-        connect_and_auth(server_addr, fingerprint_sha256, token, enable_audio_bridge).await?;
+    let (conn, mut send, mut recv) = connect_and_auth(
+        server_addr,
+        fingerprint_sha256,
+        token,
+        enable_audio_bridge,
+        initial_scale,
+    )
+    .await?;
 
     // Optional local 0600 Unix socket that tunnels `remotewayland-client pty-attach --socket <path>`
     // directly over multiplexed QUIC bidirectional streams on this authenticated connection.
@@ -314,6 +323,8 @@ pub async fn run_client(
                                         window_id,
                                         frame.width,
                                         frame.height,
+                                        hdr.logical_width,
+                                        hdr.logical_height,
                                         frame.bgra,
                                     );
                                     let _ = ack_tx.send((window_id, hdr.pts_ns));
@@ -503,6 +514,8 @@ pub async fn run_client(
                 window_id,
                 width,
                 height,
+                logical_width,
+                logical_height,
                 is_keyframe,
                 bgra,
             } => {
@@ -515,6 +528,8 @@ pub async fn run_client(
                             window_id,
                             width: frame.width,
                             height: frame.height,
+                            logical_width,
+                            logical_height,
                             bgra: frame.bgra,
                         });
                     }
@@ -579,6 +594,8 @@ pub async fn run_client(
                 window_id,
                 width,
                 height,
+                logical_width,
+                logical_height,
                 hotspot_x,
                 hotspot_y,
                 bgra,
@@ -587,6 +604,8 @@ pub async fn run_client(
                     window_id,
                     width,
                     height,
+                    logical_width,
+                    logical_height,
                     hotspot_x,
                     hotspot_y,
                     bgra,

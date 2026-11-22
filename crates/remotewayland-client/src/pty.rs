@@ -348,7 +348,7 @@ pub async fn run_pty_attach(
     command: Option<String>,
 ) -> Result<i32> {
     let (conn, _ctrl_send, _ctrl_recv) =
-        crate::quic::connect_and_auth(server, fingerprint, token, false).await?;
+        crate::quic::connect_and_auth(server, fingerprint, token, false, 1.0).await?;
 
     let (send, recv) = conn
         .open_bi()

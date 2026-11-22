@@ -30,7 +30,7 @@ use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent,
 };
 use smithay::input::{Seat, SeatHandler, SeatState};
-use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
@@ -45,14 +45,19 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{
     backend::ObjectId, Client, Display, DisplayHandle, Resource, WEnum,
 };
-use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial, SERIAL_COUNTER};
+use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    get_parent, with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
-    CompositorState, SubsurfaceCachedState, TraversalAction,
+    get_parent, send_surface_state, with_states, with_surface_tree_downward,
+    CompositorClientState, CompositorHandler, CompositorState, SubsurfaceCachedState,
+    TraversalAction,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::fractional_scale::{
+    self, FractionalScaleHandler, FractionalScaleManagerState,
+};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::{
     request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
@@ -78,9 +83,10 @@ use smithay::xwayland::xwm::{
 };
 use smithay::xwayland::{X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler};
 use smithay::{
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_kde_decoration,
-    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
-    delegate_xdg_decoration, delegate_xdg_shell, delegate_xwayland_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_fractional_scale,
+    delegate_kde_decoration, delegate_output, delegate_primary_selection, delegate_seat,
+    delegate_shm, delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_xwayland_shell,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -114,6 +120,8 @@ pub enum CompositorEvent {
         window_id: WindowId,
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         bgra: Vec<u8>,
     },
     StartMove {
@@ -156,6 +164,8 @@ pub enum CompositorEvent {
         window_id: WindowId,
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         bgra: Vec<u8>,
     },
     CursorUpdate {
@@ -167,6 +177,8 @@ pub enum CompositorEvent {
         window_id: WindowId,
         width: u32,
         height: u32,
+        logical_width: u32,
+        logical_height: u32,
         hotspot_x: i32,
         hotspot_y: i32,
         bgra: Vec<u8>,
@@ -191,10 +203,14 @@ pub enum CompositorCommand {
         window_id: WindowId,
         width: u32,
         height: u32,
+        scale_factor: f64,
         maximized: bool,
         fullscreen: bool,
         activated: bool,
         tiled: bool,
+    },
+    SetDisplayScale {
+        scale_factor: f64,
     },
     CloseWindow {
         window_id: WindowId,
@@ -272,6 +288,15 @@ impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
 
 const WINDOW_LAUNCH_ID_BASE: u64 = 1u64 << 62;
 
+#[derive(Clone, PartialEq, Eq)]
+struct CachedFrame {
+    width: u32,
+    height: u32,
+    logical_width: u32,
+    logical_height: u32,
+    bgra: Vec<u8>,
+}
+
 struct TrackedWindow {
     window_id: WindowId,
     window: Window,
@@ -279,11 +304,12 @@ struct TrackedWindow {
     last_app_id: String,
     last_width: u32,
     last_height: u32,
+    scale_factor: f64,
     geo_offset: (i32, i32),
     server_side_decoration: bool,
     announced: bool,
     has_window_entry: bool,
-    latest_bgra: Option<(u32, u32, Vec<u8>)>,
+    latest_bgra: Option<CachedFrame>,
     last_sub_info: Vec<(bool, u32, u32, i32, i32)>,
 }
 
@@ -294,7 +320,7 @@ struct TrackedPopup {
     geo: Rectangle<i32, Logical>,
     geo_offset: (i32, i32),
     announced: bool,
-    latest_bgra: Option<(u32, u32, Vec<u8>)>,
+    latest_bgra: Option<CachedFrame>,
 }
 
 struct TrackedX11Window {
@@ -308,7 +334,7 @@ struct TrackedX11Window {
     server_side_decoration: bool,
     announced: bool,
     has_window_entry: bool,
-    latest_bgra: Option<(u32, u32, Vec<u8>)>,
+    latest_bgra: Option<CachedFrame>,
 }
 
 struct TrackedX11Popup {
@@ -318,7 +344,7 @@ struct TrackedX11Popup {
     geo: Rectangle<i32, Logical>,
     rel_pos: (i32, i32),
     announced: bool,
-    latest_bgra: Option<(u32, u32, Vec<u8>)>,
+    latest_bgra: Option<CachedFrame>,
 }
 
 /// Keyboard focus target supporting both native Wayland surfaces and XWayland `X11Surface`s.
@@ -430,12 +456,17 @@ struct AppState {
     data_device_state: DataDeviceState,
     primary_selection_state: PrimarySelectionState,
     cursor_shape_state: CursorShapeManagerState,
+    fractional_scale_manager_state: FractionalScaleManagerState,
+    viewporter_state: ViewporterState,
     output_manager_state: OutputManagerState,
     xwayland_shell_state: XWaylandShellState,
     xwm: Option<X11Wm>,
     xwayland_client: Option<Client>,
     output: Output,
     output_size: (i32, i32),
+    output_scale: i32,
+    display_scale: f64,
+    xwayland_scale: f64,
     seat: Seat<Self>,
     space: Space<Window>,
     popups: PopupManager,
@@ -444,7 +475,7 @@ struct AppState {
     last_focused_x11_window_id: Option<WindowId>,
     next_x11_pos: (i32, i32),
     cursor_surface: Option<WlSurface>,
-    last_cursor_bitmap: Option<(u32, u32, i32, i32, Vec<u8>)>,
+    last_cursor_bitmap: Option<(u32, u32, u32, u32, i32, i32, Vec<u8>)>,
     clipboard_owner: SelectionOwner,
     clipboard_text: Option<String>,
     pending_clipboard_mime: Option<String>,
@@ -483,15 +514,107 @@ impl AppState {
         let new_h = self.output_size.1.max(min_h);
         if (new_w, new_h) != self.output_size {
             self.output_size = (new_w, new_h);
-            let mode = OutputMode {
-                size: (new_w, new_h).into(),
-                refresh: 60_000,
-            };
-            self.output
-                .change_current_state(Some(mode), None, None, Some((0, 0).into()));
-            self.output.set_preferred(mode);
-            debug!(width = new_w, height = new_h, "expanded headless virtual output");
+            self.apply_virtual_output_mode();
+            debug!(
+                width = new_w,
+                height = new_h,
+                scale = self.output_scale,
+                "expanded headless virtual output"
+            );
         }
+    }
+
+    fn apply_virtual_output_mode(&self) {
+        let scale = self.output_scale.max(1);
+        let mode = OutputMode {
+            size: (self.output_size.0 * scale, self.output_size.1 * scale).into(),
+            refresh: 60_000,
+        };
+        self.output.change_current_state(
+            Some(mode),
+            None,
+            Some(OutputScale::Integer(scale)),
+            Some((0, 0).into()),
+        );
+        self.output.set_preferred(mode);
+    }
+
+    fn apply_surface_tree_scale(root: &WlSurface, scale: f64) {
+        let scale = sanitize_scale(scale);
+        let int_scale = scale.ceil().max(1.0) as i32;
+        with_surface_tree_downward(
+            root,
+            (),
+            |surf, states, _| {
+                fractional_scale::with_fractional_scale(states, |fs| {
+                    fs.set_preferred_scale(scale);
+                });
+                send_surface_state(surf, states, int_scale, Transform::Normal);
+                TraversalAction::DoChildren(())
+            },
+            |_, _, _| {},
+            |_, _, _| true,
+        );
+    }
+
+    fn window_scale_for_surface(&self, surface: &WlSurface) -> f64 {
+        let mut cur = surface.clone();
+        loop {
+            if let Some(&wid) = self.surface_to_window.get(&cur.id()) {
+                if let Some(tw) = self.windows.get(&wid) {
+                    return tw.scale_factor;
+                }
+                if let Some(tp) = self.popup_windows.get(&wid) {
+                    if let Some(parent) = self.windows.get(&tp.parent_id) {
+                        return parent.scale_factor;
+                    }
+                }
+            }
+            match get_parent(&cur) {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        if let Some(tw) = self.windows.get(&self.focused_window_id) {
+            return tw.scale_factor;
+        }
+        self.display_scale
+    }
+
+    fn update_output_and_xwayland_scale(&mut self) {
+        let max_scale = self
+            .windows
+            .values()
+            .map(|w| w.scale_factor)
+            .fold(self.display_scale, f64::max);
+        let max_scale = sanitize_scale(max_scale);
+        let new_output_scale = max_scale.ceil().max(1.0) as i32;
+        if new_output_scale != self.output_scale {
+            self.output_scale = new_output_scale;
+            self.apply_virtual_output_mode();
+            debug!(output_scale = new_output_scale, "updated virtual output integer scale");
+        }
+
+        // Global XWayland HiDPI scaling: keep Smithay XWayland client_scale and Xft.dpi in sync.
+        let target_x11_scale = sanitize_scale(self.display_scale);
+        if (target_x11_scale - self.xwayland_scale).abs() > 0.005 {
+            self.xwayland_scale = target_x11_scale;
+            self.apply_xwayland_scale();
+        }
+    }
+
+    fn apply_xwayland_scale(&self) {
+        let scale = sanitize_scale(self.xwayland_scale);
+        if let Some(client) = &self.xwayland_client {
+            if let Some(data) = client.get_data::<XWaylandClientData>() {
+                data.compositor_state.set_client_scale(scale);
+            }
+        }
+        let dpi = (96.0 * scale).round() as u32;
+        debug!(scale, dpi, "applying global XWayland HiDPI scale and Xft.dpi");
+        std::thread::spawn(move || {
+            apply_xft_dpi(dpi);
+        });
     }
 
     fn alloc_x11_position(&mut self, w: i32, h: i32) -> (i32, i32) {
@@ -518,6 +641,7 @@ impl AppState {
         if *w == 0 || *h == 0 || *w > MAX_CURSOR_DIM || *h > MAX_CURSOR_DIM {
             return;
         }
+        let (logical_w, logical_h) = surface_logical_size(surf, *w, *h);
         let (hotspot_x, hotspot_y) = with_states(surf, |states| {
             states
                 .data_map
@@ -529,18 +653,34 @@ impl AppState {
         if self
             .last_cursor_bitmap
             .as_ref()
-            .is_some_and(|(lw, lh, lhx, lhy, lbgra)| {
-                *lw == *w && *lh == *h && *lhx == hotspot_x && *lhy == hotspot_y && lbgra == bgra
+            .is_some_and(|(lw, lh, llogw, llogh, lhx, lhy, lbgra)| {
+                *lw == *w
+                    && *lh == *h
+                    && *llogw == logical_w
+                    && *llogh == logical_h
+                    && *lhx == hotspot_x
+                    && *lhy == hotspot_y
+                    && lbgra == bgra
             })
         {
             return;
         }
         let bgra_cloned = bgra.clone();
-        self.last_cursor_bitmap = Some((*w, *h, hotspot_x, hotspot_y, bgra_cloned.clone()));
+        self.last_cursor_bitmap = Some((
+            *w,
+            *h,
+            logical_w,
+            logical_h,
+            hotspot_x,
+            hotspot_y,
+            bgra_cloned.clone(),
+        ));
         let _ = self.event_tx.send(CompositorEvent::CursorBitmap {
             window_id: self.focused_window_id,
             width: *w,
             height: *h,
+            logical_width: logical_w,
+            logical_height: logical_h,
             hotspot_x,
             hotspot_y,
             bgra: bgra_cloned,
@@ -578,9 +718,10 @@ impl AppState {
                     (ox + loc.x, oy + loc.y)
                 };
                 if let Some((sw, sh, _)) = self.surface_buffers.get(&surf.id()) {
+                    let (log_w, log_h) = surface_logical_size_from_states(states, *sw, *sh);
                     let lx = ix - nx;
                     let ly = iy - ny;
-                    if lx >= 0 && lx < *sw as i32 && ly >= 0 && ly < *sh as i32 {
+                    if lx >= 0 && lx < log_w as i32 && ly >= 0 && ly < log_h as i32 {
                         let mut attrs = states
                             .cached_state
                             .get::<smithay::wayland::compositor::SurfaceAttributes>();
@@ -636,16 +777,25 @@ impl AppState {
                 window_id,
                 width,
                 height,
+                scale_factor,
                 maximized,
                 fullscreen,
                 activated,
                 tiled,
             } => {
-                if let Some(tracked) = self.windows.get(&window_id) {
+                let scale = sanitize_scale(scale_factor);
+                let mut scale_updated = false;
+                let mut toplevel_surface: Option<WlSurface> = None;
+                if let Some(tracked) = self.windows.get_mut(&window_id) {
+                    if (tracked.scale_factor - scale).abs() > 0.005 {
+                        tracked.scale_factor = scale;
+                        scale_updated = true;
+                    }
                     if let Some(toplevel) = tracked.window.toplevel() {
+                        toplevel_surface = Some(toplevel.wl_surface().clone());
                         debug!(
                             window_id,
-                            width, height, maximized, fullscreen, activated, tiled,
+                            width, height, scale, maximized, fullscreen, activated, tiled,
                             "ConfigureWindow -> remote toplevel"
                         );
                         toplevel.with_pending_state(|state| {
@@ -711,6 +861,34 @@ impl AppState {
                         }
                     }
                     self.ensure_virtual_output_size(min_w, min_h);
+                }
+                if scale_updated {
+                    if let Some(root) = toplevel_surface {
+                        Self::apply_surface_tree_scale(&root, scale);
+                    }
+                    let child_popups: Vec<WlSurface> = self
+                        .popup_windows
+                        .values()
+                        .filter(|p| p.parent_id == window_id)
+                        .map(|p| p.surface.wl_surface().clone())
+                        .collect();
+                    for pop_surf in child_popups {
+                        Self::apply_surface_tree_scale(&pop_surf, scale);
+                    }
+                    if self.focused_window_id == window_id {
+                        if let Some(cs) = self.cursor_surface.clone() {
+                            Self::apply_surface_tree_scale(&cs, scale);
+                        }
+                    }
+                    self.update_output_and_xwayland_scale();
+                }
+            }
+            CompositorCommand::SetDisplayScale { scale_factor } => {
+                let scale = sanitize_scale(scale_factor);
+                if (self.display_scale - scale).abs() > 0.005 {
+                    debug!(old = self.display_scale, new = scale, "updating session display scale");
+                    self.display_scale = scale;
+                    self.update_output_and_xwayland_scale();
                 }
             }
             CompositorCommand::CloseWindow { window_id } => {
@@ -1083,32 +1261,36 @@ impl AppState {
                             window_id: tracked.window_id,
                             server_side: tracked.server_side_decoration,
                         });
-                        if let Some((w, h, bgra)) = &tracked.latest_bgra {
+                        if let Some(frame) = &tracked.latest_bgra {
                             let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
                                 window_id: tracked.window_id,
-                                width: *w,
-                                height: *h,
-                                bgra: bgra.clone(),
+                                width: frame.width,
+                                height: frame.height,
+                                logical_width: frame.logical_width,
+                                logical_height: frame.logical_height,
+                                bgra: frame.bgra.clone(),
                             });
                         }
                     }
                 }
                 for popup in self.popup_windows.values() {
                     if popup.announced {
-                        if let Some((w, h, bgra)) = &popup.latest_bgra {
+                        if let Some(frame) = &popup.latest_bgra {
                             let _ = self.event_tx.send(CompositorEvent::PopupCreated {
                                 window_id: popup.window_id,
                                 parent_id: popup.parent_id,
                                 x: popup.geo.loc.x,
                                 y: popup.geo.loc.y,
-                                width: *w,
-                                height: *h,
+                                width: frame.logical_width,
+                                height: frame.logical_height,
                             });
                             let _ = self.event_tx.send(CompositorEvent::PopupFrame {
                                 window_id: popup.window_id,
-                                width: *w,
-                                height: *h,
-                                bgra: bgra.clone(),
+                                width: frame.width,
+                                height: frame.height,
+                                logical_width: frame.logical_width,
+                                logical_height: frame.logical_height,
+                                bgra: frame.bgra.clone(),
                             });
                         }
                     }
@@ -1140,32 +1322,36 @@ impl AppState {
                             window_id: xwin.window_id,
                             server_side: xwin.server_side_decoration,
                         });
-                        if let Some((w, h, bgra)) = &xwin.latest_bgra {
+                        if let Some(frame) = &xwin.latest_bgra {
                             let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
                                 window_id: xwin.window_id,
-                                width: *w,
-                                height: *h,
-                                bgra: bgra.clone(),
+                                width: frame.width,
+                                height: frame.height,
+                                logical_width: frame.logical_width,
+                                logical_height: frame.logical_height,
+                                bgra: frame.bgra.clone(),
                             });
                         }
                     }
                 }
                 for xpop in self.x11_popups.values() {
                     if xpop.announced {
-                        if let Some((w, h, bgra)) = &xpop.latest_bgra {
+                        if let Some(frame) = &xpop.latest_bgra {
                             let _ = self.event_tx.send(CompositorEvent::PopupCreated {
                                 window_id: xpop.window_id,
                                 parent_id: xpop.parent_id,
                                 x: xpop.rel_pos.0,
                                 y: xpop.rel_pos.1,
-                                width: *w,
-                                height: *h,
+                                width: frame.logical_width,
+                                height: frame.logical_height,
                             });
                             let _ = self.event_tx.send(CompositorEvent::PopupFrame {
                                 window_id: xpop.window_id,
-                                width: *w,
-                                height: *h,
-                                bgra: bgra.clone(),
+                                width: frame.width,
+                                height: frame.height,
+                                logical_width: frame.logical_width,
+                                logical_height: frame.logical_height,
+                                bgra: frame.bgra.clone(),
                             });
                         }
                     }
@@ -1181,6 +1367,9 @@ impl AppState {
         };
         let surf_w = *surf_w;
         let surf_h = *surf_h;
+        let (root_log_w, root_log_h) = surface_logical_size(root_surface, surf_w, surf_h);
+        let root_sx = surf_w as f64 / root_log_w as f64;
+        let root_sy = surf_h as f64 / root_log_h as f64;
 
         let (title, app_id) = with_states(root_surface, |states| {
             let guard = states
@@ -1203,18 +1392,30 @@ impl AppState {
                 .current()
                 .geometry
         });
-        let (crop_x, crop_y, win_w, win_h) = match xdg_geo {
+        let (crop_x, crop_y, win_log_w, win_log_h) = match xdg_geo {
             Some(g) if g.size.w > 0 && g.size.h > 0 => {
                 let cx = g.loc.x.max(0);
                 let cy = g.loc.y.max(0);
-                let cw = (g.size.w as u32).min(surf_w.saturating_sub(cx as u32));
-                let ch = (g.size.h as u32).min(surf_h.saturating_sub(cy as u32));
+                let cw = (g.size.w as u32).min(root_log_w.saturating_sub(cx as u32));
+                let ch = (g.size.h as u32).min(root_log_h.saturating_sub(cy as u32));
                 (cx, cy, cw.max(1), ch.max(1))
             }
-            _ => (0, 0, surf_w, surf_h),
+            _ => (0, 0, root_log_w, root_log_h),
+        };
+        let (win_phys_w, win_phys_h) = if crop_x == 0
+            && crop_y == 0
+            && win_log_w == root_log_w
+            && win_log_h == root_log_h
+        {
+            (surf_w, surf_h)
+        } else {
+            (
+                ((win_log_w as f64 * root_sx).round() as u32).max(1),
+                ((win_log_h as f64 * root_sy).round() as u32).max(1),
+            )
         };
 
-        let mut composite = vec![0u8; (win_w * win_h * 4) as usize];
+        let mut composite = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
         let mut sub_info = Vec::new();
 
         with_surface_tree_downward(
@@ -1229,8 +1430,43 @@ impl AppState {
                     (ox + loc.x, oy + loc.y)
                 };
                 if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id()) {
-                    sub_info.push((surf == root_surface, *sw, *sh, nx, ny));
-                    blit_rgba_over(&mut composite, win_w, win_h, srgba, *sw, *sh, nx, ny);
+                    let (sub_log_w, sub_log_h) = surface_logical_size_from_states(states, *sw, *sh);
+                    let dst_x = (nx as f64 * root_sx).round() as i32;
+                    let dst_y = (ny as f64 * root_sy).round() as i32;
+                    let (dst_w, dst_h) = if surf == root_surface {
+                        (*sw, *sh)
+                    } else {
+                        (
+                            ((sub_log_w as f64 * root_sx).round() as u32).max(1),
+                            ((sub_log_h as f64 * root_sy).round() as u32).max(1),
+                        )
+                    };
+                    sub_info.push((surf == root_surface, *sw, *sh, dst_x, dst_y));
+                    if dst_w == *sw && dst_h == *sh {
+                        blit_rgba_over(
+                            &mut composite,
+                            win_phys_w,
+                            win_phys_h,
+                            srgba,
+                            *sw,
+                            *sh,
+                            dst_x,
+                            dst_y,
+                        );
+                    } else {
+                        blit_rgba_over_scaled(
+                            &mut composite,
+                            win_phys_w,
+                            win_phys_h,
+                            srgba,
+                            *sw,
+                            *sh,
+                            dst_x,
+                            dst_y,
+                            dst_w,
+                            dst_h,
+                        );
+                    }
                 }
                 TraversalAction::DoChildren((nx, ny))
             },
@@ -1245,8 +1481,10 @@ impl AppState {
         if sub_info != tracked.last_sub_info {
             debug!(
                 window_id,
-                win_w,
-                win_h,
+                win_phys_w,
+                win_phys_h,
+                win_log_w,
+                win_log_h,
                 crop_x,
                 crop_y,
                 ?sub_info,
@@ -1255,26 +1493,30 @@ impl AppState {
             tracked.last_sub_info = sub_info;
         }
 
-        if tracked
-            .latest_bgra
-            .as_ref()
-            .is_some_and(|(lw, lh, lbgra)| *lw == win_w && *lh == win_h && lbgra == &composite)
-        {
+        let new_frame = CachedFrame {
+            width: win_phys_w,
+            height: win_phys_h,
+            logical_width: win_log_w,
+            logical_height: win_log_h,
+            bgra: composite,
+        };
+
+        if tracked.latest_bgra.as_ref() == Some(&new_frame) {
             return;
         }
 
-        if !tracked.announced && win_w > 0 && win_h > 0 {
+        if !tracked.announced && win_log_w > 0 && win_log_h > 0 {
             tracked.announced = true;
-            tracked.last_width = win_w;
-            tracked.last_height = win_h;
+            tracked.last_width = win_log_w;
+            tracked.last_height = win_log_h;
             tracked.last_title = title.clone();
             tracked.last_app_id = app_id.clone();
             let _ = self.event_tx.send(CompositorEvent::WindowCreated {
                 window_id,
                 title: title.clone(),
                 app_id: app_id.clone(),
-                width: win_w,
-                height: win_h,
+                width: win_log_w,
+                height: win_log_h,
             });
             let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
                 window_id,
@@ -1309,23 +1551,25 @@ impl AppState {
                     state: LaunchState::Running,
                 });
             }
-        } else if win_w != tracked.last_width || win_h != tracked.last_height {
-            tracked.last_width = win_w;
-            tracked.last_height = win_h;
+        } else if win_log_w != tracked.last_width || win_log_h != tracked.last_height {
+            tracked.last_width = win_log_w;
+            tracked.last_height = win_log_h;
             let _ = self.event_tx.send(CompositorEvent::WindowConfigured {
                 window_id,
-                width: win_w,
-                height: win_h,
-                scale_factor: 1.0,
+                width: win_log_w,
+                height: win_log_h,
+                scale_factor: tracked.scale_factor,
             });
         }
 
-        tracked.latest_bgra = Some((win_w, win_h, composite.clone()));
+        tracked.latest_bgra = Some(new_frame.clone());
         let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
             window_id,
-            width: win_w,
-            height: win_h,
-            bgra: composite,
+            width: new_frame.width,
+            height: new_frame.height,
+            logical_width: new_frame.logical_width,
+            logical_height: new_frame.logical_height,
+            bgra: new_frame.bgra,
         });
     }
 
@@ -1340,6 +1584,9 @@ impl AppState {
         };
         let surf_w = *surf_w;
         let surf_h = *surf_h;
+        let (root_log_w, root_log_h) = surface_logical_size(&root_surface, surf_w, surf_h);
+        let root_sx = surf_w as f64 / root_log_w as f64;
+        let root_sy = surf_h as f64 / root_log_h as f64;
 
         let acked_geo = with_states(&root_surface, |states| {
             states
@@ -1356,18 +1603,30 @@ impl AppState {
                 .current()
                 .geometry
         });
-        let (crop_x, crop_y, pop_w, pop_h) = match xdg_geo {
+        let (crop_x, crop_y, pop_log_w, pop_log_h) = match xdg_geo {
             Some(g) if g.size.w > 0 && g.size.h > 0 => {
                 let cx = g.loc.x.max(0);
                 let cy = g.loc.y.max(0);
-                let cw = (g.size.w as u32).min(surf_w.saturating_sub(cx as u32));
-                let ch = (g.size.h as u32).min(surf_h.saturating_sub(cy as u32));
+                let cw = (g.size.w as u32).min(root_log_w.saturating_sub(cx as u32));
+                let ch = (g.size.h as u32).min(root_log_h.saturating_sub(cy as u32));
                 (cx, cy, cw.max(1), ch.max(1))
             }
-            _ => (0, 0, surf_w, surf_h),
+            _ => (0, 0, root_log_w, root_log_h),
+        };
+        let (pop_phys_w, pop_phys_h) = if crop_x == 0
+            && crop_y == 0
+            && pop_log_w == root_log_w
+            && pop_log_h == root_log_h
+        {
+            (surf_w, surf_h)
+        } else {
+            (
+                ((pop_log_w as f64 * root_sx).round() as u32).max(1),
+                ((pop_log_h as f64 * root_sy).round() as u32).max(1),
+            )
         };
 
-        let mut bgra = vec![0u8; (pop_w * pop_h * 4) as usize];
+        let mut bgra = vec![0u8; (pop_phys_w * pop_phys_h * 4) as usize];
         with_surface_tree_downward(
             &root_surface,
             (-crop_x, -crop_y),
@@ -1380,7 +1639,42 @@ impl AppState {
                     (ox + loc.x, oy + loc.y)
                 };
                 if let Some((sw, sh, sbgra)) = self.surface_buffers.get(&surf.id()) {
-                    blit_rgba_over(&mut bgra, pop_w, pop_h, sbgra, *sw, *sh, nx, ny);
+                    let (sub_log_w, sub_log_h) = surface_logical_size_from_states(states, *sw, *sh);
+                    let dst_x = (nx as f64 * root_sx).round() as i32;
+                    let dst_y = (ny as f64 * root_sy).round() as i32;
+                    let (dst_w, dst_h) = if surf == &root_surface {
+                        (*sw, *sh)
+                    } else {
+                        (
+                            ((sub_log_w as f64 * root_sx).round() as u32).max(1),
+                            ((sub_log_h as f64 * root_sy).round() as u32).max(1),
+                        )
+                    };
+                    if dst_w == *sw && dst_h == *sh {
+                        blit_rgba_over(
+                            &mut bgra,
+                            pop_phys_w,
+                            pop_phys_h,
+                            sbgra,
+                            *sw,
+                            *sh,
+                            dst_x,
+                            dst_y,
+                        );
+                    } else {
+                        blit_rgba_over_scaled(
+                            &mut bgra,
+                            pop_phys_w,
+                            pop_phys_h,
+                            sbgra,
+                            *sw,
+                            *sh,
+                            dst_x,
+                            dst_y,
+                            dst_w,
+                            dst_h,
+                        );
+                    }
                 }
                 TraversalAction::DoChildren((nx, ny))
             },
@@ -1398,11 +1692,15 @@ impl AppState {
         }
         popup.geo_offset = (crop_x, crop_y);
 
-        if popup
-            .latest_bgra
-            .as_ref()
-            .is_some_and(|(lw, lh, lbgra)| *lw == pop_w && *lh == pop_h && lbgra == &bgra)
-        {
+        let new_frame = CachedFrame {
+            width: pop_phys_w,
+            height: pop_phys_h,
+            logical_width: pop_log_w,
+            logical_height: pop_log_h,
+            bgra,
+        };
+
+        if popup.latest_bgra.as_ref() == Some(&new_frame) {
             return;
         }
 
@@ -1413,17 +1711,19 @@ impl AppState {
                 parent_id: popup.parent_id,
                 x: popup.geo.loc.x,
                 y: popup.geo.loc.y,
-                width: pop_w,
-                height: pop_h,
+                width: pop_log_w,
+                height: pop_log_h,
             });
         }
 
-        popup.latest_bgra = Some((pop_w, pop_h, bgra.clone()));
+        popup.latest_bgra = Some(new_frame.clone());
         let _ = self.event_tx.send(CompositorEvent::PopupFrame {
             window_id,
-            width: pop_w,
-            height: pop_h,
-            bgra,
+            width: new_frame.width,
+            height: new_frame.height,
+            logical_width: new_frame.logical_width,
+            logical_height: new_frame.logical_height,
+            bgra: new_frame.bgra,
         });
     }
 }
@@ -1554,7 +1854,9 @@ impl XdgShellHandler for AppState {
         });
         surface.send_configure();
 
+        let initial_scale = sanitize_scale(self.display_scale);
         let wl_surface = surface.wl_surface().clone();
+        Self::apply_surface_tree_scale(&wl_surface, initial_scale);
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window.clone(), (0, 0), false);
         let initial_ssd = self
@@ -1571,6 +1873,7 @@ impl XdgShellHandler for AppState {
                 last_app_id: String::new(),
                 last_width: 0,
                 last_height: 0,
+                scale_factor: initial_scale,
                 geo_offset: (0, 0),
                 server_side_decoration: initial_ssd,
                 announced: false,
@@ -1731,6 +2034,13 @@ impl XdgShellHandler for AppState {
             .and_then(|p| self.surface_to_window.get(&p.id()).copied())
             .unwrap_or(1);
 
+        let parent_scale = self
+            .windows
+            .get(&parent_id)
+            .map(|w| w.scale_factor)
+            .unwrap_or(self.display_scale);
+        Self::apply_surface_tree_scale(surface.wl_surface(), parent_scale);
+
         let geo = positioner.get_geometry();
         surface.with_pending_state(|state| {
             state.geometry = geo;
@@ -1839,6 +2149,12 @@ impl SeatHandler for AppState {
                 });
             }
             CursorImageStatus::Surface(surf) => {
+                let scale = self
+                    .windows
+                    .get(&self.focused_window_id)
+                    .map(|w| w.scale_factor)
+                    .unwrap_or(self.display_scale);
+                Self::apply_surface_tree_scale(&surf, scale);
                 self.cursor_surface = Some(surf.clone());
                 if self.surface_buffers.contains_key(&surf.id()) {
                     self.emit_cursor_surface_bitmap(&surf);
@@ -2067,6 +2383,9 @@ impl AppState {
         if w == 0 || h == 0 {
             return;
         }
+        let x11_scale = sanitize_scale(self.xwayland_scale);
+        let log_w = ((w as f64 / x11_scale).round() as u32).max(1);
+        let log_h = ((h as f64 / x11_scale).round() as u32).max(1);
         let Some(xwin) = self.x11_windows.get_mut(&window_id) else {
             return;
         };
@@ -2080,23 +2399,25 @@ impl AppState {
             };
         }
         let title_or_app_changed = title != xwin.last_title || app_id != xwin.last_app_id;
-        let size_changed = w != xwin.last_width || h != xwin.last_height;
-        let frame_unchanged = xwin.announced
-            && !title_or_app_changed
-            && xwin
-                .latest_bgra
-                .as_ref()
-                .is_some_and(|(lw, lh, lbgra)| *lw == w && *lh == h && lbgra == bgra_ref);
+        let size_changed = log_w != xwin.last_width || log_h != xwin.last_height;
+        let new_frame = CachedFrame {
+            width: w,
+            height: h,
+            logical_width: log_w,
+            logical_height: log_h,
+            bgra: bgra_ref.clone(),
+        };
+        let frame_unchanged =
+            xwin.announced && !title_or_app_changed && xwin.latest_bgra.as_ref() == Some(&new_frame);
         if frame_unchanged {
             return;
         }
 
-        let bgra = bgra_ref.clone();
         xwin.last_title = title.clone();
         xwin.last_app_id = app_id.clone();
-        xwin.last_width = w;
-        xwin.last_height = h;
-        xwin.latest_bgra = Some((w, h, bgra.clone()));
+        xwin.last_width = log_w;
+        xwin.last_height = log_h;
+        xwin.latest_bgra = Some(new_frame.clone());
 
         if !xwin.announced {
             xwin.announced = true;
@@ -2105,8 +2426,8 @@ impl AppState {
                 window_id,
                 title: title.clone(),
                 app_id: app_id.clone(),
-                width: w,
-                height: h,
+                width: log_w,
+                height: log_h,
             });
             let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
                 window_id,
@@ -2143,25 +2464,27 @@ impl AppState {
                     window_id,
                     title,
                     app_id,
-                    width: w,
-                    height: h,
+                    width: log_w,
+                    height: log_h,
                 });
             }
             if size_changed {
                 let _ = self.event_tx.send(CompositorEvent::WindowConfigured {
                     window_id,
-                    width: w,
-                    height: h,
-                    scale_factor: 1.0,
+                    width: log_w,
+                    height: log_h,
+                    scale_factor: x11_scale,
                 });
             }
         }
 
         let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
             window_id,
-            width: w,
-            height: h,
-            bgra,
+            width: new_frame.width,
+            height: new_frame.height,
+            logical_width: new_frame.logical_width,
+            logical_height: new_frame.logical_height,
+            bgra: new_frame.bgra,
         });
     }
 
@@ -2173,19 +2496,23 @@ impl AppState {
         if w == 0 || h == 0 {
             return;
         }
+        let x11_scale = sanitize_scale(self.xwayland_scale);
+        let log_w = ((w as f64 / x11_scale).round() as u32).max(1);
+        let log_h = ((h as f64 / x11_scale).round() as u32).max(1);
         let Some(xpop) = self.x11_popups.get_mut(&window_id) else {
             return;
         };
-        if xpop.announced
-            && xpop
-                .latest_bgra
-                .as_ref()
-                .is_some_and(|(lw, lh, lbgra)| *lw == w && *lh == h && lbgra == bgra_ref)
-        {
+        let new_frame = CachedFrame {
+            width: w,
+            height: h,
+            logical_width: log_w,
+            logical_height: log_h,
+            bgra: bgra_ref.clone(),
+        };
+        if xpop.announced && xpop.latest_bgra.as_ref() == Some(&new_frame) {
             return;
         }
-        let bgra = bgra_ref.clone();
-        xpop.latest_bgra = Some((w, h, bgra.clone()));
+        xpop.latest_bgra = Some(new_frame.clone());
         if !xpop.announced {
             xpop.announced = true;
             debug!(
@@ -2195,6 +2522,8 @@ impl AppState {
                 y = xpop.rel_pos.1,
                 w,
                 h,
+                log_w,
+                log_h,
                 "emitting PopupCreated for X11 popup"
             );
             let _ = self.event_tx.send(CompositorEvent::PopupCreated {
@@ -2202,15 +2531,17 @@ impl AppState {
                 parent_id: xpop.parent_id,
                 x: xpop.rel_pos.0,
                 y: xpop.rel_pos.1,
-                width: w,
-                height: h,
+                width: log_w,
+                height: log_h,
             });
         }
         let _ = self.event_tx.send(CompositorEvent::PopupFrame {
             window_id,
-            width: w,
-            height: h,
-            bgra,
+            width: new_frame.width,
+            height: new_frame.height,
+            logical_width: new_frame.logical_width,
+            logical_height: new_frame.logical_height,
+            bgra: new_frame.bgra,
         });
     }
 
@@ -2970,6 +3301,13 @@ impl KdeDecorationHandler for AppState {
     }
 }
 
+impl FractionalScaleHandler for AppState {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = self.window_scale_for_surface(&surface);
+        Self::apply_surface_tree_scale(&surface, scale);
+    }
+}
+
 delegate_compositor!(AppState);
 delegate_shm!(AppState);
 delegate_xdg_shell!(AppState);
@@ -2979,6 +3317,8 @@ delegate_seat!(AppState);
 delegate_data_device!(AppState);
 delegate_primary_selection!(AppState);
 delegate_cursor_shape!(AppState);
+delegate_fractional_scale!(AppState);
+delegate_viewporter!(AppState);
 delegate_output!(AppState);
 delegate_xwayland_shell!(AppState);
 
@@ -3119,6 +3459,8 @@ fn run_compositor_loop(
     let data_device_state = DataDeviceState::new::<AppState>(&dh);
     let primary_selection_state = PrimarySelectionState::new::<AppState>(&dh);
     let cursor_shape_state = CursorShapeManagerState::new::<AppState>(&dh);
+    let fractional_scale_manager_state = FractionalScaleManagerState::new::<AppState>(&dh);
+    let viewporter_state = ViewporterState::new::<AppState>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<AppState>(&dh);
     let xwayland_shell_state = XWaylandShellState::new::<AppState>(&dh);
 
@@ -3178,9 +3520,12 @@ fn run_compositor_loop(
                             ) {
                                 Ok(wm) => {
                                     state.xwm = Some(wm);
+                                    state.xwayland_scale = sanitize_scale(state.display_scale);
+                                    state.apply_xwayland_scale();
                                     info!(
                                         display = %disp,
                                         xauthority = ?xauth_path,
+                                        scale = state.xwayland_scale,
                                         "embedded XWayland window manager ready"
                                     );
                                 }
@@ -3241,12 +3586,17 @@ fn run_compositor_loop(
         data_device_state,
         primary_selection_state,
         cursor_shape_state,
+        fractional_scale_manager_state,
+        viewporter_state,
         output_manager_state,
         xwayland_shell_state,
         xwm: None,
         xwayland_client,
         output,
         output_size: (1920, 1080),
+        output_scale: 1,
+        display_scale: 1.0,
+        xwayland_scale: 1.0,
         seat,
         space,
         popups: PopupManager::default(),
@@ -3536,6 +3886,124 @@ fn clear_keyboard_focus_and_keys<D: SeatHandler + 'static>(
     }
 }
 
+fn sanitize_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale >= 1.0 {
+        scale.min(4.0)
+    } else {
+        1.0
+    }
+}
+
+fn surface_logical_size_from_states(
+    states: &smithay::wayland::compositor::SurfaceData,
+    buf_w: u32,
+    buf_h: u32,
+) -> (u32, u32) {
+    let vp_size = {
+        let mut vp = states.cached_state.get::<ViewportCachedState>();
+        let cur = vp.current();
+        if let Some(dst) = cur.dst {
+            if dst.w > 0 && dst.h > 0 {
+                Some((dst.w as u32, dst.h as u32))
+            } else {
+                None
+            }
+        } else if let Some(src) = cur.src {
+            if src.size.w > 0.0 && src.size.h > 0.0 {
+                Some((
+                    src.size.w.round().max(1.0) as u32,
+                    src.size.h.round().max(1.0) as u32,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(size) = vp_size {
+        return size;
+    }
+    let buf_scale = {
+        let mut attrs = states
+            .cached_state
+            .get::<smithay::wayland::compositor::SurfaceAttributes>();
+        attrs.current().buffer_scale.max(1) as u32
+    };
+    ((buf_w / buf_scale).max(1), (buf_h / buf_scale).max(1))
+}
+
+fn surface_logical_size(surface: &WlSurface, buf_w: u32, buf_h: u32) -> (u32, u32) {
+    with_states(surface, |states| {
+        surface_logical_size_from_states(states, buf_w, buf_h)
+    })
+}
+
+fn apply_xft_dpi(dpi: u32) {
+    let mut cmd = Command::new("xrdb");
+    if !crate::session::apply_x11_env(&mut cmd) {
+        return;
+    }
+    cmd.arg("-merge")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut child) = cmd.spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = write!(stdin, "Xft.dpi: {dpi}\n");
+        }
+        let _ = child.wait();
+    }
+}
+
+fn blit_rgba_over_scaled(
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    ox: i32,
+    oy: i32,
+    target_w: u32,
+    target_h: u32,
+) {
+    if src_w == 0 || src_h == 0 || target_w == 0 || target_h == 0 {
+        return;
+    }
+    let x_scale = src_w as f64 / target_w as f64;
+    let y_scale = src_h as f64 / target_h as f64;
+    for ty in 0..(target_h as i32) {
+        let dy = ty + oy;
+        if dy < 0 || dy >= dst_h as i32 {
+            continue;
+        }
+        let sy = ((ty as f64 + 0.5) * y_scale).floor().clamp(0.0, (src_h - 1) as f64) as u32;
+        for tx in 0..(target_w as i32) {
+            let dx = tx + ox;
+            if dx < 0 || dx >= dst_w as i32 {
+                continue;
+            }
+            let sx = ((tx as f64 + 0.5) * x_scale).floor().clamp(0.0, (src_w - 1) as f64) as u32;
+            let s_idx = ((sy * src_w + sx) * 4) as usize;
+            let d_idx = ((dy as u32 * dst_w + dx as u32) * 4) as usize;
+            let sa = src[s_idx + 3] as u32;
+            if sa == 255 {
+                dst[d_idx..d_idx + 4].copy_from_slice(&src[s_idx..s_idx + 4]);
+            } else if sa > 0 {
+                let inv = 255 - sa;
+                dst[d_idx] = ((src[s_idx] as u32 * sa + dst[d_idx] as u32 * inv) / 255) as u8;
+                dst[d_idx + 1] =
+                    ((src[s_idx + 1] as u32 * sa + dst[d_idx + 1] as u32 * inv) / 255) as u8;
+                dst[d_idx + 2] =
+                    ((src[s_idx + 2] as u32 * sa + dst[d_idx + 2] as u32 * inv) / 255) as u8;
+                dst[d_idx + 3] = (sa + (dst[d_idx + 3] as u32 * inv) / 255) as u8;
+            }
+        }
+    }
+}
+
 fn blit_rgba_over(
     dst: &mut [u8],
     dst_w: u32,
@@ -3593,6 +4061,38 @@ mod tests {
             pick_preferred_text_mime(&["image/png".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn sanitize_scale_clamps_invalid_and_out_of_range_values() {
+        assert_eq!(sanitize_scale(1.5), 1.5);
+        assert_eq!(sanitize_scale(0.5), 1.0);
+        assert_eq!(sanitize_scale(-2.0), 1.0);
+        assert_eq!(sanitize_scale(f64::NAN), 1.0);
+        assert_eq!(sanitize_scale(f64::INFINITY), 1.0);
+        assert_eq!(sanitize_scale(6.0), 4.0);
+    }
+
+    #[test]
+    fn blit_rgba_over_scaled_upscales_1x_subsurface_into_2x_canvas() {
+        // 2x1 opaque source: left pixel blue, right pixel red.
+        let src = [
+            255u8, 0, 0, 255, // (0,0)
+            0, 0, 255, 255, // (1,0)
+        ];
+        let mut dst = vec![0u8; 4 * 2 * 4];
+        blit_rgba_over_scaled(&mut dst, 4, 2, &src, 2, 1, 0, 0, 4, 2);
+        // Columns 0,1 should be blue; columns 2,3 should be red on both rows.
+        for y in 0..2 {
+            for x in 0..2 {
+                let idx = (y * 4 + x) * 4;
+                assert_eq!(&dst[idx..idx + 4], &[255, 0, 0, 255]);
+            }
+            for x in 2..4 {
+                let idx = (y * 4 + x) * 4;
+                assert_eq!(&dst[idx..idx + 4], &[0, 0, 255, 255]);
+            }
+        }
     }
 
     #[test]
