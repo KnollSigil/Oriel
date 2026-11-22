@@ -1,5 +1,7 @@
 //! Shared wire protocol and stream framing for RemoteWayland.
 
+pub mod smart_tile;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -39,6 +41,7 @@ pub enum VideoCodec {
     H264,
     Hevc,
     Av1,
+    SmartTile,
 }
 
 /// Identifies the role of a newly opened unidirectional QUIC stream.

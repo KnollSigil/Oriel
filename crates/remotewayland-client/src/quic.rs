@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::audio::{start_mic_capture, AudioPlaybackSink};
-use crate::media::VideoDecoder;
+use crate::media::{VideoDecoder, WindowVideoDecoder};
 use crate::window::{ClientUiEvent, UiSender};
 
 #[derive(Debug)]
@@ -135,7 +135,7 @@ pub async fn connect_and_auth(
         &ControlMessage::AuthRequest {
             protocol_version: PROTOCOL_VERSION,
             token,
-            supported_codecs: vec![VideoCodec::Lz4Delta],
+            supported_codecs: vec![VideoCodec::SmartTile, VideoCodec::Lz4Delta],
             enable_audio_bridge,
             initial_scale,
         },
@@ -311,11 +311,8 @@ pub async fn run_client(
             let ack_tx = uni_ack_tx.clone();
             tokio::spawn(async move {
                 match read_stream_header(&mut recv_uni).await {
-                    Ok(StreamHeader::Video {
-                        window_id,
-                        codec: _,
-                    }) => {
-                        let mut decoder = VideoDecoder::new();
+                    Ok(StreamHeader::Video { window_id, codec }) => {
+                        let mut decoder = WindowVideoDecoder::new(codec);
                         while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
                             match decoder.decode(hdr.width, hdr.height, hdr.is_keyframe, &payload) {
                                 Ok(frame) => {

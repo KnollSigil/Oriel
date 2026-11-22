@@ -1,15 +1,85 @@
-//! Pure-Rust XOR-delta + LZ4 video encoder (`VideoCodec::Lz4Delta`).
+//! Pure-Rust video encoders (`VideoCodec::Lz4Delta` and `VideoCodec::SmartTile`).
 //!
-//! Compresses full `Argb8888` (`BGRA`) frames with zero chroma subsampling,
-//! full alpha-channel preservation, and instant zero-stall window resizing.
+//! - `Lz4Delta`: lossless XOR-delta + LZ4 on full `Argb8888` (`BGRA`) frames (used for popups and fallback).
+//! - `SmartTile`: sub-region scroll `CopyRect`, 64x64 dirty-tile skipping, adaptive lossless/DCT
+//!   (Intra I-tiles & Inter residual P-tiles), and automatic lossless idle refinement.
 
-/// An encoded video frame (keyframe or XOR delta compressed with LZ4).
+use remotewayland_proto::smart_tile::SmartTileEncoder;
+use remotewayland_proto::VideoCodec;
+
+/// An encoded video frame (keyframe or delta/tile packet).
 pub struct EncodedFrame {
     pub pts_ns: u64,
     pub width: u32,
     pub height: u32,
     pub is_keyframe: bool,
+    pub used_lossy: bool,
     pub data: Vec<u8>,
+}
+
+/// Codec-polymorphic per-window video encoder.
+pub enum WindowVideoEncoder {
+    Lz4Delta(VideoEncoder),
+    SmartTile(SmartTileEncoder),
+}
+
+impl WindowVideoEncoder {
+    pub fn new(codec: VideoCodec) -> Self {
+        match codec {
+            VideoCodec::SmartTile => Self::SmartTile(SmartTileEncoder::new()),
+            _ => Self::Lz4Delta(VideoEncoder::new()),
+        }
+    }
+
+    pub fn encode_bgra(
+        &mut self,
+        width: u32,
+        height: u32,
+        pts_ns: u64,
+        bgra: &[u8],
+        quality: u8,
+    ) -> EncodedFrame {
+        match self {
+            Self::Lz4Delta(enc) => enc.encode_bgra(width, height, pts_ns, bgra),
+            Self::SmartTile(enc) => {
+                let pkt = enc.encode(width, height, bgra, quality);
+                EncodedFrame {
+                    pts_ns,
+                    width,
+                    height,
+                    is_keyframe: pkt.is_keyframe,
+                    used_lossy: pkt.used_lossy,
+                    data: pkt.payload,
+                }
+            }
+        }
+    }
+
+    pub fn has_pending_lossless_refresh(&self) -> bool {
+        match self {
+            Self::Lz4Delta(_) => false,
+            Self::SmartTile(enc) => enc.has_pending_lossless_refresh(),
+        }
+    }
+
+    pub fn encode_lossless_refresh(
+        &mut self,
+        width: u32,
+        height: u32,
+        pts_ns: u64,
+    ) -> Option<EncodedFrame> {
+        match self {
+            Self::Lz4Delta(_) => None,
+            Self::SmartTile(enc) => enc.encode_lossless_refresh().map(|pkt| EncodedFrame {
+                pts_ns,
+                width,
+                height,
+                is_keyframe: false,
+                used_lossy: false,
+                data: pkt.payload,
+            }),
+        }
+    }
 }
 
 /// Per-window XOR-delta + LZ4 video encoder.
@@ -19,7 +89,6 @@ pub struct VideoEncoder {
     height: u32,
     prev_bgra: Vec<u8>,
     scratch_delta: Vec<u8>,
-    frame_idx: u64,
 }
 
 impl VideoEncoder {
@@ -35,10 +104,8 @@ impl VideoEncoder {
         pts_ns: u64,
         bgra: &[u8],
     ) -> EncodedFrame {
-        let is_keyframe = width != self.width
-            || height != self.height
-            || self.prev_bgra.len() != bgra.len()
-            || self.frame_idx % 120 == 0;
+        let is_keyframe =
+            width != self.width || height != self.height || self.prev_bgra.len() != bgra.len();
 
         let data = if is_keyframe {
             self.width = width;
@@ -60,12 +127,12 @@ impl VideoEncoder {
             lz4_flex::compress_prepend_size(&self.scratch_delta)
         };
 
-        self.frame_idx = self.frame_idx.wrapping_add(1);
         EncodedFrame {
             pts_ns,
             width,
             height,
             is_keyframe,
+            used_lossy: false,
             data,
         }
     }

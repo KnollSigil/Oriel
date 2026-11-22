@@ -1,12 +1,49 @@
-//! Pure-Rust XOR-delta + LZ4 video decoder (`VideoCodec::Lz4Delta`).
+//! Pure-Rust video decoders (`VideoCodec::Lz4Delta` and `VideoCodec::SmartTile`).
 
 use anyhow::{bail, Context, Result};
+use remotewayland_proto::smart_tile::SmartTileDecoder;
+use remotewayland_proto::VideoCodec;
 
 /// A decoded BGRA (`Argb8888`) video frame ready for Wayland SHM presentation.
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+}
+
+/// Codec-polymorphic per-window video decoder.
+pub enum WindowVideoDecoder {
+    Lz4Delta(VideoDecoder),
+    SmartTile(SmartTileDecoder),
+}
+
+impl WindowVideoDecoder {
+    pub fn new(codec: VideoCodec) -> Self {
+        match codec {
+            VideoCodec::SmartTile => Self::SmartTile(SmartTileDecoder::new()),
+            _ => Self::Lz4Delta(VideoDecoder::new()),
+        }
+    }
+
+    pub fn decode(
+        &mut self,
+        width: u32,
+        height: u32,
+        is_keyframe: bool,
+        data: &[u8],
+    ) -> Result<DecodedFrame> {
+        match self {
+            Self::Lz4Delta(dec) => dec.decode(width, height, is_keyframe, data),
+            Self::SmartTile(dec) => {
+                let bgra = dec.decode(width, height, data)?;
+                Ok(DecodedFrame {
+                    width,
+                    height,
+                    bgra,
+                })
+            }
+        }
+    }
 }
 
 /// Per-window XOR-delta + LZ4 video decoder.

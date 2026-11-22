@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
-use crate::media::VideoEncoder;
+use crate::media::{VideoEncoder, WindowVideoEncoder};
 
 /// Holds the ephemeral TLS certificate fingerprint and single-use expiring session tokens.
 pub struct EphemeralCredentials {
@@ -198,10 +198,14 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            let selected_codec = supported_codecs
-                .first()
-                .copied()
-                .unwrap_or(VideoCodec::Lz4Delta);
+            let selected_codec = if supported_codecs.contains(&VideoCodec::SmartTile) {
+                VideoCodec::SmartTile
+            } else {
+                supported_codecs
+                    .first()
+                    .copied()
+                    .unwrap_or(VideoCodec::Lz4Delta)
+            };
 
             write_control_message(
                 &mut send,
@@ -715,12 +719,17 @@ async fn run_window_video_pipeline(
         return;
     }
 
-    let mut encoder = Some(VideoEncoder::new());
+    let mut encoder = Some(WindowVideoEncoder::new(selected_codec));
     let mut in_flight_pts: VecDeque<u64> = VecDeque::new();
     let mut last_pts_ns: u64 = 0;
+    let mut quality: u8 = 80;
+    let mut last_dims: Option<(u32, u32, u32, u32)> = None;
+    const IDLE_REFRESH_DELAY: Duration = Duration::from_millis(200);
 
     loop {
-        // 1. Wait until a new frame is available in the 1-slot mailbox.
+        // 1. Wait until a new frame is available in the 1-slot mailbox,
+        //    or fire an automatic lossless refinement pass after 200ms idle on lossy tiles.
+        let mut do_idle_refresh = false;
         loop {
             let notified = notify.notified();
             tokio::pin!(notified);
@@ -728,6 +737,10 @@ async fn run_window_video_pipeline(
             if latest_frame.lock().unwrap().is_some() {
                 break;
             }
+            let needs_refresh = encoder
+                .as_ref()
+                .is_some_and(|e| e.has_pending_lossless_refresh())
+                && last_dims.is_some();
             tokio::select! {
                 _ = notified => {}
                 res = ack_rx.changed() => {
@@ -737,13 +750,27 @@ async fn run_window_video_pipeline(
                     }
                     prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
                 }
+                _ = async {
+                    if needs_refresh {
+                        tokio::time::sleep(IDLE_REFRESH_DELAY).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    if latest_frame.lock().unwrap().is_none() {
+                        do_idle_refresh = true;
+                        break;
+                    }
+                }
             }
         }
 
         // 2. Enforce end-to-end in-flight frame cap before taking/encoding the newest frame.
         //    Any newer frames arriving while waiting overwrite `latest_frame` in place.
         prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
+        let mut experienced_backpressure = false;
         while in_flight_pts.len() >= MAX_IN_FLIGHT_FRAMES {
+            experienced_backpressure = true;
             match tokio::time::timeout(FRAME_ACK_TIMEOUT, ack_rx.changed()).await {
                 Ok(Ok(())) => {
                     prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
@@ -758,35 +785,68 @@ async fn run_window_video_pipeline(
             }
         }
 
-        // 3. Take the latest frame AFTER acquiring credit so stale intermediate frames are skipped.
-        let Some(raw) = latest_frame.lock().unwrap().take() else {
-            continue;
-        };
-
         let raw_pts = session_start.elapsed().as_nanos() as u64;
         let pts_ns = raw_pts.max(last_pts_ns.saturating_add(1));
-        last_pts_ns = pts_ns;
 
-        let logical_width = raw.logical_width;
-        let logical_height = raw.logical_height;
-        // 4. Encode off the async runtime thread so control/input latency stays unaffected.
-        let mut enc = encoder.take().unwrap();
-        let encoded_res = tokio::task::spawn_blocking(move || {
-            let frame = enc.encode_bgra(raw.width, raw.height, pts_ns, &raw.bgra);
-            (enc, frame)
-        })
-        .await;
-        let (enc, frame) = match encoded_res {
-            Ok(pair) => pair,
-            Err(err) => {
-                warn!(window_id, error = %err, "video encoder task panicked");
-                let _ = stream.finish();
-                return;
+        let (logical_width, logical_height, frame) = if do_idle_refresh {
+            // Re-check mailbox in case a new frame arrived while waiting for credit.
+            if latest_frame.lock().unwrap().is_some() {
+                continue;
             }
-        };
-        encoder = Some(enc);
+            let Some((lw_phys, lh_phys, log_w, log_h)) = last_dims else {
+                continue;
+            };
+            let mut enc = encoder.take().unwrap();
+            let encoded_res = tokio::task::spawn_blocking(move || {
+                let frame = enc.encode_lossless_refresh(lw_phys, lh_phys, pts_ns);
+                (enc, frame)
+            })
+            .await;
+            let (enc, frame_opt) = match encoded_res {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(window_id, error = %err, "video lossless refresh task panicked");
+                    let _ = stream.finish();
+                    return;
+                }
+            };
+            encoder = Some(enc);
+            let Some(frame) = frame_opt else {
+                continue;
+            };
+            last_pts_ns = pts_ns;
+            (log_w, log_h, frame)
+        } else {
+            // 3. Take the latest frame AFTER acquiring credit so stale intermediate frames are skipped.
+            let Some(raw) = latest_frame.lock().unwrap().take() else {
+                continue;
+            };
+            last_pts_ns = pts_ns;
+            let logical_width = raw.logical_width;
+            let logical_height = raw.logical_height;
+            last_dims = Some((raw.width, raw.height, logical_width, logical_height));
 
-        // 5. Write encoded frame to the per-window QUIC stream.
+            // 4. Encode off the async runtime thread so control/input latency stays unaffected.
+            let mut enc = encoder.take().unwrap();
+            let q = quality;
+            let encoded_res = tokio::task::spawn_blocking(move || {
+                let frame = enc.encode_bgra(raw.width, raw.height, pts_ns, &raw.bgra, q);
+                (enc, frame)
+            })
+            .await;
+            let (enc, frame) = match encoded_res {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(window_id, error = %err, "video encoder task panicked");
+                    let _ = stream.finish();
+                    return;
+                }
+            };
+            encoder = Some(enc);
+            (logical_width, logical_height, frame)
+        };
+
+        // 5. Write encoded frame to the per-window QUIC stream and adapt DCT quality dynamically.
         let hdr = VideoFrameHeader {
             pts_ns: frame.pts_ns,
             width: frame.width,
@@ -796,10 +856,18 @@ async fn run_window_video_pipeline(
             is_keyframe: frame.is_keyframe,
             payload_len: frame.data.len() as u32,
         };
+        let send_start = Instant::now();
         if let Err(err) = write_video_frame(&mut stream, &hdr, &frame.data).await {
             warn!(window_id, error = %err, "failed to write video frame");
             return;
         }
+        let send_elapsed = send_start.elapsed();
+        if experienced_backpressure || send_elapsed > Duration::from_millis(16) {
+            quality = quality.saturating_sub(8).max(48);
+        } else if frame.used_lossy && send_elapsed < Duration::from_millis(8) {
+            quality = (quality + 2).min(82);
+        }
+
         in_flight_pts.push_back(pts_ns);
         prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
     }
