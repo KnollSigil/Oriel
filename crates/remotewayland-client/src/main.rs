@@ -6,6 +6,7 @@
 
 mod audio;
 mod hosts;
+mod icon;
 mod launcher;
 mod media;
 mod pty;

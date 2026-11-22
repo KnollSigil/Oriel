@@ -7,7 +7,10 @@ license.workspace = true
 [features]
 default = ["gtk4"]
 gtk4 = ["dep:gtk4"]
-qt = ["dep:qtbridge"]
+qt = ["dep:qtbridge", "dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
 
 [dependencies]
 anyhow.workspace = true

@@ -595,7 +595,34 @@ pub async fn run_client(
             }
             ControlMessage::AppList { apps } => {
                 if let Some(tx) = &launcher_tx {
+                    let icon_entries: Vec<crate::icon::AppIconEntry> = apps
+                        .iter()
+                        .filter(|a| !a.icon_data.is_empty())
+                        .map(|a| crate::icon::AppIconEntry {
+                            id: a.id.clone(),
+                            name: a.name.clone(),
+                            exec: a.exec.clone(),
+                            icon_data: a.icon_data.clone(),
+                        })
+                        .collect();
+                    let _ = ui_tx.send(ClientUiEvent::AppIconsUpdated {
+                        entries: icon_entries,
+                    });
                     let _ = tx.send(LauncherNetEvent::AppList(apps));
+                } else {
+                    let icon_entries: Vec<crate::icon::AppIconEntry> = apps
+                        .into_iter()
+                        .filter(|a| !a.icon_data.is_empty())
+                        .map(|a| crate::icon::AppIconEntry {
+                            id: a.id,
+                            name: a.name,
+                            exec: a.exec,
+                            icon_data: a.icon_data,
+                        })
+                        .collect();
+                    let _ = ui_tx.send(ClientUiEvent::AppIconsUpdated {
+                        entries: icon_entries,
+                    });
                 }
             }
             ControlMessage::AppState {

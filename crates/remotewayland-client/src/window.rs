@@ -47,7 +47,10 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{
+        slot::{Buffer, SlotPool},
+        Shm, ShmHandler,
+    },
 };
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -58,7 +61,7 @@ use wayland_client::{
         wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
         wl_surface,
     },
-    Connection, Proxy, QueueHandle, WEnum,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
@@ -68,6 +71,12 @@ use wayland_protocols::xdg::shell::client::{
     xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
     xdg_toplevel::ResizeEdge,
 };
+use wayland_protocols::xdg::toplevel_icon::v1::client::{
+    xdg_toplevel_icon_manager_v1::{self, XdgToplevelIconManagerV1},
+    xdg_toplevel_icon_v1::XdgToplevelIconV1,
+};
+
+use crate::icon::{decode_icon_argb8888, match_app_icon, AppIconEntry};
 
 /// Events sent from the QUIC/GStreamer receiver tasks to the Wayland UI thread.
 #[derive(Debug)]
@@ -155,6 +164,9 @@ pub enum ClientUiEvent {
     PrimarySelectionText {
         text: String,
     },
+    AppIconsUpdated {
+        entries: Vec<AppIconEntry>,
+    },
     Disconnected,
 }
 
@@ -174,8 +186,25 @@ enum ActiveCursor {
 /// Sender handle used by background tasks to wake and message the Wayland event loop.
 pub type UiSender = CalloopSender<ClientUiEvent>;
 
+/// Holds an `xdg_toplevel_icon_v1` and its backing `wl_shm` buffers.
+/// `Drop` destroys the icon object before releasing the backing buffers, as required
+/// by the `xdg-toplevel-icon-v1` protocol (`no_buffer` error).
+struct AppliedWindowIcon {
+    icon: XdgToplevelIconV1,
+    _buffers: Vec<Buffer>,
+}
+
+impl Drop for AppliedWindowIcon {
+    fn drop(&mut self) {
+        self.icon.destroy();
+    }
+}
+
 struct RemoteWindow {
     window: Window,
+    app_id: String,
+    applied_icon: Option<AppliedWindowIcon>,
+    has_pixel_icon: bool,
     configured: bool,
     width: u32,
     height: u32,
@@ -203,7 +232,11 @@ struct ClientApp {
     shm: Shm,
     data_device_manager_state: Option<DataDeviceManagerState>,
     primary_selection_manager_state: Option<PrimarySelectionManagerState>,
+    toplevel_icon_manager: Option<XdgToplevelIconManagerV1>,
     pool: SlotPool,
+    icon_pool: SlotPool,
+    app_icons: Vec<AppIconEntry>,
+    decoded_icon_cache: HashMap<String, Vec<(u32, i32, Vec<u8>)>>,
     conn: Connection,
     qh: QueueHandle<Self>,
 
@@ -309,6 +342,87 @@ impl ClientApp {
         }
     }
 
+    fn apply_window_icon(&mut self, window_id: WindowId, commit: bool) {
+        let Some(mgr) = self.toplevel_icon_manager.clone() else {
+            return;
+        };
+        let Some(win) = self.windows.get(&window_id) else {
+            return;
+        };
+        if win.app_id.is_empty() {
+            return;
+        }
+        let app_id = win.app_id.clone();
+        let already_has_pixels = win.has_pixel_icon;
+        let already_has_icon = win.applied_icon.is_some();
+
+        // Try matching a remote `.desktop` icon from `AppList` and uploading ARGB8888 pixel
+        // buffers at 1x (64px) and 2x (128px) so compositors show the exact remote app icon
+        // even when the app is not installed locally.
+        let mut buffers: Vec<Buffer> = Vec::new();
+        let mut icon_obj: Option<XdgToplevelIconV1> = None;
+
+        if let Some(entry_id) = match_app_icon(&app_id, &self.app_icons).map(|e| e.id.clone()) {
+            if !self.decoded_icon_cache.contains_key(&entry_id) {
+                if let Some(entry) = self.app_icons.iter().find(|e| e.id == entry_id) {
+                    let mut decoded: Vec<(u32, i32, Vec<u8>)> = Vec::new();
+                    for (size, scale) in [(64u32, 1i32), (128u32, 2i32)] {
+                        if let Some(argb) = decode_icon_argb8888(&entry.icon_data, size) {
+                            decoded.push((size, scale, argb));
+                        }
+                    }
+                    self.decoded_icon_cache.insert(entry_id.clone(), decoded);
+                }
+            }
+            if let Some(decoded) = self.decoded_icon_cache.get(&entry_id) {
+                if !decoded.is_empty() {
+                    let icon = mgr.create_icon(&self.qh, ());
+                    for (size, scale, argb) in decoded {
+                        let stride = (*size * 4) as i32;
+                        if let Ok((buffer, canvas)) = self.icon_pool.create_buffer(
+                            *size as i32,
+                            *size as i32,
+                            stride,
+                            wl_shm::Format::Argb8888,
+                        ) {
+                            canvas[..argb.len()].copy_from_slice(argb);
+                            icon.add_buffer(buffer.wl_buffer(), *scale);
+                            buffers.push(buffer);
+                        }
+                    }
+                    if !buffers.is_empty() {
+                        icon_obj = Some(icon);
+                    } else {
+                        icon.destroy();
+                    }
+                }
+            }
+        }
+
+        let has_pixel_icon = !buffers.is_empty();
+        if icon_obj.is_none() {
+            if already_has_pixels || already_has_icon {
+                return;
+            }
+            // Fall back to icon theme name lookup via `xdg_toplevel_icon_v1.set_name`.
+            let icon = mgr.create_icon(&self.qh, ());
+            icon.set_name(app_id);
+            icon_obj = Some(icon);
+        }
+
+        if let (Some(icon), Some(win)) = (icon_obj, self.windows.get_mut(&window_id)) {
+            mgr.set_icon(win.window.xdg_toplevel(), Some(&icon));
+            if commit {
+                win.window.wl_surface().commit();
+            }
+            win.applied_icon = Some(AppliedWindowIcon {
+                icon,
+                _buffers: buffers,
+            });
+            win.has_pixel_icon = has_pixel_icon;
+        }
+    }
+
     fn handle_ui_event(&mut self, event: ClientUiEvent) {
         match event {
             ClientUiEvent::WindowCreated {
@@ -318,12 +432,19 @@ impl ClientApp {
                 width,
                 height,
             } => {
-                if let Some(existing) = self.windows.get(&window_id) {
+                if let Some(existing) = self.windows.get_mut(&window_id) {
                     if !title.is_empty() {
                         existing.window.set_title(title);
                     }
-                    if !app_id.is_empty() {
-                        existing.window.set_app_id(app_id);
+                    let app_id_changed = !app_id.is_empty() && existing.app_id != app_id;
+                    if app_id_changed {
+                        existing.window.set_app_id(app_id.clone());
+                        existing.app_id = app_id;
+                        existing.applied_icon = None;
+                        existing.has_pixel_icon = false;
+                    }
+                    if app_id_changed {
+                        self.apply_window_icon(window_id, true);
                     }
                     return;
                 }
@@ -340,15 +461,18 @@ impl ClientApp {
                     title
                 });
                 if !app_id.is_empty() {
-                    window.set_app_id(app_id);
+                    window.set_app_id(app_id.clone());
                 }
-                window.commit();
 
                 self.surface_to_remote.insert(surf_id, window_id);
+                let has_app_id = !app_id.is_empty();
                 self.windows.insert(
                     window_id,
                     RemoteWindow {
                         window,
+                        app_id,
+                        applied_icon: None,
+                        has_pixel_icon: false,
                         configured: false,
                         width: width.max(64),
                         height: height.max(64),
@@ -360,6 +484,14 @@ impl ClientApp {
                         pending_resize_prev: None,
                     },
                 );
+                if has_app_id {
+                    // Apply icon before the initial commit so both `app_id` and `icon`
+                    // take effect in a single initial surface commit.
+                    self.apply_window_icon(window_id, false);
+                }
+                if let Some(win) = self.windows.get(&window_id) {
+                    win.window.commit();
+                }
             }
             ClientUiEvent::PopupCreated {
                 window_id,
@@ -649,6 +781,19 @@ impl ClientApp {
                         source.set_selection(primary_device, self.last_input_serial);
                         self.primary_selection_source = Some(source);
                     }
+                }
+            }
+            ClientUiEvent::AppIconsUpdated { entries } => {
+                self.app_icons = entries;
+                self.decoded_icon_cache.clear();
+                let pending: Vec<WindowId> = self
+                    .windows
+                    .iter()
+                    .filter(|(_, w)| !w.has_pixel_icon && !w.app_id.is_empty())
+                    .map(|(&id, _)| id)
+                    .collect();
+                for window_id in pending {
+                    self.apply_window_icon(window_id, true);
                 }
             }
             ClientUiEvent::Disconnected => {
@@ -1507,6 +1652,30 @@ impl PrimarySelectionSourceHandler for ClientApp {
     }
 }
 
+impl Dispatch<XdgToplevelIconManagerV1, ()> for ClientApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgToplevelIconManagerV1,
+        _event: xdg_toplevel_icon_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<XdgToplevelIconV1, ()> for ClientApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgToplevelIconV1,
+        _event: wayland_protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl ProvidesRegistryState for ClientApp {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -1564,7 +1733,10 @@ pub fn run_event_loop(
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
     let data_device_manager_state = DataDeviceManagerState::bind(&globals, &qh).ok();
     let primary_selection_manager_state = PrimarySelectionManagerState::bind(&globals, &qh).ok();
+    let toplevel_icon_manager: Option<XdgToplevelIconManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
     let pool = SlotPool::new(1920 * 1080 * 4, &shm).context("failed to create SlotPool")?;
+    let icon_pool =
+        SlotPool::new(128 * 128 * 4 * 4, &shm).context("failed to create icon SlotPool")?;
 
     let mut app = ClientApp {
         registry_state: RegistryState::new(&globals),
@@ -1575,7 +1747,11 @@ pub fn run_event_loop(
         shm,
         data_device_manager_state,
         primary_selection_manager_state,
+        toplevel_icon_manager,
         pool,
+        icon_pool,
+        app_icons: Vec::new(),
+        decoded_icon_cache: HashMap::new(),
         conn,
         qh,
         seat: None,
