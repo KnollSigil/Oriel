@@ -576,6 +576,7 @@ fn sync_dbus_activation_env() {
     let mut cmd = Command::new("dbus-update-activation-environment");
     let mut vars = vec![
         "XDG_RUNTIME_DIR",
+        "XDG_SESSION_TYPE",
         "XDG_CONFIG_DIRS",
         "GTK_USE_PORTAL",
         "PULSE_SINK",
@@ -1070,6 +1071,7 @@ pub fn write_xwayland_auth_shim(
 pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
     cmd.env_remove("DISPLAY")
         .env_remove("XAUTHORITY")
+        .env("XDG_SESSION_TYPE", "wayland")
         .env("GTK_USE_PORTAL", "1")
         .env("PULSE_SINK", crate::audio::VIRTUAL_SINK_NAME)
         .env("PULSE_SOURCE", crate::audio::VIRTUAL_MIC_NAME);
@@ -1298,5 +1300,17 @@ mod tests {
         assert_eq!(entries, vec![OsString::from("keyfile")]);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_session_env_sets_xdg_session_type_wayland() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("printf '%s' \"$XDG_SESSION_TYPE\"")
+            .env("XDG_SESSION_TYPE", "tty");
+        apply_session_env(&mut cmd, Some(OsStr::new("wayland-test")));
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "wayland");
     }
 }
