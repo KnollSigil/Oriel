@@ -96,7 +96,6 @@ pub async fn run_server(
     comp_handle: CompositorHandle,
     mut event_rx: mpsc::UnboundedReceiver<CompositorEvent>,
     bound_addr_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
-    quiet: bool,
 ) -> Result<()> {
     let endpoint = Endpoint::server(creds.server_config, listen_addr)
         .with_context(|| format!("failed to bind QUIC endpoint on {listen_addr}"))?;
@@ -105,19 +104,9 @@ pub async fn run_server(
         let _ = tx.send(actual_addr);
     }
 
+    // The connect URI carries a session token, so it is never written to the
+    // server's own output; `remotewayland-server attach` mints one on request.
     info!(%actual_addr, cert_sha256 = %creds.cert_sha256_hex, "RemoteWayland server listening");
-    if !quiet {
-        let first_token = creds
-            .valid_tokens
-            .lock()
-            .ok()
-            .and_then(|m| m.keys().next().cloned())
-            .unwrap_or_default();
-        println!(
-            "remotewayland://{}?fp={}&token={}",
-            actual_addr, creds.cert_sha256_hex, first_token
-        );
-    }
 
     let (bcast_tx, _) = broadcast::channel::<CompositorEvent>(256);
     let bcast_tx_clone = bcast_tx.clone();

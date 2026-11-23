@@ -32,7 +32,7 @@ use tracing_subscriber::EnvFilter;
 
 /// TTL for single-use tokens minted via `attach` / control socket.
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(60);
-/// TTL for single-use token printed on stdout in interactive foreground mode.
+/// TTL for the initial single-use token (e.g. one supplied via `--token`) in foreground mode.
 const FOREGROUND_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Parser)]
@@ -169,7 +169,6 @@ async fn main() -> Result<()> {
             comp_handle,
             event_rx,
             Some(bound_tx),
-            cli.daemon,
         ) => res,
         _ = sigterm.recv() => {
             info!("received SIGTERM; shutting down isolated session");
@@ -197,6 +196,11 @@ async fn run_control_socket(
 ) -> Result<()> {
     if sock_path.exists() {
         if UnixStream::connect(sock_path).await.is_ok() {
+            warn!(
+                path = %sock_path.display(),
+                "another server owns the control socket; `remotewayland-server attach` will \
+                 connect to that one, not this one"
+            );
             return Ok(());
         }
         let _ = std::fs::remove_file(sock_path);
@@ -207,6 +211,7 @@ async fn run_control_socket(
     session::set_mode(sock_path, 0o600)?;
     owns_control_sock.store(true, Ordering::SeqCst);
     info!(path = %sock_path.display(), "control Unix socket listening (mode 0600)");
+    info!("run `remotewayland-server attach --host <addr>` to print a connect URI");
 
     loop {
         let (mut stream, _) = listener.accept().await?;
