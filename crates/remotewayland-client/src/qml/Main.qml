@@ -2,6 +2,8 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Templates as T
+import org.kde.kirigami as Kirigami
+import org.kde.kirigami.delegates as KD
 
 ApplicationWindow {
     id: root
@@ -42,14 +44,20 @@ ApplicationWindow {
         property alias dropButton: splitDropBtn
         signal triggered(string binary)
 
-        radius: 4
-        color: root.palette.button
+        // Qt Quick Controls has no split button; draw a button-coloured frame around two
+        // ToolButtons using the same theme colours the KDE style uses for frames.
+        Kirigami.Theme.colorSet: Kirigami.Theme.Button
+        Kirigami.Theme.inherit: false
+        radius: Kirigami.Units.cornerRadius
+        color: Kirigami.Theme.backgroundColor
         border.width: 1
         border.color: (splitPrimaryBtn.hovered || splitDropBtn.hovered
             || splitPrimaryBtn.activeFocus || splitDropBtn.activeFocus
             || splitMenu.visible)
-            ? root.palette.highlight
-            : root.palette.mid
+            ? Kirigami.Theme.focusColor
+            : Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor,
+                                                      Kirigami.Theme.textColor,
+                                                      Kirigami.Theme.frameContrast)
         implicitHeight: splitRow.implicitHeight
         implicitWidth: splitRow.implicitWidth
 
@@ -71,18 +79,15 @@ ApplicationWindow {
                 ToolTip {
                     popupType: Popup.Window
                     visible: splitPrimaryBtn.hovered
-                    delay: 400
+                    delay: Kirigami.Units.toolTipDelay
                     text: splitRoot.primaryToolTip
                 }
             }
 
-            Rectangle {
+            Kirigami.Separator {
                 Layout.fillHeight: true
-                Layout.topMargin: 4
-                Layout.bottomMargin: 4
-                implicitWidth: 1
-                color: root.palette.mid
-                opacity: 0.7
+                Layout.topMargin: Kirigami.Units.smallSpacing
+                Layout.bottomMargin: Kirigami.Units.smallSpacing
             }
 
             ToolButton {
@@ -97,7 +102,7 @@ ApplicationWindow {
                 ToolTip {
                     popupType: Popup.Window
                     visible: splitDropBtn.hovered
-                    delay: 400
+                    delay: Kirigami.Units.toolTipDelay
                     text: splitRoot.dropToolTip
                 }
             }
@@ -172,6 +177,15 @@ ApplicationWindow {
                 onObjectRemoved: (index, object) => dropdownMenu.removeItem(object)
             }
         }
+    }
+
+    // Small status indicator dot; callers colour it with Kirigami.Theme's semantic colours
+    // (positive/neutral/negative/disabled) so it follows the colour scheme.
+    component StatusDot: Rectangle {
+        Layout.alignment: Qt.AlignVCenter
+        implicitWidth: Kirigami.Units.smallSpacing * 2
+        implicitHeight: implicitWidth
+        radius: width / 2
     }
 
     // Helper functions for clean keyboard navigation
@@ -268,9 +282,9 @@ ApplicationWindow {
 
         RowLayout {
             anchors.fill: parent
-            anchors.leftMargin: 10
-            anchors.rightMargin: 10
-            spacing: 10
+            anchors.leftMargin: Kirigami.Units.largeSpacing
+            anchors.rightMargin: Kirigami.Units.largeSpacing
+            spacing: Kirigami.Units.largeSpacing
 
             Label {
                 text: backend.activeLabel.length > 0
@@ -283,15 +297,15 @@ ApplicationWindow {
             Label {
                 visible: backend.rttText.length > 0
                 text: backend.isCongested ? backend.rttText + " (congested)" : backend.rttText
-                color: backend.isCongested ? "#e6a23c" : root.palette.windowText
-                opacity: 0.85
+                color: backend.isCongested ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.textColor
+                opacity: backend.isCongested ? 1.0 : 0.85
             }
 
             Label {
                 text: "Mic: " + backend.micSummary
-                opacity: 0.75
+                color: Kirigami.Theme.disabledTextColor
                 elide: Text.ElideRight
-                Layout.maximumWidth: 200
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 11
             }
 
             Button {
@@ -341,19 +355,19 @@ ApplicationWindow {
                 SplitView.preferredWidth: 210
                 SplitView.minimumWidth: 150
                 SplitView.maximumWidth: 360
-                padding: 8
+                padding: Kirigami.Units.largeSpacing
 
                 ColumnLayout {
                     anchors.fill: parent
-                    spacing: 6
+                    spacing: Kirigami.Units.mediumSpacing
 
                     RowLayout {
                         Layout.fillWidth: true
-                        spacing: 4
+                        spacing: Kirigami.Units.smallSpacing
 
-                        Label {
+                        Kirigami.Heading {
+                            level: 4
                             text: "Servers"
-                            font.bold: true
                             Layout.fillWidth: true
                             elide: Text.ElideRight
                         }
@@ -381,7 +395,7 @@ ApplicationWindow {
                             id: serverList
                             anchors.fill: parent
                             clip: true
-                            spacing: 2
+                            spacing: Kirigami.Units.smallSpacing / 2
                             model: root.hostsModel
                             activeFocusOnTab: true
                             keyNavigationEnabled: true
@@ -433,65 +447,41 @@ ApplicationWindow {
                                 }
 
                                 contentItem: RowLayout {
-                                    spacing: 8
+                                    spacing: Kirigami.Units.largeSpacing
 
-                                    Rectangle {
-                                        width: 8
-                                        height: 8
-                                        radius: 4
-                                        color: status === "connected"
-                                            ? (congested ? "#e6a23c" : "#2ecc71")
-                                            : (status === "connecting" ? "#f1c40f" : root.palette.mid)
+                                    StatusDot {
+                                        color: hostDelegate.status === "connected"
+                                            ? (hostDelegate.congested ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.positiveTextColor)
+                                            : (hostDelegate.status === "connecting" ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.disabledTextColor)
                                     }
 
-                                    ColumnLayout {
+                                    KD.TitleSubtitle {
                                         Layout.fillWidth: true
-                                        spacing: 1
-
-                                        Label {
-                                            text: hostDelegate.label
-                                            elide: Text.ElideRight
-                                            Layout.fillWidth: true
-                                            font.bold: hostDelegate.is_active
-                                            color: hostDelegate.highlighted
-                                                ? root.palette.highlightedText
-                                                : root.palette.windowText
-                                        }
-
-                                        Label {
-                                            text: hostDelegate.rtt_text.length > 0
-                                                ? hostDelegate.rtt_text
-                                                : hostDelegate.ssh_target
-                                            font.pointSize: Math.max(8, root.font.pointSize - 2)
-                                            opacity: 0.7
-                                            elide: Text.ElideRight
-                                            Layout.fillWidth: true
-                                            color: hostDelegate.highlighted
-                                                ? root.palette.highlightedText
-                                                : root.palette.windowText
-                                        }
+                                        title: hostDelegate.label
+                                        subtitle: hostDelegate.rtt_text.length > 0
+                                            ? hostDelegate.rtt_text
+                                            : hostDelegate.ssh_target
+                                        font.bold: hostDelegate.is_active
+                                        selected: hostDelegate.highlighted
                                     }
 
                                     Label {
                                         visible: hostDelegate.program_count > 0
                                         text: hostDelegate.program_count.toString()
-                                        font.pointSize: Math.max(8, root.font.pointSize - 2)
-                                        opacity: 0.8
+                                        font: Kirigami.Theme.smallFont
                                         color: hostDelegate.highlighted
-                                            ? root.palette.highlightedText
-                                            : root.palette.windowText
+                                            ? Kirigami.Theme.highlightedTextColor
+                                            : Kirigami.Theme.textColor
                                     }
                                 }
                             }
 
-                            Label {
+                            // Kept minimal: the main area shows the "Add Server…" prompt.
+                            Kirigami.PlaceholderMessage {
                                 anchors.centerIn: parent
+                                width: parent.width - Kirigami.Units.largeSpacing * 2
                                 visible: serverList.count === 0
-                                text: "No servers yet.\nClick ⚙ to add one."
-                                horizontalAlignment: Text.AlignHCenter
-                                opacity: 0.6
-                                wrapMode: Text.WordWrap
-                                width: parent.width - 16
+                                text: "No servers yet"
                             }
                         }
                     }
@@ -501,26 +491,37 @@ ApplicationWindow {
             // --- Right Main Pane ---
             Pane {
                 SplitView.fillWidth: true
-                padding: 10
+                padding: Kirigami.Units.largeSpacing
 
                 ColumnLayout {
                     anchors.fill: parent
-                    spacing: 10
+                    spacing: Kirigami.Units.largeSpacing
 
                     // Top bar: Search + Split New Terminal + Settings
                     RowLayout {
                         Layout.fillWidth: true
-                        spacing: 8
+                        spacing: Kirigami.Units.largeSpacing
 
-                        TextField {
+                        Kirigami.SearchField {
                             id: searchField
                             Layout.fillWidth: true
                             placeholderText: "Type to search apps, or >command to run directly…"
                             text: backend.searchQuery
                             selectByMouse: true
                             activeFocusOnTab: true
+                            // Our own Shortcut (Ctrl+F / Ctrl+L, also selects the text) handles focus;
+                            // the built-in Ctrl+F would be an ambiguous duplicate.
+                            focusSequences: []
+                            // Searching follows text changes directly; no accepted() signal needed.
+                            autoAccept: false
 
-                            onTextEdited: backend.set_search_query(text)
+                            // onTextChanged rather than onTextEdited: the clear button sets the text
+                            // programmatically, which doesn't emit textEdited. The comparison stops
+                            // updates coming from the backend (via the binding) echoing back.
+                            onTextChanged: {
+                                if (text !== backend.searchQuery)
+                                    backend.set_search_query(text)
+                            }
 
                             KeyNavigation.tab: termSplit.enabled ? termSplit.primaryButton : settingsBtn
                             KeyNavigation.backtab: serverList
@@ -608,7 +609,7 @@ ApplicationWindow {
                                 ? "Running (" + backend.programCount + ")"
                                 : "Running"
                             ToolTip.visible: hovered
-                            ToolTip.delay: 400
+                            ToolTip.delay: Kirigami.Units.toolTipDelay
                             ToolTip.text: "Show running applications and terminals (Ctrl+3)"
                             onClicked: root.toggleRunningApps()
                             KeyNavigation.left: termSplit.enabled ? termSplit.dropButton : searchField
@@ -619,16 +620,16 @@ ApplicationWindow {
                             Popup {
                                 id: runningPopup
                                 // implicitWidth, not width: window-type popups resize to their
-                                // implicit size when opened, which overrode an explicit width.
-                                implicitWidth: Math.min(480, root.width - 32)
+                                // implicit size when opened (see manageDialog).
+                                implicitWidth: Math.min(Kirigami.Units.gridUnit * 27, root.width - Kirigami.Units.gridUnit * 2)
                                 // Native popup window (xdg_popup on Wayland) so it can extend
                                 // past the main window. Margins only matter if the platform
                                 // falls back to an in-window Popup.Item.
                                 popupType: Popup.Window
                                 x: parent.width - width
                                 y: parent.height + 4
-                                margins: 16
-                                padding: 12
+                                margins: Kirigami.Units.gridUnit
+                                padding: Kirigami.Units.largeSpacing
                                 modal: false
                                 focus: true
                                 closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
@@ -652,31 +653,32 @@ ApplicationWindow {
 
                                 ColumnLayout {
                                     width: parent.width
-                                    spacing: 8
+                                    spacing: Kirigami.Units.largeSpacing
 
                                     RowLayout {
                                         Layout.fillWidth: true
-                                        spacing: 8
+                                        spacing: Kirigami.Units.largeSpacing
 
-                                        Label {
+                                        Kirigami.Heading {
+                                            level: 4
                                             text: "Running Applications (" + backend.programCount + ")"
-                                            font.bold: true
                                             Layout.fillWidth: true
+                                            elide: Text.ElideRight
                                         }
 
                                         Label {
                                             text: "Del: Stop · Enter: Attach"
-                                            font.pointSize: Math.max(8, root.font.pointSize - 2)
-                                            opacity: 0.65
+                                            font: Kirigami.Theme.smallFont
+                                            color: Kirigami.Theme.disabledTextColor
                                         }
                                     }
 
                                     ListView {
                                         id: runningAppsList
                                         Layout.fillWidth: true
-                                        Layout.preferredHeight: Math.min(Math.max(contentHeight, 44), 320)
+                                        Layout.preferredHeight: Math.min(Math.max(contentHeight, Kirigami.Units.gridUnit * 2.5), Kirigami.Units.gridUnit * 18)
                                         clip: true
-                                        spacing: 4
+                                        spacing: Kirigami.Units.smallSpacing
                                         model: root.programsModel
                                         keyNavigationEnabled: true
                                         highlightFollowsCurrentItem: true
@@ -734,7 +736,7 @@ ApplicationWindow {
                                             required property bool term_sent
 
                                             width: runningAppsList.width
-                                            padding: 6
+                                            padding: Kirigami.Units.mediumSpacing
                                             highlighted: runningAppsList.currentIndex === index
                                             onClicked: {
                                                 runningAppsList.currentIndex = index
@@ -742,41 +744,20 @@ ApplicationWindow {
                                             }
 
                                             contentItem: RowLayout {
-                                                spacing: 8
+                                                spacing: Kirigami.Units.largeSpacing
 
-                                                Rectangle {
-                                                    Layout.alignment: Qt.AlignVCenter
-                                                    width: 8
-                                                    height: 8
-                                                    radius: 4
+                                                StatusDot {
                                                     color: progRow.term_sent
-                                                        ? "#e6a23c"
-                                                        : (progRow.state === "Running" ? "#2ecc71" : "#f1c40f")
+                                                        ? Kirigami.Theme.negativeTextColor
+                                                        : (progRow.state === "Running" ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.neutralTextColor)
                                                 }
 
-                                                ColumnLayout {
+                                                KD.TitleSubtitle {
                                                     Layout.fillWidth: true
                                                     Layout.alignment: Qt.AlignVCenter
-                                                    spacing: 0
-
-                                                    Label {
-                                                        text: progRow.name
-                                                        Layout.fillWidth: true
-                                                        elide: Text.ElideRight
-                                                        font.bold: progRow.highlighted
-                                                        color: progRow.highlighted
-                                                            ? root.palette.highlightedText
-                                                            : root.palette.windowText
-                                                    }
-
-                                                    Label {
-                                                        text: progRow.state
-                                                        opacity: 0.75
-                                                        font.pointSize: Math.max(8, root.font.pointSize - 2)
-                                                        color: progRow.highlighted
-                                                            ? root.palette.highlightedText
-                                                            : root.palette.windowText
-                                                    }
+                                                    title: progRow.name
+                                                    subtitle: progRow.state
+                                                    selected: progRow.highlighted
                                                 }
 
                                                 TerminalSplitButton {
@@ -799,12 +780,11 @@ ApplicationWindow {
                                         }
                                     }
 
-                                    Label {
+                                    Kirigami.PlaceholderMessage {
                                         Layout.fillWidth: true
                                         visible: runningAppsList.count === 0
-                                        text: "No running applications."
-                                        horizontalAlignment: Text.AlignHCenter
-                                        opacity: 0.65
+                                        icon.name: "system-run"
+                                        text: "No running applications"
                                     }
                                 }
                             }
@@ -818,7 +798,7 @@ ApplicationWindow {
                             display: AbstractButton.IconOnly
                             Accessible.name: "Settings"
                             ToolTip.visible: hovered
-                            ToolTip.delay: 400
+                            ToolTip.delay: Kirigami.Units.toolTipDelay
                             ToolTip.text: "Settings (Ctrl+,) — Mic: " + backend.micSummary
                             onClicked: root.toggleSettingsPopup()
                             KeyNavigation.left: runningAppsBtn.visible && runningAppsBtn.enabled
@@ -832,16 +812,16 @@ ApplicationWindow {
                             Popup {
                                 id: settingsPopup
                                 // implicitWidth, not width: window-type popups resize to their
-                                // implicit size when opened, which overrode an explicit width.
-                                implicitWidth: Math.min(320, root.width - 32)
+                                // implicit size when opened (see manageDialog).
+                                implicitWidth: Math.min(Kirigami.Units.gridUnit * 18, root.width - Kirigami.Units.gridUnit * 2)
                                 // Native popup window (xdg_popup on Wayland) so it can extend
                                 // past the main window. Margins only matter if the platform
                                 // falls back to an in-window Popup.Item.
                                 popupType: Popup.Window
                                 x: parent.width - width
                                 y: parent.height + 4
-                                margins: 16
-                                padding: 12
+                                margins: Kirigami.Units.gridUnit
+                                padding: Kirigami.Units.largeSpacing
                                 modal: false
                                 focus: true
                                 closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
@@ -852,36 +832,32 @@ ApplicationWindow {
                                 }
                                 onClosed: settingsBtn.forceActiveFocus()
 
-                                ColumnLayout {
+                                Kirigami.FormLayout {
                                     width: parent.width
-                                    spacing: 8
-
-                                    Label {
-                                        text: "Render Scale Cap"
-                                        font.bold: true
-                                        Layout.fillWidth: true
-                                    }
 
                                     WindowComboBox {
                                         id: globalScaleCombo
+                                        Kirigami.FormData.label: "Render scale cap:"
                                         Layout.fillWidth: true
                                         model: ["Uncapped", "2.0x", "1.5x", "1.0x"]
                                         currentIndex: backend.globalMaxScaleIndex
                                         onActivated: (idx) => backend.select_global_max_scale(idx)
                                     }
 
-                                    ToolSeparator {
-                                        Layout.fillWidth: true
-                                        orientation: Qt.Horizontal
-                                    }
-
                                     RowLayout {
+                                        Kirigami.FormData.label: "Microphone:"
                                         Layout.fillWidth: true
-                                        Label {
-                                            text: "Host Microphone"
-                                            font.bold: true
+                                        spacing: Kirigami.Units.smallSpacing
+
+                                        WindowComboBox {
+                                            id: micCombo
                                             Layout.fillWidth: true
+                                            model: root.micsModel
+                                            textRole: "label"
+                                            currentIndex: backend.selectedMicIndex
+                                            onActivated: (idx) => backend.select_mic(idx)
                                         }
+
                                         ToolButton {
                                             id: refreshMicsBtn
                                             icon.name: "view-refresh"
@@ -894,19 +870,10 @@ ApplicationWindow {
                                             ToolTip {
                                                 popupType: Popup.Window
                                                 visible: refreshMicsBtn.hovered
-                                                delay: 400
+                                                delay: Kirigami.Units.toolTipDelay
                                                 text: "Refresh PipeWire sources"
                                             }
                                         }
-                                    }
-
-                                    WindowComboBox {
-                                        id: micCombo
-                                        Layout.fillWidth: true
-                                        model: root.micsModel
-                                        textRole: "label"
-                                        currentIndex: backend.selectedMicIndex
-                                        onActivated: (idx) => backend.select_mic(idx)
                                     }
                                 }
                             }
@@ -914,54 +881,38 @@ ApplicationWindow {
                     }
 
                     // Error banner (when applicable)
-                    Frame {
+                    Kirigami.InlineMessage {
                         Layout.fillWidth: true
+                        type: Kirigami.MessageType.Error
                         visible: backend.hasError
-                        padding: 8
-
-                        RowLayout {
-                            anchors.fill: parent
-                            spacing: 8
-
-                            Label {
-                                text: backend.errorText
-                                color: "#e74c3c"
-                                wrapMode: Text.WordWrap
-                                Layout.fillWidth: true
-                            }
-
-                            Button {
+                        text: backend.errorText
+                        actions: [
+                            Kirigami.Action {
                                 text: "Retry"
+                                icon.name: "view-refresh"
                                 visible: !backend.isConnected && !backend.isConnecting && backend.activeTarget.length > 0
-                                onClicked: backend.connect_host(backend.activeTarget)
+                                onTriggered: backend.connect_host(backend.activeTarget)
                             }
-                        }
+                        ]
                     }
 
                     // Explicit command hint banner (>cmd / !cmd)
-                    Frame {
+                    Kirigami.InlineMessage {
                         Layout.fillWidth: true
+                        type: Kirigami.MessageType.Information
+                        icon.name: "utilities-terminal"
                         visible: backend.isConnected && backend.isExplicitCommand
-                        padding: 10
-
-                        RowLayout {
-                            anchors.fill: parent
-                            spacing: 8
-
-                            Label {
-                                text: backend.explicitCommandText.length > 0
-                                    ? "Press Enter to run remote command: " + backend.explicitCommandText
-                                    : "Type a remote command after > or ! and press Enter"
-                                Layout.fillWidth: true
-                                elide: Text.ElideRight
-                            }
-
-                            Button {
+                        text: backend.explicitCommandText.length > 0
+                            ? "Press Enter to run remote command: " + backend.explicitCommandText
+                            : "Type a remote command after > or ! and press Enter"
+                        actions: [
+                            Kirigami.Action {
                                 text: "Run"
+                                icon.name: "system-run"
                                 enabled: backend.explicitCommandText.length > 0
-                                onClicked: backend.launch_primary_action()
+                                onTriggered: backend.launch_primary_action()
                             }
-                        }
+                        ]
                     }
 
                     // Main Application Grid
@@ -1080,7 +1031,7 @@ ApplicationWindow {
                                 highlighted: (appGrid.activeFocus && appGrid.currentIndex === index)
                                     || (searchField.activeFocus && index === 0)
                                 ToolTip.visible: hovered
-                                ToolTip.delay: 500
+                                ToolTip.delay: Kirigami.Units.toolTipDelay
                                 ToolTip.text: generic_name.length > 0
                                     ? name + " — " + generic_name
                                     : name
@@ -1092,31 +1043,32 @@ ApplicationWindow {
                                 }
 
                                 contentItem: ColumnLayout {
-                                    spacing: 4
+                                    spacing: Kirigami.Units.smallSpacing
 
+                                    // The backend sends icons as data: URIs, which Kirigami.Icon
+                                    // doesn't load (it treats them as icon names), so use Image for
+                                    // those and Kirigami.Icon for the generic app icon fallback.
                                     Item {
                                         Layout.alignment: Qt.AlignHCenter
-                                        width: 48
-                                        height: 48
+                                        implicitWidth: Kirigami.Units.iconSizes.large
+                                        implicitHeight: Kirigami.Units.iconSizes.large
 
                                         Image {
+                                            id: appIconImage
                                             anchors.fill: parent
                                             source: appTile.icon_source
-                                            visible: appTile.icon_source.length > 0
+                                            visible: status === Image.Ready
                                             fillMode: Image.PreserveAspectFit
                                             smooth: true
                                             mipmap: true
-                                            sourceSize.width: 48
-                                            sourceSize.height: 48
+                                            sourceSize.width: Kirigami.Units.iconSizes.large
+                                            sourceSize.height: Kirigami.Units.iconSizes.large
                                         }
 
-                                        Label {
-                                            anchors.centerIn: parent
-                                            visible: appTile.icon_source.length === 0
-                                            text: appTile.name.length > 0 ? appTile.name.charAt(0).toUpperCase() : "?"
-                                            font.pointSize: 18
-                                            font.bold: true
-                                            opacity: 0.5
+                                        Kirigami.Icon {
+                                            anchors.fill: parent
+                                            visible: !appIconImage.visible
+                                            source: "application-x-executable"
                                         }
                                     }
 
@@ -1127,50 +1079,63 @@ ApplicationWindow {
                                         elide: Text.ElideRight
                                         maximumLineCount: 1
                                         color: appTile.highlighted
-                                            ? root.palette.highlightedText
-                                            : root.palette.windowText
+                                            ? Kirigami.Theme.highlightedTextColor
+                                            : Kirigami.Theme.textColor
                                     }
                                 }
                             }
                         }
 
-                        // Connecting / Disconnected / Empty state overlay
-                        ColumnLayout {
+                        // Connecting / loading state
+                        Kirigami.LoadingPlaceholder {
                             anchors.centerIn: parent
-                            spacing: 10
-                            visible: !backend.isConnected || (backend.isConnected && !backend.isExplicitCommand && backend.appCount === 0)
+                            width: Math.min(parent.width - Kirigami.Units.gridUnit * 4, Kirigami.Units.gridUnit * 24)
+                            visible: backend.isConnecting
+                                || (backend.isConnected && !backend.isExplicitCommand
+                                    && backend.appCount === 0 && backend.searchQuery.trim().length === 0)
+                            text: backend.isConnecting
+                                ? "Connecting to " + backend.activeLabel + "…"
+                                : "Loading remote applications…"
+                        }
 
-                            BusyIndicator {
-                                Layout.alignment: Qt.AlignHCenter
-                                running: backend.isConnecting
-                                visible: backend.isConnecting
-                            }
+                        // Disconnected / no servers / no matching apps
+                        Kirigami.PlaceholderMessage {
+                            anchors.centerIn: parent
+                            width: Math.min(parent.width - Kirigami.Units.gridUnit * 4, Kirigami.Units.gridUnit * 24)
+                            visible: !backend.isConnecting
+                                && (!backend.isConnected
+                                    || (!backend.isExplicitCommand && backend.appCount === 0
+                                        && backend.searchQuery.trim().length > 0))
+                            icon.name: backend.isConnected
+                                ? "edit-find"
+                                : (backend.activeTarget.length > 0 ? "network-disconnect" : "network-server")
+                            text: backend.isConnected
+                                ? "No matching apps"
+                                : (backend.activeTarget.length > 0
+                                    ? "Disconnected from " + backend.activeLabel
+                                    : "No server selected")
+                            explanation: backend.isConnected
+                                ? "Press Enter to run \"" + backend.searchQuery.trim() + "\" directly."
+                                : (backend.activeTarget.length > 0
+                                    ? ""
+                                    : (serverList.count > 0 ? "Choose a server from the list." : "Add a server to get started."))
+                            helpfulAction: backend.isConnected
+                                ? null
+                                : (backend.activeTarget.length > 0
+                                    ? connectAction
+                                    : (serverList.count > 0 ? null : addServerAction))
 
-                            Label {
-                                Layout.alignment: Qt.AlignHCenter
-                                horizontalAlignment: Text.AlignHCenter
-                                opacity: 0.75
-                                text: {
-                                    if (backend.isConnecting) {
-                                        return "Connecting to " + backend.activeLabel + "…"
-                                    }
-                                    if (!backend.isConnected) {
-                                        return backend.activeTarget.length > 0
-                                            ? "Disconnected from " + backend.activeLabel
-                                            : "Add a server using the ⚙ button in the sidebar to get started."
-                                    }
-                                    if (backend.searchQuery.trim().length > 0) {
-                                        return "No matching apps. Press Enter to run \"" + backend.searchQuery.trim() + "\" directly."
-                                    }
-                                    return "Loading remote applications…"
-                                }
-                            }
-
-                            Button {
-                                Layout.alignment: Qt.AlignHCenter
+                            Kirigami.Action {
+                                id: connectAction
                                 text: "Connect"
-                                visible: !backend.isConnected && !backend.isConnecting && backend.activeTarget.length > 0
-                                onClicked: backend.connect_host(backend.activeTarget)
+                                icon.name: "network-connect"
+                                onTriggered: backend.connect_host(backend.activeTarget)
+                            }
+                            Kirigami.Action {
+                                id: addServerAction
+                                text: "Add Server…"
+                                icon.name: "list-add"
+                                onTriggered: manageDialog.open()
                             }
                         }
                     }
@@ -1232,20 +1197,21 @@ ApplicationWindow {
 
         RowLayout {
             anchors.fill: parent
-            spacing: 12
+            spacing: Kirigami.Units.largeSpacing
 
             // Left pane: Saved servers list + New Server button
             ColumnLayout {
-                Layout.preferredWidth: 215
+                Layout.preferredWidth: Kirigami.Units.gridUnit * 12
                 Layout.fillHeight: true
-                spacing: 8
+                spacing: Kirigami.Units.largeSpacing
 
                 RowLayout {
                     Layout.fillWidth: true
-                    Label {
+                    Kirigami.Heading {
+                        level: 4
                         text: "Saved Servers"
-                        font.bold: true
                         Layout.fillWidth: true
+                        elide: Text.ElideRight
                     }
                     Button {
                         text: "New"
@@ -1264,7 +1230,7 @@ ApplicationWindow {
                         anchors.fill: parent
                         clip: true
                         model: root.hostsModel
-                        spacing: 2
+                        spacing: Kirigami.Units.smallSpacing / 2
 
                         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
@@ -1281,35 +1247,25 @@ ApplicationWindow {
                             highlighted: !manageDialog.isNewHost && manageDialog.selectedTarget === ssh_target
                             onClicked: manageDialog.loadHost(label, ssh_target, port, server_bin, audio_enabled, max_scale_index)
 
-                            contentItem: ColumnLayout {
-                                spacing: 1
-                                Label {
-                                    text: mgmtRow.label
+                            // Wrapped in a layout so the style's "show tooltip when the
+                            // content is truncated" doesn't trigger: that uses the shared
+                            // ToolTip, which must not be shown in this dialog's window.
+                            contentItem: RowLayout {
+                                KD.TitleSubtitle {
+                                    Layout.fillWidth: true
+                                    title: mgmtRow.label
+                                    subtitle: mgmtRow.ssh_target
                                     font.bold: mgmtRow.highlighted
-                                    elide: Text.ElideRight
-                                    Layout.fillWidth: true
-                                    color: mgmtRow.highlighted
-                                        ? root.palette.highlightedText
-                                        : root.palette.windowText
-                                }
-                                Label {
-                                    text: mgmtRow.ssh_target
-                                    opacity: 0.7
-                                    font.pointSize: Math.max(8, root.font.pointSize - 2)
-                                    elide: Text.ElideRight
-                                    Layout.fillWidth: true
-                                    color: mgmtRow.highlighted
-                                        ? root.palette.highlightedText
-                                        : root.palette.windowText
+                                    selected: mgmtRow.highlighted
                                 }
                             }
                         }
 
-                        Label {
+                        Kirigami.PlaceholderMessage {
                             anchors.centerIn: parent
+                            width: parent.width - Kirigami.Units.largeSpacing * 2
                             visible: manageHostList.count === 0
                             text: "No saved servers"
-                            opacity: 0.6
                         }
                     }
                 }
@@ -1323,75 +1279,55 @@ ApplicationWindow {
             ColumnLayout {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: 10
+                spacing: Kirigami.Units.largeSpacing
 
-                Label {
+                Kirigami.Heading {
+                    level: 3
                     text: manageDialog.isNewHost ? "Add New Server" : "Edit Server"
-                    font.bold: true
-                    font.pointSize: root.font.pointSize + 1
                 }
 
-                GridLayout {
+                Kirigami.FormLayout {
                     Layout.fillWidth: true
-                    columns: 2
-                    columnSpacing: 10
-                    rowSpacing: 8
 
-                    Label {
-                        text: "Display Name"
-                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
-                    }
                     TextField {
                         id: labelField
+                        Kirigami.FormData.label: "Display name:"
                         Layout.fillWidth: true
                         placeholderText: "e.g. Workstation"
                     }
 
-                    Label {
-                        text: "SSH Target"
-                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
-                    }
                     TextField {
                         id: targetField
+                        Kirigami.FormData.label: "SSH target:"
                         Layout.fillWidth: true
                         placeholderText: "user@hostname"
                     }
 
-                    Label {
-                        text: "QUIC Port"
-                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
-                    }
                     SpinBox {
                         id: portSpin
+                        Kirigami.FormData.label: "QUIC port:"
                         from: 1
                         to: 65535
                         value: 7443
                         editable: true
                     }
 
-                    Label {
-                        text: "Server Binary"
-                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
-                    }
                     TextField {
                         id: serverBinField
+                        Kirigami.FormData.label: "Server binary:"
                         Layout.fillWidth: true
                         placeholderText: "remotewayland-server (optional)"
                     }
 
-                    Label {
-                        text: "Render Scale Cap"
-                        Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
-                    }
                     WindowComboBox {
                         id: hostScaleCombo
+                        Kirigami.FormData.label: "Render scale cap:"
                         Layout.fillWidth: true
                         model: ["Use Global Default", "Uncapped", "2.0x", "1.5x", "1.0x"]
                         currentIndex: 0
                         onActivated: (idx) => currentIndex = idx
                     }
 
-                    Item { implicitWidth: 1; implicitHeight: 1 }
                     CheckBox {
                         id: audioCheck
                         text: "Enable PipeWire audio bridge"
@@ -1403,7 +1339,7 @@ ApplicationWindow {
 
                 RowLayout {
                     Layout.fillWidth: true
-                    spacing: 8
+                    spacing: Kirigami.Units.largeSpacing
 
                     Button {
                         text: "Delete"

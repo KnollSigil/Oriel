@@ -15,6 +15,12 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-utils xorg-x11-server-Xwayland
 ```
 
+The optional Qt Quick launcher (`--features qt`, Qt 6.10+) uses KDE Kirigami at runtime; it is
+already present on Plasma and in the `org.kde.Platform` Flatpak runtime:
+```bash
+sudo dnf install kf6-kirigami
+```
+
 ### Ubuntu / Debian
 ```bash
 sudo apt install libwayland-dev libxkbcommon-dev pulseaudio-utils xwayland
