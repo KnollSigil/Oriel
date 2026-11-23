@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Templates as T
 
 ApplicationWindow {
     id: root
@@ -64,10 +65,15 @@ ApplicationWindow {
                 text: splitRoot.primaryText
                 icon.name: "utilities-terminal"
                 display: AbstractButton.TextBesideIcon
-                ToolTip.visible: hovered
-                ToolTip.delay: 400
-                ToolTip.text: splitRoot.primaryToolTip
                 onClicked: splitRoot.triggered("")
+                // Dedicated tooltips: instances of this component also live in runningPopup's
+                // window (see note on the shared ToolTip instance).
+                ToolTip {
+                    popupType: Popup.Window
+                    visible: splitPrimaryBtn.hovered
+                    delay: 400
+                    text: splitRoot.primaryToolTip
+                }
             }
 
             Rectangle {
@@ -87,15 +93,20 @@ ApplicationWindow {
                 icon.name: "arrow-down"
                 display: AbstractButton.IconOnly
                 Accessible.name: splitRoot.dropToolTip
-                ToolTip.visible: hovered
-                ToolTip.delay: 400
-                ToolTip.text: splitRoot.dropToolTip
                 onClicked: splitMenu.popup(splitRoot, 0, splitRoot.height + 2)
+                ToolTip {
+                    popupType: Popup.Window
+                    visible: splitDropBtn.hovered
+                    delay: 400
+                    text: splitRoot.dropToolTip
+                }
             }
         }
 
         Menu {
             id: splitMenu
+            // Must be its own window: it opens from inside runningPopup's window too.
+            popupType: Popup.Window
             Instantiator {
                 model: root.terminalsModel
                 delegate: MenuItem {
@@ -106,6 +117,59 @@ ApplicationWindow {
                 }
                 onObjectAdded: (index, object) => splitMenu.insertItem(index, object)
                 onObjectRemoved: (index, object) => splitMenu.removeItem(object)
+            }
+        }
+    }
+
+    // Standard ComboBox whose dropdown is a native popup window.
+    //
+    // `popup.popupType: Popup.Window` on a plain ComboBox doesn't work on Wayland:
+    // QQuickComboBox::focusOutEvent closes a window-type popup on *any* focus-out, and the
+    // dropdown's xdg_popup grab takes keyboard focus from the ComboBox's window, so the dropdown
+    // closes about one frame after it opens. Instead, the ComboBox's own `popup` is an invisible
+    // in-window stub (which it may close whenever it likes); opening the stub (click, Space,
+    // Alt+Down, ...) hands off to a native-window Menu of plain MenuItems — the same thing the
+    // KDE desktop style shows as its dropdown.
+    //
+    // The Menu builds its own MenuItems rather than reusing `delegateModel`: the style's default
+    // popup is still instantiated despite the override and already consumes `delegateModel`.
+    //
+    // Difference from ComboBox: picking an item emits `activated(index)` but does NOT set
+    // `currentIndex` (doing that from QML would break the owner's `currentIndex` binding).
+    // Owners update `currentIndex` themselves, usually via the backend binding.
+    component WindowComboBox: ComboBox {
+        id: combo
+        property alias dropdown: dropdownMenu
+
+        down: pressed || dropdownMenu.visible
+
+        popup: T.Popup {
+            implicitWidth: 0
+            implicitHeight: 0
+            padding: 0
+            closePolicy: T.Popup.NoAutoClose
+            exit: Transition {} // styles read popup.exit.running
+            onOpened: {
+                close()
+                dropdownMenu.currentIndex = combo.currentIndex
+                dropdownMenu.popup(combo, 0, combo.height)
+            }
+        }
+
+        Menu {
+            id: dropdownMenu
+            popupType: Popup.Window
+
+            Instantiator {
+                model: combo.model
+                delegate: MenuItem {
+                    required property int index
+                    required property var model
+                    text: combo.textRole.length > 0 ? model[combo.textRole] : model.modelData
+                    onTriggered: combo.activated(index)
+                }
+                onObjectAdded: (index, object) => dropdownMenu.insertItem(index, object)
+                onObjectRemoved: (index, object) => dropdownMenu.removeItem(object)
             }
         }
     }
@@ -202,6 +266,17 @@ ApplicationWindow {
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
+
+        // All attached `ToolTip.*` share one per-engine ToolTip instance; make it a native
+        // (non-grabbing, non-focus-taking) popup so tooltips aren't clipped at the window edge.
+        // Needs an Item to attach to.
+        //
+        // NOTE: Qt creates a popup's native window once, parented to whatever window it is first
+        // shown over, and never re-parents it. So the shared instance must only be used by items
+        // in the main window. Items inside popup windows (settingsPopup, runningPopup, Menus)
+        // need a dedicated child `ToolTip { popupType: Popup.Window; visible: <button>.hovered }`,
+        // or their tooltip is positioned relative to the wrong window.
+        Component.onCompleted: ToolTip.toolTip.popupType = Popup.Window
 
         SplitView {
             Layout.fillWidth: true
@@ -496,9 +571,16 @@ ApplicationWindow {
 
                             Popup {
                                 id: runningPopup
-                                width: Math.min(480, root.width - 32)
-                                x: Math.max(-(runningAppsBtn.mapToItem(root.contentItem, 0, 0).x - 16), parent.width - width)
+                                // implicitWidth, not width: window-type popups resize to their
+                                // implicit size when opened, which overrode an explicit width.
+                                implicitWidth: Math.min(480, root.width - 32)
+                                // Native popup window (xdg_popup on Wayland) so it can extend
+                                // past the main window. Margins only matter if the platform
+                                // falls back to an in-window Popup.Item.
+                                popupType: Popup.Window
+                                x: parent.width - width
                                 y: parent.height + 4
+                                margins: 16
                                 padding: 12
                                 modal: false
                                 focus: true
@@ -681,7 +763,7 @@ ApplicationWindow {
                             }
                         }
 
-                        // Settings popover button (gear icon + Microphone ComboBox dropdown)
+                        // Settings popover button (gear icon + scale/microphone selectors)
                         ToolButton {
                             id: settingsBtn
                             activeFocusOnTab: true
@@ -702,9 +784,16 @@ ApplicationWindow {
 
                             Popup {
                                 id: settingsPopup
-                                width: Math.min(320, root.width - 32)
-                                x: Math.max(-(settingsBtn.mapToItem(root.contentItem, 0, 0).x - 16), parent.width - width)
+                                // implicitWidth, not width: window-type popups resize to their
+                                // implicit size when opened, which overrode an explicit width.
+                                implicitWidth: Math.min(320, root.width - 32)
+                                // Native popup window (xdg_popup on Wayland) so it can extend
+                                // past the main window. Margins only matter if the platform
+                                // falls back to an in-window Popup.Item.
+                                popupType: Popup.Window
+                                x: parent.width - width
                                 y: parent.height + 4
+                                margins: 16
                                 padding: 12
                                 modal: false
                                 focus: true
@@ -726,7 +815,7 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                     }
 
-                                    ComboBox {
+                                    WindowComboBox {
                                         id: globalScaleCombo
                                         Layout.fillWidth: true
                                         model: ["Uncapped", "2.0x", "1.5x", "1.0x"]
@@ -749,16 +838,24 @@ ApplicationWindow {
                                             Layout.fillWidth: true
                                         }
                                         ToolButton {
+                                            id: refreshMicsBtn
                                             icon.name: "view-refresh"
                                             display: AbstractButton.IconOnly
                                             Accessible.name: "Refresh PipeWire sources"
-                                            ToolTip.visible: hovered
-                                            ToolTip.text: "Refresh PipeWire sources"
                                             onClicked: backend.refresh_mics()
+
+                                            // Dedicated tooltip: this button lives in settingsPopup's
+                                            // window (see note on the shared ToolTip instance).
+                                            ToolTip {
+                                                popupType: Popup.Window
+                                                visible: refreshMicsBtn.hovered
+                                                delay: 400
+                                                text: "Refresh PipeWire sources"
+                                            }
                                         }
                                     }
 
-                                    ComboBox {
+                                    WindowComboBox {
                                         id: micCombo
                                         Layout.fillWidth: true
                                         model: root.micsModel
@@ -1286,11 +1383,12 @@ ApplicationWindow {
                         text: "Render Scale Cap"
                         Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
                     }
-                    ComboBox {
+                    WindowComboBox {
                         id: hostScaleCombo
                         Layout.fillWidth: true
                         model: ["Use Global Default", "Uncapped", "2.0x", "1.5x", "1.0x"]
                         currentIndex: 0
+                        onActivated: (idx) => currentIndex = idx
                     }
 
                     Item { implicitWidth: 1; implicitHeight: 1 }
