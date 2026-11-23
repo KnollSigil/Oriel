@@ -23,7 +23,7 @@ use smithay_client_toolkit::{
     },
     delegate_dispatch2, delegate_registry,
     dispatch2::Dispatch2,
-    output::{OutputHandler, OutputState},
+    output::{OutputHandler, OutputInfo, OutputState},
     primary_selection::{
         device::{PrimarySelectionDevice, PrimarySelectionDeviceHandler},
         selection::{PrimarySelectionSource, PrimarySelectionSourceHandler},
@@ -1034,7 +1034,7 @@ impl ClientApp {
         self.output_state
             .outputs()
             .filter_map(|o| self.output_state.info(&o))
-            .map(|info| info.scale_factor.max(1) as f64)
+            .map(|info| output_scale(&info))
             .fold(1.0, f64::max)
     }
 
@@ -1200,6 +1200,45 @@ fn draw_shm_surface(
             }
             surface.commit();
         }
+    }
+}
+
+/// An output's scale including fractional scaling: its current mode size over its xdg-output
+/// logical size. `wl_output.scale` alone is only the integer ceiling (2 at 150%).
+fn output_scale(info: &OutputInfo) -> f64 {
+    let mode = info.modes.iter().find(|m| m.current).map(|m| m.dimensions);
+    let rotated = matches!(
+        info.transform,
+        wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270
+    );
+    fractional_output_scale(info.scale_factor, info.logical_size, mode, rotated)
+}
+
+fn fractional_output_scale(
+    integer_scale: i32,
+    logical_size: Option<(i32, i32)>,
+    mode_size: Option<(i32, i32)>,
+    rotated: bool,
+) -> f64 {
+    let integer = integer_scale.max(1) as f64;
+    let (Some((logical_w, _)), Some((mode_w, mode_h))) = (logical_size, mode_size) else {
+        return integer;
+    };
+    let physical_w = if rotated { mode_h } else { mode_w };
+    if logical_w <= 0 || physical_w <= 0 {
+        return integer;
+    }
+    // Quantize to the fractional-scale protocol's 1/120 steps.
+    let scale = (physical_w as f64 / logical_w as f64 * 120.0).round() / 120.0;
+    // wl_output.scale is the ratio rounded up. If they disagree (e.g. Mutter's physical layout
+    // mode reports xdg-output sizes in physical pixels), trust the integer scale.
+    if scale > integer - 1.0 && scale <= integer {
+        scale.max(1.0)
+    } else {
+        integer
     }
 }
 
@@ -2236,6 +2275,38 @@ pub fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fractional_output_scale_uses_logical_size() {
+        // 2560x1440 at 150%: wl_output reports 2, xdg-output 1707x960 logical.
+        assert_eq!(
+            fractional_output_scale(2, Some((1707, 960)), Some((2560, 1440)), false),
+            1.5
+        );
+        // Rotated outputs compare the mode height against the logical width.
+        assert_eq!(
+            fractional_output_scale(2, Some((960, 1707)), Some((2560, 1440)), true),
+            1.5
+        );
+        assert_eq!(
+            fractional_output_scale(2, Some((1920, 1080)), Some((3840, 2160)), false),
+            2.0
+        );
+        // Without xdg-output, fall back to the integer scale; never go below 1.
+        assert_eq!(
+            fractional_output_scale(2, None, Some((2560, 1440)), false),
+            2.0
+        );
+        assert_eq!(
+            fractional_output_scale(1, Some((2560, 1440)), Some((1920, 1080)), false),
+            1.0
+        );
+        // xdg-output in physical pixels (ratio 1) contradicts wl_output.scale 2: keep 2.
+        assert_eq!(
+            fractional_output_scale(2, Some((2560, 1440)), Some((2560, 1440)), false),
+            2.0
+        );
+    }
 
     #[test]
     fn ui_sender_push_frame_coalesces_to_latest_without_duplicate_wakeups() {
