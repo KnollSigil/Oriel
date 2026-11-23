@@ -50,6 +50,7 @@ pub fn run(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|app| {
         install_css();
+        install_icon_theme_fallback();
         app.set_accels_for_action("win.preferences", &["<Control>comma"]);
     });
     app.connect_activate(move |app| {
@@ -61,6 +62,70 @@ pub fn run(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
     });
     app.run_with_args(&Vec::<String>::new());
     Ok(())
+}
+
+const FALLBACK_ICON_THEME: &str = "Adwaita";
+
+/// Uses Adwaita whenever the configured icon theme isn't installed, now and on every change.
+///
+/// GTK4 doesn't fall back to Adwaita, so a missing theme leaves only hicolor and GTK's few
+/// built-in icons. This happens in a Flatpak when the settings portal doesn't provide
+/// `icon-theme`: GTK then uses its hardcoded default "gnome", which nothing ships anymore.
+///
+/// The display's own `IconTheme` can't be pinned, so this sets `gtk-icon-theme-name`. An
+/// app-set value shadows the session's, so the configured theme is read from the display
+/// (unaffected by the override) and the override is reset once that theme is installed.
+fn install_icon_theme_fallback() {
+    let (Some(display), Some(settings)) = (gdk::Display::default(), gtk::Settings::default())
+    else {
+        return;
+    };
+    apply_icon_theme_fallback(&display, &settings);
+    display.connect_setting_changed(move |display, name| {
+        if name == "gtk-icon-theme-name" {
+            apply_icon_theme_fallback(display, &settings);
+        }
+    });
+}
+
+fn apply_icon_theme_fallback(display: &gdk::Display, settings: &gtk::Settings) {
+    const PROPERTY: &str = "gtk-icon-theme-name";
+    let configured = display_string_setting(display, PROPERTY).unwrap_or_default();
+    let installed = !configured.is_empty()
+        && gtk::IconTheme::for_display(display)
+            .search_path()
+            .iter()
+            .any(|dir| dir.join(&configured).join("index.theme").is_file());
+    if installed {
+        // Follow the session's theme again; harmless if nothing was overridden.
+        settings.reset_property(PROPERTY);
+    } else if settings.gtk_icon_theme_name().as_deref() != Some(FALLBACK_ICON_THEME) {
+        tracing::info!(
+            "icon theme {configured:?} is not installed; using {FALLBACK_ICON_THEME} instead"
+        );
+        settings.set_gtk_icon_theme_name(Some(FALLBACK_ICON_THEME));
+    }
+}
+
+/// The session's value of a string setting, before any app override. Not
+/// `DisplayExt::get_setting`, which passes GDK an untyped `GValue` that it can't fill.
+fn display_string_setting(display: &gdk::Display, name: &str) -> Option<String> {
+    use glib::translate::{ToGlibPtr, ToGlibPtrMut};
+
+    let mut value = glib::Value::from_type(glib::Type::STRING);
+    // SAFETY: `display` and the NUL-terminated `name` outlive the call, and `value` is an
+    // initialized string `GValue`, the type GDK stores for string settings.
+    let found = unsafe {
+        gdk::ffi::gdk_display_get_setting(
+            display.to_glib_none().0,
+            name.to_glib_none().0,
+            value.to_glib_none_mut().0,
+        )
+    };
+    if found == glib::ffi::GFALSE {
+        return None;
+    }
+    value.get::<Option<String>>().ok().flatten()
 }
 
 fn install_css() {
