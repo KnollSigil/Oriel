@@ -11,9 +11,9 @@ gtk4 = ["dep:gtk4", "dep:adw"]
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-gtk4 = { version = "0.9", optional = true, features = ["v4_12"] }
+gtk4 = { version = "0.11", optional = true, features = ["v4_12"] }
 # libadwaita 1.5 is the oldest supported (Ubuntu 24.04).
-adw = { package = "libadwaita", version = "0.7", optional = true, features = ["v1_5"] }
+adw = { package = "libadwaita", version = "0.9", optional = true, features = ["v1_5"] }
 libc.workspace = true
 lz4_flex.workspace = true
 opus.workspace = true

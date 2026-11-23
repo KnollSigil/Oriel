@@ -59,7 +59,7 @@ pub fn generate_ephemeral_credentials(
     let cert = rcgen::generate_simple_self_signed(vec!["remotewayland.local".to_string()])
         .context("failed to generate self-signed TLS certificate")?;
     let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
     let digest = sha256_bytes(cert_der.as_ref());
     let cert_sha256_hex = hex_encode(&digest);

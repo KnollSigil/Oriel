@@ -917,12 +917,14 @@ impl SmartTileGpuEngine {
     }
 
     fn try_new_internal(allow_cpu_adapter: bool) -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
-        let adapters = instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::GL);
+        let adapters = pollster::block_on(
+            instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::GL),
+        );
         let adapter = adapters
             .into_iter()
             .filter(|a| {
@@ -1009,8 +1011,8 @@ impl SmartTileGpuEngine {
 
         let scan_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scan_pl"),
-            bind_group_layouts: &[&scan_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&scan_bgl)],
+            immediate_size: 0,
         });
 
         let scan_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1070,8 +1072,8 @@ impl SmartTileGpuEngine {
 
         let dct_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("dct_pl"),
-            bind_group_layouts: &[&dct_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&dct_bgl)],
+            immediate_size: 0,
         });
 
         let dct_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1160,8 +1162,8 @@ impl SmartTileGpuEngine {
 
         let tile_batch_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile_batch_pl"),
-            bind_group_layouts: &[&tile_batch_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&tile_batch_bgl)],
+            immediate_size: 0,
         });
 
         let tile_batch_pipeline =
@@ -1339,11 +1341,12 @@ impl SmartTileGpuEngine {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().ok()?.ok()?;
 
-        let mapped = slice.get_mapped_range();
-        let out: Vec<u32> = bytemuck::cast_slice(&mapped).to_vec();
-        drop(mapped);
+        let out: Option<Vec<u32>> = slice
+            .get_mapped_range()
+            .ok()
+            .map(|mapped| bytemuck::cast_slice(&mapped).to_vec());
         flags_staging.unmap();
-        Some(out)
+        out
     }
 
     fn ensure_dct_buffers(&self, sc: &mut GpuScratchBuffers, num_blocks: usize) {
@@ -1497,16 +1500,18 @@ impl SmartTileGpuEngine {
             return false;
         }
 
-        {
-            let q_mapped = q_slice.get_mapped_range();
-            let idct_mapped = idct_slice.get_mapped_range();
-            bytemuck::cast_slice_mut::<[i32; 64], u8>(out_q_blocks).copy_from_slice(&q_mapped);
-            bytemuck::cast_slice_mut::<[i32; 64], u8>(out_idct_blocks)
-                .copy_from_slice(&idct_mapped);
-        }
+        let copied = match (q_slice.get_mapped_range(), idct_slice.get_mapped_range()) {
+            (Ok(q_mapped), Ok(idct_mapped)) => {
+                bytemuck::cast_slice_mut::<[i32; 64], u8>(out_q_blocks).copy_from_slice(&q_mapped);
+                bytemuck::cast_slice_mut::<[i32; 64], u8>(out_idct_blocks)
+                    .copy_from_slice(&idct_mapped);
+                true
+            }
+            _ => false,
+        };
         q_staging.unmap();
         idct_staging.unmap();
-        true
+        copied
     }
 
     /// Execute batched 2D 8x8 inverse IDCT on the GPU for client decoding.
@@ -1597,13 +1602,16 @@ impl SmartTileGpuEngine {
             return false;
         }
 
-        {
-            let idct_mapped = idct_slice.get_mapped_range();
-            bytemuck::cast_slice_mut::<[i32; 64], u8>(out_idct_blocks)
-                .copy_from_slice(&idct_mapped);
-        }
+        let copied = match idct_slice.get_mapped_range() {
+            Ok(idct_mapped) => {
+                bytemuck::cast_slice_mut::<[i32; 64], u8>(out_idct_blocks)
+                    .copy_from_slice(&idct_mapped);
+                true
+            }
+            Err(_) => false,
+        };
         idct_staging.unmap();
-        true
+        copied
     }
 
     /// Encode and reconstruct a batch of full-resolution opaque 64x64 tiles on the GPU in a single
@@ -1817,11 +1825,12 @@ impl SmartTileGpuEngine {
         let d_gpu = t_sub0.elapsed();
 
         let t_rle0 = std::time::Instant::now();
-        let res = {
-            let q_mapped = q_slice.get_mapped_range();
-            let recon_mapped = recon_slice.get_mapped_range();
-            let q_i32: &[i32] = bytemuck::cast_slice(&q_mapped);
-            consume(ref_bgra, prep_state, q_i32, &recon_mapped)
+        let res = match (q_slice.get_mapped_range(), recon_slice.get_mapped_range()) {
+            (Ok(q_mapped), Ok(recon_mapped)) => {
+                let q_i32: &[i32] = bytemuck::cast_slice(&q_mapped);
+                Some(consume(ref_bgra, prep_state, q_i32, &recon_mapped))
+            }
+            _ => None,
         };
         let d_rle = t_rle0.elapsed();
         if let Ok(mut lt) = self.last_timing.lock() {
@@ -1829,6 +1838,6 @@ impl SmartTileGpuEngine {
         }
         q_staging.unmap();
         recon_staging.unmap();
-        Some(res)
+        res
     }
 }
