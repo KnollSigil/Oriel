@@ -194,10 +194,15 @@ pub enum CompositorEvent {
         name: String,
         state: LaunchState,
     },
+    /// Emitted at the exact point a [`CompositorCommand::Snapshot`] with this id was taken.
+    /// Every event before it is already reflected in the snapshot.
+    SnapshotTaken {
+        sync_id: u64,
+    },
 }
 
 /// Commands sent from the QUIC server loop to the headless compositor.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum CompositorCommand {
     ConfigureWindow {
         window_id: WindowId,
@@ -261,7 +266,15 @@ pub enum CompositorCommand {
         launch_id: u64,
         code: i32,
     },
-    SyncWindows,
+    /// Reply with the events that describe the current session state (see
+    /// `snapshot_events`) and emit [`CompositorEvent::SnapshotTaken`] on the event stream.
+    Snapshot {
+        sync_id: u64,
+        reply: tokio::sync::oneshot::Sender<Vec<CompositorEvent>>,
+    },
+    /// Release every held pointer button and key and clear keyboard focus, e.g. when the
+    /// client that was driving input goes away mid-press.
+    ReleaseInput,
 }
 
 /// Handle to interact with the running compositor thread.
@@ -484,6 +497,8 @@ struct AppState {
     next_window_id: WindowId,
     focused_window_id: WindowId,
     last_focused_x11_window_id: Option<WindowId>,
+    /// Pointer buttons a client has pressed and not yet released.
+    pressed_buttons: HashSet<u32>,
     next_x11_pos: (i32, i32),
     cursor_surface: Option<WlSurface>,
     last_cursor_bitmap: Option<(u32, u32, u32, u32, i32, i32, Vec<u8>)>,
@@ -1008,6 +1023,11 @@ impl AppState {
                         }
                     }
                 }
+                if pressed {
+                    self.pressed_buttons.insert(button);
+                } else {
+                    self.pressed_buttons.remove(&button);
+                }
                 if let Some(pointer) = self.seat.get_pointer() {
                     let state = if pressed {
                         smithay::backend::input::ButtonState::Pressed
@@ -1244,142 +1264,176 @@ impl AppState {
                     }
                 }
             }
-            CompositorCommand::SyncWindows => {
-                for app in self.launched_apps.values() {
-                    if !matches!(app.state, LaunchState::Exited(_)) {
-                        let _ = self.event_tx.send(CompositorEvent::AppState {
-                            launch_id: app.launch_id,
-                            name: app.name.clone(),
-                            state: app.state,
-                        });
+            CompositorCommand::Snapshot { sync_id, reply } => {
+                // The marker goes out on the shared event stream at the exact point the
+                // snapshot is taken, so the requesting connection can tell which streamed
+                // events are older than the snapshot.
+                let events = self.snapshot_events();
+                let _ = self.event_tx.send(CompositorEvent::SnapshotTaken { sync_id });
+                let _ = reply.send(events);
+            }
+            CompositorCommand::ReleaseInput => {
+                if let Some(pointer) = self.seat.get_pointer() {
+                    let held: Vec<u32> = self.pressed_buttons.drain().collect();
+                    for button in held {
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                button,
+                                state: smithay::backend::input::ButtonState::Released,
+                                serial,
+                                time: time_ms,
+                            },
+                        );
                     }
+                    pointer.frame(self);
                 }
-                for tracked in self.windows.values() {
-                    if tracked.announced && tracked.has_window_entry {
-                        let win_name = if !tracked.last_title.is_empty() {
-                            tracked.last_title.clone()
-                        } else if !tracked.last_app_id.is_empty() {
-                            tracked.last_app_id.clone()
-                        } else {
-                            format!("Window #{}", tracked.window_id)
-                        };
-                        let _ = self.event_tx.send(CompositorEvent::AppState {
-                            launch_id: WINDOW_LAUNCH_ID_BASE | tracked.window_id,
-                            name: win_name,
-                            state: LaunchState::Running,
-                        });
-                    }
-                }
-                for tracked in self.windows.values() {
-                    if tracked.announced {
-                        let _ = self.event_tx.send(CompositorEvent::WindowCreated {
-                            window_id: tracked.window_id,
-                            title: tracked.last_title.clone(),
-                            app_id: tracked.last_app_id.clone(),
-                            width: tracked.last_width,
-                            height: tracked.last_height,
-                        });
-                        let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
-                            window_id: tracked.window_id,
-                            server_side: tracked.server_side_decoration,
-                        });
-                        if let Some(frame) = &tracked.latest_bgra {
-                            let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
-                                window_id: tracked.window_id,
-                                width: frame.width,
-                                height: frame.height,
-                                logical_width: frame.logical_width,
-                                logical_height: frame.logical_height,
-                                bgra: Arc::clone(&frame.bgra),
-                            });
-                        }
-                    }
-                }
-                for popup in self.popup_windows.values() {
-                    if popup.announced {
-                        if let Some(frame) = &popup.latest_bgra {
-                            let _ = self.event_tx.send(CompositorEvent::PopupCreated {
-                                window_id: popup.window_id,
-                                parent_id: popup.parent_id,
-                                x: popup.geo.loc.x,
-                                y: popup.geo.loc.y,
-                                width: frame.logical_width,
-                                height: frame.logical_height,
-                            });
-                            let _ = self.event_tx.send(CompositorEvent::PopupFrame {
-                                window_id: popup.window_id,
-                                width: frame.width,
-                                height: frame.height,
-                                logical_width: frame.logical_width,
-                                logical_height: frame.logical_height,
-                                bgra: (*frame.bgra).clone(),
-                            });
-                        }
-                    }
-                }
-                for xwin in self.x11_windows.values() {
-                    if xwin.announced {
-                        if xwin.has_window_entry {
-                            let win_name = if !xwin.last_title.is_empty() {
-                                xwin.last_title.clone()
-                            } else if !xwin.last_app_id.is_empty() {
-                                xwin.last_app_id.clone()
-                            } else {
-                                format!("X11 Window #{}", xwin.window_id)
-                            };
-                            let _ = self.event_tx.send(CompositorEvent::AppState {
-                                launch_id: WINDOW_LAUNCH_ID_BASE | xwin.window_id,
-                                name: win_name,
-                                state: LaunchState::Running,
-                            });
-                        }
-                        let _ = self.event_tx.send(CompositorEvent::WindowCreated {
-                            window_id: xwin.window_id,
-                            title: xwin.last_title.clone(),
-                            app_id: xwin.last_app_id.clone(),
-                            width: xwin.last_width,
-                            height: xwin.last_height,
-                        });
-                        let _ = self.event_tx.send(CompositorEvent::SetDecorationMode {
-                            window_id: xwin.window_id,
-                            server_side: xwin.server_side_decoration,
-                        });
-                        if let Some(frame) = &xwin.latest_bgra {
-                            let _ = self.event_tx.send(CompositorEvent::FrameCommitted {
-                                window_id: xwin.window_id,
-                                width: frame.width,
-                                height: frame.height,
-                                logical_width: frame.logical_width,
-                                logical_height: frame.logical_height,
-                                bgra: Arc::clone(&frame.bgra),
-                            });
-                        }
-                    }
-                }
-                for xpop in self.x11_popups.values() {
-                    if xpop.announced {
-                        if let Some(frame) = &xpop.latest_bgra {
-                            let _ = self.event_tx.send(CompositorEvent::PopupCreated {
-                                window_id: xpop.window_id,
-                                parent_id: xpop.parent_id,
-                                x: xpop.rel_pos.0,
-                                y: xpop.rel_pos.1,
-                                width: frame.logical_width,
-                                height: frame.logical_height,
-                            });
-                            let _ = self.event_tx.send(CompositorEvent::PopupFrame {
-                                window_id: xpop.window_id,
-                                width: frame.width,
-                                height: frame.height,
-                                logical_width: frame.logical_width,
-                                logical_height: frame.logical_height,
-                                bgra: (*frame.bgra).clone(),
-                            });
-                        }
-                    }
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    clear_keyboard_focus_and_keys(self, &keyboard, serial, time_ms);
                 }
             }
         }
+    }
+
+    /// Events that bring a freshly connected (or resyncing) client up to date: every
+    /// running app and window entry, and every announced window and popup with its
+    /// decoration mode and latest frame.
+    fn snapshot_events(&self) -> Vec<CompositorEvent> {
+        let mut events = Vec::new();
+        for app in self.launched_apps.values() {
+            if !matches!(app.state, LaunchState::Exited(_)) {
+                events.push(CompositorEvent::AppState {
+                    launch_id: app.launch_id,
+                    name: app.name.clone(),
+                    state: app.state,
+                });
+            }
+        }
+        for tracked in self.windows.values() {
+            if tracked.announced && tracked.has_window_entry {
+                let win_name = if !tracked.last_title.is_empty() {
+                    tracked.last_title.clone()
+                } else if !tracked.last_app_id.is_empty() {
+                    tracked.last_app_id.clone()
+                } else {
+                    format!("Window #{}", tracked.window_id)
+                };
+                events.push(CompositorEvent::AppState {
+                    launch_id: WINDOW_LAUNCH_ID_BASE | tracked.window_id,
+                    name: win_name,
+                    state: LaunchState::Running,
+                });
+            }
+        }
+        for tracked in self.windows.values() {
+            if tracked.announced {
+                events.push(CompositorEvent::WindowCreated {
+                    window_id: tracked.window_id,
+                    title: tracked.last_title.clone(),
+                    app_id: tracked.last_app_id.clone(),
+                    width: tracked.last_width,
+                    height: tracked.last_height,
+                });
+                events.push(CompositorEvent::SetDecorationMode {
+                    window_id: tracked.window_id,
+                    server_side: tracked.server_side_decoration,
+                });
+                if let Some(frame) = &tracked.latest_bgra {
+                    events.push(CompositorEvent::FrameCommitted {
+                        window_id: tracked.window_id,
+                        width: frame.width,
+                        height: frame.height,
+                        logical_width: frame.logical_width,
+                        logical_height: frame.logical_height,
+                        bgra: Arc::clone(&frame.bgra),
+                    });
+                }
+            }
+        }
+        for popup in self.popup_windows.values() {
+            if popup.announced {
+                if let Some(frame) = &popup.latest_bgra {
+                    events.push(CompositorEvent::PopupCreated {
+                        window_id: popup.window_id,
+                        parent_id: popup.parent_id,
+                        x: popup.geo.loc.x,
+                        y: popup.geo.loc.y,
+                        width: frame.logical_width,
+                        height: frame.logical_height,
+                    });
+                    events.push(CompositorEvent::PopupFrame {
+                        window_id: popup.window_id,
+                        width: frame.width,
+                        height: frame.height,
+                        logical_width: frame.logical_width,
+                        logical_height: frame.logical_height,
+                        bgra: (*frame.bgra).clone(),
+                    });
+                }
+            }
+        }
+        for xwin in self.x11_windows.values() {
+            if xwin.announced {
+                if xwin.has_window_entry {
+                    let win_name = if !xwin.last_title.is_empty() {
+                        xwin.last_title.clone()
+                    } else if !xwin.last_app_id.is_empty() {
+                        xwin.last_app_id.clone()
+                    } else {
+                        format!("X11 Window #{}", xwin.window_id)
+                    };
+                    events.push(CompositorEvent::AppState {
+                        launch_id: WINDOW_LAUNCH_ID_BASE | xwin.window_id,
+                        name: win_name,
+                        state: LaunchState::Running,
+                    });
+                }
+                events.push(CompositorEvent::WindowCreated {
+                    window_id: xwin.window_id,
+                    title: xwin.last_title.clone(),
+                    app_id: xwin.last_app_id.clone(),
+                    width: xwin.last_width,
+                    height: xwin.last_height,
+                });
+                events.push(CompositorEvent::SetDecorationMode {
+                    window_id: xwin.window_id,
+                    server_side: xwin.server_side_decoration,
+                });
+                if let Some(frame) = &xwin.latest_bgra {
+                    events.push(CompositorEvent::FrameCommitted {
+                        window_id: xwin.window_id,
+                        width: frame.width,
+                        height: frame.height,
+                        logical_width: frame.logical_width,
+                        logical_height: frame.logical_height,
+                        bgra: Arc::clone(&frame.bgra),
+                    });
+                }
+            }
+        }
+        for xpop in self.x11_popups.values() {
+            if xpop.announced {
+                if let Some(frame) = &xpop.latest_bgra {
+                    events.push(CompositorEvent::PopupCreated {
+                        window_id: xpop.window_id,
+                        parent_id: xpop.parent_id,
+                        x: xpop.rel_pos.0,
+                        y: xpop.rel_pos.1,
+                        width: frame.logical_width,
+                        height: frame.logical_height,
+                    });
+                    events.push(CompositorEvent::PopupFrame {
+                        window_id: xpop.window_id,
+                        width: frame.width,
+                        height: frame.height,
+                        logical_width: frame.logical_width,
+                        logical_height: frame.logical_height,
+                        bgra: (*frame.bgra).clone(),
+                    });
+                }
+            }
+        }
+        events
     }
 
     fn recomposite_window(&mut self, window_id: WindowId, root_surface: &WlSurface) {
@@ -3674,6 +3728,7 @@ fn run_compositor_loop(
         next_window_id: 1,
         focused_window_id: 1,
         last_focused_x11_window_id: None,
+        pressed_buttons: HashSet::new(),
         next_x11_pos: (100, 100),
         cursor_surface: None,
         last_cursor_bitmap: None,

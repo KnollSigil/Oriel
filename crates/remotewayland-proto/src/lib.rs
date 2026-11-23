@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
+
+/// QUIC application close code the server sends to a display client whose session was
+/// taken over by a newer display client. Clients must not auto-reconnect on it, or two
+/// clients would keep taking the session from each other.
+pub const CLOSE_CODE_SUPERSEDED: u32 = 0x5257_0001;
 
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -121,6 +126,18 @@ pub enum LaunchState {
     Exited(i32),
 }
 
+/// What an authenticated connection is used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientRole {
+    /// Full desktop session: windows, input, clipboard and audio. The server serves one
+    /// display client at a time; a newly authenticated one takes over the session and the
+    /// previous one is closed with [`CLOSE_CODE_SUPERSEDED`].
+    Display,
+    /// Only tunnels remote PTY streams. Never takes over, or is taken over by, a display
+    /// client.
+    PtyOnly,
+}
+
 /// Bidirectional control-stream messages (QUIC stream 0).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMessage {
@@ -128,6 +145,7 @@ pub enum ControlMessage {
     AuthRequest {
         protocol_version: u32,
         token: String,
+        role: ClientRole,
         supported_codecs: Vec<VideoCodec>,
         enable_audio_bridge: bool,
         /// Initial effective display scale factor (>= 1.0) so the server can configure

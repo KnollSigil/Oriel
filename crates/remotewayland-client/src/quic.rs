@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use quinn::{ClientConfig, Endpoint, TransportConfig};
+use quinn::{ClientConfig, ConnectionError, Endpoint, TransportConfig, VarInt};
 use remotewayland_proto::{
     read_audio_packet, read_control_message, read_stream_header, read_video_frame,
-    write_audio_packet, write_control_message, write_stream_header, AudioPacketHeader,
+    write_audio_packet, write_control_message, write_stream_header, AudioPacketHeader, ClientRole,
     ControlMessage, LaunchState, RemoteAppEntry, StreamHeader, VideoCodec, WindowId,
-    PROTOCOL_VERSION,
+    CLOSE_CODE_SUPERSEDED, PROTOCOL_VERSION,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -91,11 +91,36 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
+/// The server ended the session because another display client took it over. Reconnecting
+/// automatically would take it back, so callers should stop instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTakenOver;
+
+impl std::fmt::Display for SessionTakenOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session opened by another client")
+    }
+}
+
+impl std::error::Error for SessionTakenOver {}
+
+/// Whether the server closed `conn` because another display client took over.
+fn closed_as_superseded(conn: &quinn::Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(ConnectionError::ApplicationClosed(close))
+            if close.error_code == VarInt::from_u32(CLOSE_CODE_SUPERSEDED)
+    )
+}
+
 /// Establish a pinned QUIC connection and perform the `AuthRequest`/`AuthResponse` handshake.
+/// A [`ClientRole::Display`] connection takes over the server's session from any other
+/// display client; a [`ClientRole::PtyOnly`] one coexists with it.
 pub async fn connect_and_auth(
     server_addr: SocketAddr,
     fingerprint_sha256: String,
     token: String,
+    role: ClientRole,
     enable_audio_bridge: bool,
     initial_scale: f64,
 ) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream, VideoCodec)> {
@@ -136,6 +161,7 @@ pub async fn connect_and_auth(
         &ControlMessage::AuthRequest {
             protocol_version: PROTOCOL_VERSION,
             token,
+            role,
             supported_codecs: vec![VideoCodec::SmartTile, VideoCodec::Lz4Delta],
             enable_audio_bridge,
             initial_scale,
@@ -185,6 +211,8 @@ pub enum LauncherNetEvent {
         congested: bool,
     },
     Disconnected(Option<String>),
+    /// The server closed the session because another display client took it over.
+    TakenOver,
 }
 
 /// Connect to the RemoteWayland server, verify its TLS fingerprint, and run the session loops.
@@ -203,6 +231,7 @@ pub async fn run_client(
         server_addr,
         fingerprint_sha256,
         token,
+        ClientRole::Display,
         enable_audio_bridge,
         initial_scale,
     )
@@ -727,6 +756,7 @@ pub async fn run_client(
     }
     .await;
 
+    let taken_over = closed_as_superseded(&conn);
     conn.close(0u32.into(), b"client disconnect");
     let _ = ui_tx.send(ClientUiEvent::Disconnected);
     if let Some(tx) = &launcher_tx {
@@ -749,6 +779,10 @@ pub async fn run_client(
         drop(handle);
     }
     uni_task.abort();
+    if taken_over {
+        info!("server session was opened by another client");
+        return Err(SessionTakenOver.into());
+    }
     loop_res
 }
 

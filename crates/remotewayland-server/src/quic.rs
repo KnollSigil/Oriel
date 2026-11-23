@@ -1,20 +1,22 @@
 //! QUIC server transport and ephemeral TLS/token authentication.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use quinn::{Endpoint, ServerConfig, TransportConfig};
+use anyhow::{anyhow, Context, Result};
+use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
 use remotewayland_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_stream_header,
     write_audio_packet, write_control_message, write_stream_header, write_video_frame,
-    AudioPacketHeader, BidiStreamHeader, ControlMessage, StreamHeader, VideoCodec,
-    VideoFrameHeader, WindowId, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
+    AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage, LaunchState, StreamHeader,
+    VideoCodec, VideoFrameHeader, WindowId, CLOSE_CODE_SUPERSEDED, MAX_VIDEO_FRAME_BYTES,
+    PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::{broadcast, mpsc, watch, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tracing::{info, warn};
 
 use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
@@ -89,6 +91,19 @@ pub fn generate_ephemeral_credentials(
     })
 }
 
+/// How long a newly authenticated display client waits for the client it replaces to tear
+/// down (release input, stop its audio bridge) before starting anyway.
+const TAKEOVER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// State shared by every connection to this server.
+struct Shared {
+    valid_tokens: Arc<Mutex<HashMap<String, Instant>>>,
+    cmd_tx: calloop::channel::Sender<CompositorCommand>,
+    events: broadcast::Sender<CompositorEvent>,
+    pty_mgr: Arc<crate::pty::PtyManager>,
+    display: Arc<Mutex<DisplaySlot>>,
+}
+
 /// Bind the QUIC endpoint and handle incoming authenticated client sessions.
 pub async fn run_server(
     listen_addr: SocketAddr,
@@ -116,15 +131,17 @@ pub async fn run_server(
         }
     });
 
-    let pty_mgr = crate::pty::PtyManager::new(bcast_tx.clone());
-    let valid_tokens = Arc::clone(&creds.valid_tokens);
+    let shared = Arc::new(Shared {
+        valid_tokens: Arc::clone(&creds.valid_tokens),
+        cmd_tx: comp_handle.cmd_tx.clone(),
+        pty_mgr: crate::pty::PtyManager::new(bcast_tx.clone()),
+        events: bcast_tx,
+        display: Arc::new(Mutex::new(DisplaySlot::default())),
+    });
     while let Some(incoming) = endpoint.accept().await {
-        let tokens = Arc::clone(&valid_tokens);
-        let cmd_tx = comp_handle.cmd_tx.clone();
-        let ev_rx = bcast_tx.subscribe();
-        let pty = Arc::clone(&pty_mgr);
+        let shared = Arc::clone(&shared);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(incoming, tokens, cmd_tx, ev_rx, pty).await {
+            if let Err(err) = handle_connection(incoming, shared).await {
                 warn!(error = %err, "client connection ended with error");
             }
         });
@@ -133,13 +150,7 @@ pub async fn run_server(
     Ok(())
 }
 
-async fn handle_connection(
-    incoming: quinn::Incoming,
-    valid_tokens: Arc<Mutex<HashMap<String, Instant>>>,
-    cmd_tx: calloop::channel::Sender<CompositorCommand>,
-    mut ev_rx: broadcast::Receiver<CompositorEvent>,
-    pty_mgr: Arc<crate::pty::PtyManager>,
-) -> Result<()> {
+async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<()> {
     let conn = incoming.await.context("QUIC handshake failed")?;
     let remote = conn.remote_address();
     info!(%remote, "QUIC peer connected");
@@ -153,73 +164,30 @@ async fn handle_connection(
         .await?
         .context("control stream closed before AuthRequest")?;
 
-    let (selected_codec, enable_audio_bridge) = match auth_msg {
+    let (token, role, supported_codecs, enable_audio_bridge, initial_scale) = match auth_msg {
         ControlMessage::AuthRequest {
             protocol_version,
             token,
+            role,
             supported_codecs,
             enable_audio_bridge,
             initial_scale,
         } => {
             if protocol_version != PROTOCOL_VERSION {
-                write_control_message(
+                reject_auth(
                     &mut send,
-                    &ControlMessage::AuthResponse {
-                        accepted: false,
-                        reason: Some(format!("unsupported protocol version {protocol_version}")),
-                        selected_codec: VideoCodec::Lz4Delta,
-                    },
+                    format!("unsupported protocol version {protocol_version}"),
                 )
                 .await?;
                 return Ok(());
             }
-
-            let token_valid = consume_token(&valid_tokens, &token);
-            if !token_valid {
-                write_control_message(
-                    &mut send,
-                    &ControlMessage::AuthResponse {
-                        accepted: false,
-                        reason: Some("invalid or expired session token".into()),
-                        selected_codec: VideoCodec::Lz4Delta,
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-
-            let selected_codec = if supported_codecs.contains(&VideoCodec::SmartTile) {
-                VideoCodec::SmartTile
-            } else {
-                supported_codecs
-                    .first()
-                    .copied()
-                    .unwrap_or(VideoCodec::Lz4Delta)
-            };
-
-            write_control_message(
-                &mut send,
-                &ControlMessage::AuthResponse {
-                    accepted: true,
-                    reason: None,
-                    selected_codec,
-                },
-            )
-            .await?;
-
-            info!(
-                %remote,
-                ?selected_codec,
+            (
+                token,
+                role,
+                supported_codecs,
                 enable_audio_bridge,
                 initial_scale,
-                "client authenticated; starting compositor/media loop"
-            );
-            let _ = cmd_tx.send(CompositorCommand::SetDisplayScale {
-                scale_factor: initial_scale,
-            });
-            let _ = cmd_tx.send(CompositorCommand::SyncWindows);
-            pty_mgr.sync_states();
-            (selected_codec, enable_audio_bridge)
+            )
         }
         other => {
             warn!(?other, "unexpected initial control message");
@@ -227,12 +195,75 @@ async fn handle_connection(
         }
     };
 
-    // Accept secondary bidirectional QUIC streams (e.g., persistent remote PTYs).
-    let bidi_conn = conn.clone();
-    let bidi_pty = Arc::clone(&pty_mgr);
+    if !consume_token(&shared.valid_tokens, &token) {
+        reject_auth(&mut send, "invalid or expired session token".into()).await?;
+        return Ok(());
+    }
+
+    let selected_codec = if supported_codecs.contains(&VideoCodec::SmartTile) {
+        VideoCodec::SmartTile
+    } else {
+        supported_codecs
+            .first()
+            .copied()
+            .unwrap_or(VideoCodec::Lz4Delta)
+    };
+
+    write_control_message(
+        &mut send,
+        &ControlMessage::AuthResponse {
+            accepted: true,
+            reason: None,
+            selected_codec,
+        },
+    )
+    .await?;
+
+    let pty_streams = spawn_pty_stream_acceptor(conn.clone(), Arc::clone(&shared.pty_mgr));
+    let res = match role {
+        ClientRole::PtyOnly => {
+            info!(%remote, "PTY-only client authenticated");
+            // The control stream stays open (and unused) for the connection's lifetime.
+            conn.closed().await;
+            Ok(())
+        }
+        ClientRole::Display => {
+            run_display_session(
+                &conn,
+                send,
+                recv,
+                &shared,
+                selected_codec,
+                enable_audio_bridge,
+                initial_scale,
+            )
+            .await
+        }
+    };
+    pty_streams.abort();
+    res
+}
+
+async fn reject_auth(send: &mut quinn::SendStream, reason: String) -> Result<()> {
+    write_control_message(
+        send,
+        &ControlMessage::AuthResponse {
+            accepted: false,
+            reason: Some(reason),
+            selected_codec: VideoCodec::Lz4Delta,
+        },
+    )
+    .await
+}
+
+/// Accept secondary bidirectional QUIC streams (persistent remote PTYs) on `conn`.
+fn spawn_pty_stream_acceptor(
+    conn: quinn::Connection,
+    pty_mgr: Arc<crate::pty::PtyManager>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok((send_bi, mut recv_bi)) = bidi_conn.accept_bi().await {
-            let pty = Arc::clone(&bidi_pty);
+        while let Ok((send_bi, mut recv_bi)) = conn.accept_bi().await {
+            let pty = Arc::clone(&pty_mgr);
             tokio::spawn(async move {
                 match read_bidi_stream_header(&mut recv_bi).await {
                     Ok(BidiStreamHeader::Pty {
@@ -261,10 +292,166 @@ async fn handle_connection(
                 }
             });
         }
+    })
+}
+
+/// The display client currently being served. The server drives one display client at a
+/// time: windows, input, display scale and audio are all session-wide, so two clients
+/// would fight over them.
+#[derive(Default)]
+struct DisplaySlot {
+    next_id: u64,
+    active: Option<ActiveDisplay>,
+}
+
+struct ActiveDisplay {
+    id: u64,
+    remote: SocketAddr,
+    /// Closes the client's connection with [`CLOSE_CODE_SUPERSEDED`].
+    supersede: Box<dyn FnOnce() + Send>,
+    /// Resolves once the client's session has fully torn down (its lease was dropped).
+    finished: oneshot::Receiver<()>,
+}
+
+/// Held by the display session that owns the slot; dropping it frees the slot (unless a
+/// newer client already took it) and wakes a client waiting to take over.
+struct DisplayLease {
+    slot: Arc<Mutex<DisplaySlot>>,
+    id: u64,
+    _finished: oneshot::Sender<()>,
+}
+
+impl DisplayLease {
+    /// Whether a newer display client has taken the session from this one.
+    fn superseded(&self) -> bool {
+        self.slot
+            .lock()
+            .map(|s| s.active.as_ref().is_none_or(|a| a.id != self.id))
+            .unwrap_or(true)
+    }
+}
+
+impl Drop for DisplayLease {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            if slot.active.as_ref().is_some_and(|a| a.id == self.id) {
+                slot.active = None;
+            }
+        }
+    }
+}
+
+/// Make the caller the active display client. The previous one, if any, is superseded and
+/// this waits (bounded) until its session has torn down, so the two never drive input or
+/// run audio bridges at the same time. Call only after the client has authenticated, so
+/// unauthenticated peers cannot kick the active session.
+async fn take_over_display(
+    slot: &Arc<Mutex<DisplaySlot>>,
+    remote: SocketAddr,
+    supersede: Box<dyn FnOnce() + Send>,
+) -> DisplayLease {
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let (id, previous) = {
+        let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
+        s.next_id += 1;
+        let id = s.next_id;
+        let previous = s.active.replace(ActiveDisplay {
+            id,
+            remote,
+            supersede,
+            finished: finished_rx,
+        });
+        (id, previous)
+    };
+    if let Some(previous) = previous {
+        info!(
+            previous = %previous.remote,
+            new = %remote,
+            "display session taken over by a newly connected client"
+        );
+        (previous.supersede)();
+        if tokio::time::timeout(TAKEOVER_TEARDOWN_TIMEOUT, previous.finished)
+            .await
+            .is_err()
+        {
+            warn!(previous = %previous.remote, "previous display client did not tear down in time");
+        }
+    }
+    DisplayLease {
+        slot: Arc::clone(slot),
+        id,
+        _finished: finished_tx,
+    }
+}
+
+static NEXT_SYNC_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A snapshot requested from the compositor whose [`CompositorEvent::SnapshotTaken`]
+/// marker has not been seen on the event stream yet.
+struct PendingSnapshot {
+    sync_id: u64,
+    reply: oneshot::Receiver<Vec<CompositorEvent>>,
+}
+
+fn request_snapshot(
+    cmd_tx: &calloop::channel::Sender<CompositorCommand>,
+) -> Result<PendingSnapshot> {
+    let sync_id = NEXT_SYNC_ID.fetch_add(1, Ordering::Relaxed);
+    let (reply_tx, reply) = oneshot::channel();
+    cmd_tx
+        .send(CompositorCommand::Snapshot {
+            sync_id,
+            reply: reply_tx,
+        })
+        .map_err(|_| anyhow!("compositor is no longer running"))?;
+    Ok(PendingSnapshot { sync_id, reply })
+}
+
+async fn run_display_session(
+    conn: &quinn::Connection,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    shared: &Shared,
+    selected_codec: VideoCodec,
+    enable_audio_bridge: bool,
+    initial_scale: f64,
+) -> Result<()> {
+    let remote = conn.remote_address();
+    let supersede_conn = conn.clone();
+    let lease = take_over_display(
+        &shared.display,
+        remote,
+        Box::new(move || {
+            supersede_conn.close(
+                VarInt::from_u32(CLOSE_CODE_SUPERSEDED),
+                b"session opened by another client",
+            );
+        }),
+    )
+    .await;
+    if lease.superseded() || conn.close_reason().is_some() {
+        // Superseded or gone while waiting for the previous client to tear down.
+        return Ok(());
+    }
+
+    info!(
+        %remote,
+        ?selected_codec,
+        enable_audio_bridge,
+        initial_scale,
+        "display client authenticated; starting compositor/media loop"
+    );
+    let cmd_tx = shared.cmd_tx.clone();
+    let pty_mgr = &shared.pty_mgr;
+    // Subscribe only now: everything before this point is covered by the initial snapshot.
+    let mut ev_rx = shared.events.subscribe();
+    let _ = cmd_tx.send(CompositorCommand::SetDisplayScale {
+        scale_factor: initial_scale,
     });
+    let mut pending_snapshot = Some(request_snapshot(&cmd_tx)?);
 
     // Start bidirectional PipeWire <-> Opus audio bridge if requested.
-    let (mut mic_active_rx, _audio_bridge_guard) = if enable_audio_bridge {
+    let (mut mic_active_rx, audio_bridge_guard) = if enable_audio_bridge {
         let (mic_rx, guard) = match start_per_app_playback_capture() {
             Ok(bridge) => {
                 let mut streams = bridge.streams;
@@ -345,20 +532,6 @@ async fn handle_connection(
         (None, None)
     };
 
-    struct PopupEncoderState {
-        encoder: WindowVideoEncoder,
-        width: u32,
-        height: u32,
-        logical_width: u32,
-        logical_height: u32,
-        last_update: Instant,
-    }
-
-    let mut video_pipelines: HashMap<WindowId, WindowVideoPipeline> = HashMap::new();
-    let mut popup_encoders: HashMap<WindowId, PopupEncoderState> = HashMap::new();
-    let session_start = Instant::now();
-    const POPUP_IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
-
     // Serialize and coalesce client ColorScheme updates onto a single worker so bursts
     // cannot spawn unbounded blocking tasks or race on isolated portal config files.
     let (color_scheme_tx, mut color_scheme_rx) = tokio::sync::watch::channel::<Option<u32>>(None);
@@ -395,19 +568,16 @@ async fn handle_connection(
         }
     });
 
+    // Replies produced off the event loop (e.g. the app list, whose discovery blocks), so
+    // slow work never stalls event forwarding and makes the event receiver lag.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ControlMessage>();
+
+    let mut fwd = EventForwarder::new(conn.clone(), selected_codec);
+
     // Bridge compositor events -> QUIC control/video streams and QUIC control messages -> compositor.
     let loop_res: Result<()> = async {
     loop {
-        let next_popup_refresh = popup_encoders
-            .iter()
-            .filter(|(_, st)| st.encoder.has_pending_lossless_refresh())
-            .map(|(&wid, st)| {
-                (
-                    wid,
-                    POPUP_IDLE_REFRESH_DELAY.saturating_sub(st.last_update.elapsed()),
-                )
-            })
-            .min_by_key(|&(_, wait)| wait);
+        let next_popup_refresh = fwd.next_popup_refresh();
 
         tokio::select! {
             Some(wid) = async {
@@ -421,21 +591,7 @@ async fn handle_connection(
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(st) = popup_encoders.get_mut(&wid) {
-                    let pts_ns = session_start.elapsed().as_nanos() as u64;
-                    if let Some(frame) = st.encoder.encode_lossless_refresh(st.width, st.height, pts_ns) {
-                        st.last_update = Instant::now();
-                        write_control_message(&mut send, &ControlMessage::PopupFrame {
-                            window_id: wid,
-                            width: frame.width,
-                            height: frame.height,
-                            logical_width: st.logical_width,
-                            logical_height: st.logical_height,
-                            is_keyframe: frame.is_keyframe,
-                            bgra: frame.data,
-                        }).await?;
-                    }
-                }
+                fwd.send_popup_lossless_refresh(&mut send, wid).await?;
             }
             Some(active) = async {
                 match mic_active_rx.as_mut() {
@@ -445,159 +601,36 @@ async fn handle_connection(
             } => {
                 write_control_message(&mut send, &ControlMessage::SetMicActive { active }).await?;
             }
+            Some(msg) = out_rx.recv() => {
+                write_control_message(&mut send, &msg).await?;
+            }
             ev = ev_rx.recv() => {
                 match ev {
-                    Ok(CompositorEvent::WindowCreated { window_id, title, app_id, width, height }) => {
-                        write_control_message(&mut send, &ControlMessage::WindowCreated {
-                            window_id, title, app_id, width, height
-                        }).await?;
+                    Ok(CompositorEvent::SnapshotTaken { sync_id })
+                        if pending_snapshot.as_ref().is_some_and(|p| p.sync_id == sync_id) =>
+                    {
+                        let Some(pending) = pending_snapshot.take() else {
+                            continue;
+                        };
+                        let mut events = pending
+                            .reply
+                            .await
+                            .context("compositor dropped a snapshot request")?;
+                        // PTY events reach the stream directly rather than through the
+                        // compositor, so their snapshot is taken now: any PTY event still
+                        // queued behind the marker is newer than the compositor snapshot
+                        // and is applied after this one.
+                        events.extend(pty_mgr.state_events());
+                        fwd.apply_snapshot(&mut send, events).await?;
                     }
-                    Ok(CompositorEvent::PopupCreated { window_id, parent_id, x, y, width, height }) => {
-                        write_control_message(&mut send, &ControlMessage::PopupCreated {
-                            window_id, parent_id, x, y, width, height
-                        }).await?;
-                    }
-                    Ok(CompositorEvent::PopupRepositioned { window_id, x, y, width, height }) => {
-                        write_control_message(&mut send, &ControlMessage::PopupRepositioned {
-                            window_id, x, y, width, height
-                        }).await?;
-                    }
-                    Ok(CompositorEvent::PopupFrame {
-                        window_id,
-                        width,
-                        height,
-                        logical_width,
-                        logical_height,
-                        bgra,
-                    }) => {
-                        let st = popup_encoders
-                            .entry(window_id)
-                            .or_insert_with(|| PopupEncoderState {
-                                encoder: WindowVideoEncoder::new(selected_codec),
-                                width,
-                                height,
-                                logical_width,
-                                logical_height,
-                                last_update: Instant::now(),
-                            });
-                        st.width = width;
-                        st.height = height;
-                        st.logical_width = logical_width;
-                        st.logical_height = logical_height;
-                        st.last_update = Instant::now();
-                        let pts_ns = session_start.elapsed().as_nanos() as u64;
-                        let frame = st.encoder.encode_bgra(width, height, pts_ns, &bgra, 80);
-                        write_control_message(&mut send, &ControlMessage::PopupFrame {
-                            window_id,
-                            width: frame.width,
-                            height: frame.height,
-                            logical_width,
-                            logical_height,
-                            is_keyframe: frame.is_keyframe,
-                            bgra: frame.data,
-                        }).await?;
-                    }
-                    Ok(CompositorEvent::StartMove { window_id }) => {
-                        write_control_message(&mut send, &ControlMessage::StartMove { window_id }).await?;
-                    }
-                    Ok(CompositorEvent::StartResize { window_id, edge }) => {
-                        write_control_message(&mut send, &ControlMessage::StartResize { window_id, edge }).await?;
-                    }
-                    Ok(CompositorEvent::SetMaximized { window_id, maximized }) => {
-                        write_control_message(&mut send, &ControlMessage::SetMaximized { window_id, maximized }).await?;
-                    }
-                    Ok(CompositorEvent::SetMinimized { window_id }) => {
-                        write_control_message(&mut send, &ControlMessage::SetMinimized { window_id }).await?;
-                    }
-                    Ok(CompositorEvent::SetFullscreen { window_id, fullscreen }) => {
-                        write_control_message(&mut send, &ControlMessage::SetFullscreen { window_id, fullscreen }).await?;
-                    }
-                    Ok(CompositorEvent::ShowWindowMenu { window_id, x, y }) => {
-                        write_control_message(&mut send, &ControlMessage::ShowWindowMenu { window_id, x, y }).await?;
-                    }
-                    Ok(CompositorEvent::SetDecorationMode { window_id, server_side }) => {
-                        write_control_message(&mut send, &ControlMessage::SetDecorationMode { window_id, server_side }).await?;
-                    }
-                    Ok(CompositorEvent::WindowConfigured { window_id, width, height, scale_factor }) => {
-                        write_control_message(&mut send, &ControlMessage::WindowConfigured {
-                            window_id,
-                            width,
-                            height,
-                            scale_factor,
-                            maximized: false,
-                            fullscreen: false,
-                            activated: true,
-                            tiled: false,
-                        }).await?;
-                    }
-                    Ok(CompositorEvent::WindowClosed { window_id }) => {
-                        video_pipelines.remove(&window_id);
-                        popup_encoders.remove(&window_id);
-                        write_control_message(&mut send, &ControlMessage::WindowClosed { window_id }).await?;
-                    }
-                    Ok(CompositorEvent::CursorUpdate { window_id, visible, shape_name }) => {
-                        write_control_message(&mut send, &ControlMessage::CursorUpdate {
-                            window_id, visible, shape_name
-                        }).await?;
-                    }
-                    Ok(CompositorEvent::CursorBitmap {
-                        window_id,
-                        width,
-                        height,
-                        logical_width,
-                        logical_height,
-                        hotspot_x,
-                        hotspot_y,
-                        bgra,
-                    }) => {
-                        write_control_message(&mut send, &ControlMessage::CursorBitmap {
-                            window_id,
-                            width,
-                            height,
-                            logical_width,
-                            logical_height,
-                            hotspot_x,
-                            hotspot_y,
-                            bgra,
-                        }).await?;
-                    }
-                    Ok(CompositorEvent::ClipboardText { text }) => {
-                        write_control_message(&mut send, &ControlMessage::ClipboardText { text }).await?;
-                    }
-                    Ok(CompositorEvent::PrimarySelectionText { text }) => {
-                        write_control_message(&mut send, &ControlMessage::PrimarySelectionText { text }).await?;
-                    }
-                    Ok(CompositorEvent::AppState { launch_id, name, state }) => {
-                        write_control_message(&mut send, &ControlMessage::AppState {
-                            launch_id, name, state
-                        }).await?;
-                    }
-                    Ok(CompositorEvent::FrameCommitted {
-                        window_id,
-                        width,
-                        height,
-                        logical_width,
-                        logical_height,
-                        bgra,
-                    }) => {
-                        let pipeline = video_pipelines.entry(window_id).or_insert_with(|| {
-                            spawn_window_video_pipeline(
-                                window_id,
-                                conn.clone(),
-                                selected_codec,
-                                session_start,
-                            )
-                        });
-                        pipeline.push_frame(RawVideoFrame {
-                            width,
-                            height,
-                            logical_width,
-                            logical_height,
-                            bgra,
-                        });
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "compositor event receiver lagged");
+                    // Already reflected in the pending snapshot.
+                    Ok(_) if pending_snapshot.is_some() => {}
+                    Ok(ev) => fwd.forward(&mut send, ev).await?,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Dropped events may include windows or programs that opened or
+                        // closed; bring the client back in line from a fresh snapshot.
+                        warn!(skipped, "compositor event receiver lagged; resyncing client");
+                        pending_snapshot = Some(request_snapshot(&cmd_tx)?);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -661,10 +694,13 @@ async fn handle_connection(
                         let _ = cmd_tx.send(CompositorCommand::KeyboardLeave { window_id });
                     }
                     Some(ControlMessage::ListApps) => {
-                        let apps = tokio::task::spawn_blocking(crate::apps::discover_apps)
-                            .await
-                            .unwrap_or_default();
-                        write_control_message(&mut send, &ControlMessage::AppList { apps }).await?;
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            let apps = tokio::task::spawn_blocking(crate::apps::discover_apps)
+                                .await
+                                .unwrap_or_default();
+                            let _ = out_tx.send(ControlMessage::AppList { apps });
+                        });
                     }
                     Some(ControlMessage::LaunchApp { launch_id, name, exec }) => {
                         let _ = cmd_tx.send(CompositorCommand::LaunchApp { launch_id, name, exec });
@@ -680,9 +716,7 @@ async fn handle_connection(
                         let _ = color_scheme_tx.send(Some(scheme));
                     }
                     Some(ControlMessage::FrameAck { window_id, pts_ns }) => {
-                        if let Some(pipeline) = video_pipelines.get(&window_id) {
-                            pipeline.ack_frame(pts_ns);
-                        }
+                        fwd.ack_frame(window_id, pts_ns);
                     }
                     Some(other) => {
                         info!(?other, "received control message");
@@ -696,12 +730,471 @@ async fn handle_connection(
     }
     .await;
 
+    // Tear down before releasing the slot, so a client taking over never overlaps with
+    // this one's input or audio bridge.
     ctrl_reader_task.abort();
-    for (_, pipeline) in video_pipelines.drain() {
-        pipeline.task.abort();
+    fwd.shutdown();
+    let _ = cmd_tx.send(CompositorCommand::ReleaseInput);
+    drop(audio_bridge_guard);
+    let superseded = lease.superseded();
+    if conn.close_reason().is_none() {
+        conn.close(0u32.into(), b"session ended");
+    }
+    drop(lease);
+
+    if superseded {
+        info!(%remote, "display client disconnected: session taken over by another client");
+        return Ok(());
+    }
+    loop_res
+}
+
+struct PopupEncoderState {
+    encoder: WindowVideoEncoder,
+    width: u32,
+    height: u32,
+    logical_width: u32,
+    logical_height: u32,
+    last_update: Instant,
+}
+
+const POPUP_IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
+
+/// Forwards compositor events to one display client and tracks what that client has been
+/// told, so a snapshot can retract windows and programs it missed the end of.
+struct EventForwarder {
+    conn: quinn::Connection,
+    selected_codec: VideoCodec,
+    session_start: Instant,
+    video_pipelines: HashMap<WindowId, WindowVideoPipeline>,
+    popup_encoders: HashMap<WindowId, PopupEncoderState>,
+    /// Windows and popups announced to the client and not closed since.
+    announced_windows: HashSet<WindowId>,
+    /// Programs (launched apps, window entries, PTYs) the client shows as live, by launch id.
+    live_programs: HashMap<u64, String>,
+}
+
+impl EventForwarder {
+    fn new(conn: quinn::Connection, selected_codec: VideoCodec) -> Self {
+        Self {
+            conn,
+            selected_codec,
+            session_start: Instant::now(),
+            video_pipelines: HashMap::new(),
+            popup_encoders: HashMap::new(),
+            announced_windows: HashSet::new(),
+            live_programs: HashMap::new(),
+        }
     }
 
-    loop_res
+    /// The popup whose pending lossless refresh is due next, and how long until it is.
+    fn next_popup_refresh(&self) -> Option<(WindowId, Duration)> {
+        self.popup_encoders
+            .iter()
+            .filter(|(_, st)| st.encoder.has_pending_lossless_refresh())
+            .map(|(&wid, st)| {
+                (
+                    wid,
+                    POPUP_IDLE_REFRESH_DELAY.saturating_sub(st.last_update.elapsed()),
+                )
+            })
+            .min_by_key(|&(_, wait)| wait)
+    }
+
+    async fn send_popup_lossless_refresh(
+        &mut self,
+        send: &mut quinn::SendStream,
+        wid: WindowId,
+    ) -> Result<()> {
+        let pts_ns = self.session_start.elapsed().as_nanos() as u64;
+        let Some(st) = self.popup_encoders.get_mut(&wid) else {
+            return Ok(());
+        };
+        let Some(frame) = st
+            .encoder
+            .encode_lossless_refresh(st.width, st.height, pts_ns)
+        else {
+            return Ok(());
+        };
+        st.last_update = Instant::now();
+        write_control_message(
+            send,
+            &ControlMessage::PopupFrame {
+                window_id: wid,
+                width: frame.width,
+                height: frame.height,
+                logical_width: st.logical_width,
+                logical_height: st.logical_height,
+                is_keyframe: frame.is_keyframe,
+                bgra: frame.data,
+            },
+        )
+        .await
+    }
+
+    fn ack_frame(&self, window_id: WindowId, pts_ns: u64) {
+        if let Some(pipeline) = self.video_pipelines.get(&window_id) {
+            pipeline.ack_frame(pts_ns);
+        }
+    }
+
+    /// Bring the client in line with `snapshot`: retract what it shows that no longer
+    /// exists, then replay the snapshot (re-announcing what already exists is idempotent).
+    async fn apply_snapshot(
+        &mut self,
+        send: &mut quinn::SendStream,
+        snapshot: Vec<CompositorEvent>,
+    ) -> Result<()> {
+        let (stale_windows, stale_programs) =
+            stale_entries(&self.announced_windows, &self.live_programs, &snapshot);
+        for window_id in stale_windows {
+            self.forward(send, CompositorEvent::WindowClosed { window_id })
+                .await?;
+        }
+        for (launch_id, name) in stale_programs {
+            // The real exit code is unknown; clients only use it to drop the entry.
+            self.forward(
+                send,
+                CompositorEvent::AppState {
+                    launch_id,
+                    name,
+                    state: LaunchState::Exited(0),
+                },
+            )
+            .await?;
+        }
+        for ev in snapshot {
+            self.forward(send, ev).await?;
+        }
+        Ok(())
+    }
+
+    async fn forward(&mut self, send: &mut quinn::SendStream, ev: CompositorEvent) -> Result<()> {
+        match ev {
+            CompositorEvent::WindowCreated {
+                window_id,
+                title,
+                app_id,
+                width,
+                height,
+            } => {
+                self.announced_windows.insert(window_id);
+                write_control_message(
+                    send,
+                    &ControlMessage::WindowCreated {
+                        window_id,
+                        title,
+                        app_id,
+                        width,
+                        height,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::PopupCreated {
+                window_id,
+                parent_id,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                self.announced_windows.insert(window_id);
+                write_control_message(
+                    send,
+                    &ControlMessage::PopupCreated {
+                        window_id,
+                        parent_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::PopupRepositioned {
+                window_id,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::PopupRepositioned {
+                        window_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::PopupFrame {
+                window_id,
+                width,
+                height,
+                logical_width,
+                logical_height,
+                bgra,
+            } => {
+                let selected_codec = self.selected_codec;
+                let st =
+                    self.popup_encoders
+                        .entry(window_id)
+                        .or_insert_with(|| PopupEncoderState {
+                            encoder: WindowVideoEncoder::new(selected_codec),
+                            width,
+                            height,
+                            logical_width,
+                            logical_height,
+                            last_update: Instant::now(),
+                        });
+                st.width = width;
+                st.height = height;
+                st.logical_width = logical_width;
+                st.logical_height = logical_height;
+                st.last_update = Instant::now();
+                let pts_ns = self.session_start.elapsed().as_nanos() as u64;
+                let frame = st.encoder.encode_bgra(width, height, pts_ns, &bgra, 80);
+                write_control_message(
+                    send,
+                    &ControlMessage::PopupFrame {
+                        window_id,
+                        width: frame.width,
+                        height: frame.height,
+                        logical_width,
+                        logical_height,
+                        is_keyframe: frame.is_keyframe,
+                        bgra: frame.data,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::StartMove { window_id } => {
+                write_control_message(send, &ControlMessage::StartMove { window_id }).await?;
+            }
+            CompositorEvent::StartResize { window_id, edge } => {
+                write_control_message(send, &ControlMessage::StartResize { window_id, edge })
+                    .await?;
+            }
+            CompositorEvent::SetMaximized {
+                window_id,
+                maximized,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::SetMaximized {
+                        window_id,
+                        maximized,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::SetMinimized { window_id } => {
+                write_control_message(send, &ControlMessage::SetMinimized { window_id }).await?;
+            }
+            CompositorEvent::SetFullscreen {
+                window_id,
+                fullscreen,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::SetFullscreen {
+                        window_id,
+                        fullscreen,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::ShowWindowMenu { window_id, x, y } => {
+                write_control_message(send, &ControlMessage::ShowWindowMenu { window_id, x, y })
+                    .await?;
+            }
+            CompositorEvent::SetDecorationMode {
+                window_id,
+                server_side,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::SetDecorationMode {
+                        window_id,
+                        server_side,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::WindowConfigured {
+                window_id,
+                width,
+                height,
+                scale_factor,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::WindowConfigured {
+                        window_id,
+                        width,
+                        height,
+                        scale_factor,
+                        maximized: false,
+                        fullscreen: false,
+                        activated: true,
+                        tiled: false,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::WindowClosed { window_id } => {
+                self.announced_windows.remove(&window_id);
+                if let Some(pipeline) = self.video_pipelines.remove(&window_id) {
+                    pipeline.task.abort();
+                }
+                self.popup_encoders.remove(&window_id);
+                write_control_message(send, &ControlMessage::WindowClosed { window_id }).await?;
+            }
+            CompositorEvent::CursorUpdate {
+                window_id,
+                visible,
+                shape_name,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::CursorUpdate {
+                        window_id,
+                        visible,
+                        shape_name,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::CursorBitmap {
+                window_id,
+                width,
+                height,
+                logical_width,
+                logical_height,
+                hotspot_x,
+                hotspot_y,
+                bgra,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::CursorBitmap {
+                        window_id,
+                        width,
+                        height,
+                        logical_width,
+                        logical_height,
+                        hotspot_x,
+                        hotspot_y,
+                        bgra,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::ClipboardText { text } => {
+                write_control_message(send, &ControlMessage::ClipboardText { text }).await?;
+            }
+            CompositorEvent::PrimarySelectionText { text } => {
+                write_control_message(send, &ControlMessage::PrimarySelectionText { text }).await?;
+            }
+            CompositorEvent::AppState {
+                launch_id,
+                name,
+                state,
+            } => {
+                if matches!(state, LaunchState::Exited(_)) {
+                    self.live_programs.remove(&launch_id);
+                } else {
+                    self.live_programs.insert(launch_id, name.clone());
+                }
+                write_control_message(
+                    send,
+                    &ControlMessage::AppState {
+                        launch_id,
+                        name,
+                        state,
+                    },
+                )
+                .await?;
+            }
+            CompositorEvent::FrameCommitted {
+                window_id,
+                width,
+                height,
+                logical_width,
+                logical_height,
+                bgra,
+            } => {
+                let (conn, selected_codec, session_start) =
+                    (&self.conn, self.selected_codec, self.session_start);
+                let pipeline = self.video_pipelines.entry(window_id).or_insert_with(|| {
+                    spawn_window_video_pipeline(
+                        window_id,
+                        conn.clone(),
+                        selected_codec,
+                        session_start,
+                    )
+                });
+                pipeline.push_frame(RawVideoFrame {
+                    width,
+                    height,
+                    logical_width,
+                    logical_height,
+                    bgra,
+                });
+            }
+            CompositorEvent::SnapshotTaken { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        for (_, pipeline) in self.video_pipelines.drain() {
+            pipeline.task.abort();
+        }
+    }
+}
+
+/// What a client tracking `announced_windows` and `live_programs` shows that `snapshot`
+/// no longer contains: windows/popups to close and programs to mark exited.
+fn stale_entries(
+    announced_windows: &HashSet<WindowId>,
+    live_programs: &HashMap<u64, String>,
+    snapshot: &[CompositorEvent],
+) -> (Vec<WindowId>, Vec<(u64, String)>) {
+    let mut windows = HashSet::new();
+    let mut programs = HashSet::new();
+    for ev in snapshot {
+        match ev {
+            CompositorEvent::WindowCreated { window_id, .. }
+            | CompositorEvent::PopupCreated { window_id, .. } => {
+                windows.insert(*window_id);
+            }
+            CompositorEvent::AppState {
+                launch_id, state, ..
+            } if !matches!(state, LaunchState::Exited(_)) => {
+                programs.insert(*launch_id);
+            }
+            _ => {}
+        }
+    }
+    let mut stale_windows: Vec<WindowId> = announced_windows
+        .iter()
+        .filter(|id| !windows.contains(*id))
+        .copied()
+        .collect();
+    stale_windows.sort_unstable();
+    let mut stale_programs: Vec<(u64, String)> = live_programs
+        .iter()
+        .filter(|(id, _)| !programs.contains(*id))
+        .map(|(id, name)| (*id, name.clone()))
+        .collect();
+    stale_programs.sort_unstable();
+    (stale_windows, stale_programs)
 }
 
 /// Maximum number of unacknowledged video frames allowed in flight per window.
@@ -1063,6 +1556,95 @@ mod tests {
         assert!(!consume_token(&map, "expired"));
         assert!(!consume_token(&map, "nonexistent"));
         assert!(map.lock().unwrap().is_empty());
+    }
+
+    fn app_state(launch_id: u64, state: LaunchState) -> CompositorEvent {
+        CompositorEvent::AppState {
+            launch_id,
+            name: format!("app {launch_id}"),
+            state,
+        }
+    }
+
+    #[test]
+    fn stale_entries_are_what_the_client_shows_but_the_snapshot_lacks() {
+        let announced = HashSet::from([1, 2, 3, 4]);
+        let live = HashMap::from([
+            (10, "app 10".to_string()),
+            (11, "app 11".to_string()),
+            (12, "app 12".to_string()),
+        ]);
+        let snapshot = vec![
+            CompositorEvent::WindowCreated {
+                window_id: 1,
+                title: String::new(),
+                app_id: String::new(),
+                width: 1,
+                height: 1,
+            },
+            CompositorEvent::PopupCreated {
+                window_id: 3,
+                parent_id: 1,
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            // New since the client last heard: not stale, just announced by the replay.
+            CompositorEvent::WindowCreated {
+                window_id: 5,
+                title: String::new(),
+                app_id: String::new(),
+                width: 1,
+                height: 1,
+            },
+            app_state(10, LaunchState::Running),
+            app_state(12, LaunchState::Exited(0)),
+        ];
+
+        let (windows, programs) = stale_entries(&announced, &live, &snapshot);
+        assert_eq!(windows, vec![2, 4]);
+        assert_eq!(
+            programs,
+            vec![(11, "app 11".to_string()), (12, "app 12".to_string())]
+        );
+    }
+
+    fn superseder(flag: &Arc<std::sync::atomic::AtomicBool>) -> Box<dyn FnOnce() + Send> {
+        let flag = Arc::clone(flag);
+        Box::new(move || flag.store(true, Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn new_display_client_supersedes_and_waits_for_the_previous_one() {
+        let slot = Arc::new(Mutex::new(DisplaySlot::default()));
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let first_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = take_over_display(&slot, addr, superseder(&first_closed)).await;
+        assert!(!first.superseded());
+
+        let second_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let takeover = {
+            let slot = Arc::clone(&slot);
+            let closed = Arc::clone(&second_closed);
+            tokio::spawn(async move { take_over_display(&slot, addr, superseder(&closed)).await })
+        };
+        // The first client is told to go away, and the second waits for it to tear down.
+        while !first_closed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!takeover.is_finished());
+        assert!(first.superseded());
+
+        // Releasing the first lease lets the second through without freeing its slot.
+        drop(first);
+        let second = takeover.await.unwrap();
+        assert!(!second.superseded());
+        assert!(!second_closed.load(Ordering::SeqCst));
+
+        drop(second);
+        assert!(slot.lock().unwrap().active.is_none());
     }
 
     #[test]

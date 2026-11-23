@@ -77,11 +77,11 @@ impl PtyManager {
         })
     }
 
-    /// Emit `AppState` events for all currently alive (attached or detached) PTYs.
-    pub fn sync_states(&self) {
+    /// `AppState` events for all currently alive (attached or detached) PTYs.
+    pub fn state_events(&self) -> Vec<CompositorEvent> {
         let snapshot: Vec<(u64, String)> = {
             let Ok(map) = self.sessions.lock() else {
-                return;
+                return Vec::new();
             };
             map.values()
                 .map(|pty| {
@@ -100,13 +100,14 @@ impl PtyManager {
                 .collect()
         };
 
-        for (pty_id, name) in snapshot {
-            let _ = self.event_tx.send(CompositorEvent::AppState {
+        snapshot
+            .into_iter()
+            .map(|(pty_id, name)| CompositorEvent::AppState {
                 launch_id: PTY_LAUNCH_ID_BASE | pty_id,
                 name,
                 state: LaunchState::Running,
-            });
-        }
+            })
+            .collect()
     }
 
     /// Terminate a server-managed PTY by `pty_id` (signaling the entire PTY session,

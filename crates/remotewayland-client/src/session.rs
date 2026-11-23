@@ -41,6 +41,8 @@ use crate::window::{self, ClientUiEvent};
 pub const DEFAULT_QUIC_PORT: u16 = 7443;
 const INITIAL_RECONNECT_BACKOFF_SECS: u64 = 2;
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 15;
+/// Shown when another client took over the host's session.
+const TAKEN_OVER_MESSAGE: &str = "Session opened by another client";
 
 /// Tokio runtime shared by every launcher connection (QUIC clients, event forwarding,
 /// reconnect timers). `quic::run_client` aborts all of its tasks, including per-stream
@@ -581,7 +583,12 @@ impl SessionManager {
             )
             .await
             {
-                let _ = net_tx.send(LauncherNetEvent::Disconnected(Some(err.to_string())));
+                let event = if err.is::<quic::SessionTakenOver>() {
+                    LauncherNetEvent::TakenOver
+                } else {
+                    LauncherNetEvent::Disconnected(Some(err.to_string()))
+                };
+                let _ = net_tx.send(event);
                 let _ = ui_tx_net.send(ClientUiEvent::Disconnected);
             }
         });
@@ -626,6 +633,11 @@ impl SessionManager {
             LauncherNetEvent::Disconnected(err) => {
                 return self.fail_attempt(target, attempt_id, err);
             }
+            LauncherNetEvent::TakenOver => {
+                // Reconnecting would take the session back and start a tug of war.
+                sess.auto_reconnect = false;
+                return self.fail_attempt(target, attempt_id, Some(TAKEN_OVER_MESSAGE.into()));
+            }
             _ if sess.status != ConnStatus::Connected => return Changes::NONE,
             _ => {}
         }
@@ -649,7 +661,9 @@ impl SessionManager {
                 sess.congested = congested;
                 Changes::STATUS.if_active(is_active && changed)
             }
-            LauncherNetEvent::Connected | LauncherNetEvent::Disconnected(_) => Changes::NONE,
+            LauncherNetEvent::Connected
+            | LauncherNetEvent::Disconnected(_)
+            | LauncherNetEvent::TakenOver => Changes::NONE,
         }
     }
 
@@ -914,7 +928,8 @@ fn catch_panic<T>(
 
 /// Tag a connection's network events with its attempt and forward them to the manager.
 /// `run_client` may report several `Disconnected`s while shutting down (a bare one, then
-/// the error); they are coalesced into one, sent once the connection is fully gone.
+/// the error); they are coalesced into one, sent once the connection is fully gone. A
+/// `TakenOver` among them wins, so the manager knows not to reconnect.
 async fn forward_net_events(
     target: String,
     attempt_id: u64,
@@ -929,17 +944,26 @@ async fn forward_net_events(
         }));
     };
     let mut disconnected: Option<Option<String>> = None;
+    let mut taken_over = false;
     while let Some(event) = net_rx.recv().await {
         match event {
             LauncherNetEvent::Disconnected(err) => {
                 let prev = disconnected.take().flatten();
                 disconnected = Some(err.or(prev));
             }
+            LauncherNetEvent::TakenOver => {
+                taken_over = true;
+                disconnected.get_or_insert(None);
+            }
             event if disconnected.is_none() => forward(event),
             _ => {}
         }
     }
-    forward(LauncherNetEvent::Disconnected(disconnected.flatten()));
+    if taken_over {
+        forward(LauncherNetEvent::TakenOver);
+    } else {
+        forward(LauncherNetEvent::Disconnected(disconnected.flatten()));
+    }
 }
 
 /// Mark `sess` as waiting to reconnect after `cause`, and return the delay in seconds.
@@ -1244,6 +1268,46 @@ mod tests {
         });
         assert_eq!(mgr.handle_event(due), Changes::NONE);
         assert_eq!(mgr.session("a@h").unwrap().status, ConnStatus::Disconnected);
+    }
+
+    #[test]
+    fn taken_over_session_disconnects_without_reconnecting() {
+        let (mut mgr, _events) = manager(&["a@h"]);
+        let (attempt, _ctrl_rx) = connected(&mut mgr, "a@h");
+        assert!(mgr.session("a@h").unwrap().auto_reconnect);
+
+        let changes = mgr.handle_event(net("a@h", attempt, LauncherNetEvent::TakenOver));
+        assert_eq!(changes, Changes::ALL);
+        let sess = mgr.session("a@h").unwrap();
+        assert_eq!(sess.status, ConnStatus::Disconnected);
+        assert_eq!(sess.error.as_deref(), Some(TAKEN_OVER_MESSAGE));
+        assert!(!sess.wants_connection());
+    }
+
+    #[test]
+    fn taken_over_wins_when_coalescing_disconnects() {
+        let (net_tx, net_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        net_tx.send(LauncherNetEvent::Connected).unwrap();
+        net_tx.send(LauncherNetEvent::Disconnected(None)).unwrap();
+        net_tx.send(LauncherNetEvent::TakenOver).unwrap();
+        net_tx
+            .send(LauncherNetEvent::Disconnected(Some("closed".into())))
+            .unwrap();
+        drop(net_tx);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(forward_net_events("a@h".into(), 1, net_rx, events_tx));
+
+        let mut forwarded = Vec::new();
+        while let Ok(SessionEvent(EventKind::Net { event, .. })) = events_rx.try_recv() {
+            forwarded.push(event);
+        }
+        assert!(matches!(
+            forwarded.as_slice(),
+            [LauncherNetEvent::Connected, LauncherNetEvent::TakenOver]
+        ));
     }
 
     #[test]
