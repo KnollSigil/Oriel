@@ -261,7 +261,60 @@ ApplicationWindow {
     }
 
     // -----------------------------------------------------------------------
-    // Main layout: SplitView (left sidebar + right launcher) + bottom status bar
+    // Bottom status bar (ApplicationWindow footer)
+    // -----------------------------------------------------------------------
+    footer: ToolBar {
+        position: ToolBar.Footer
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 10
+            anchors.rightMargin: 10
+            spacing: 10
+
+            Label {
+                text: backend.activeLabel.length > 0
+                    ? backend.activeLabel + " — " + backend.statusText
+                    : backend.statusText
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+            }
+
+            Label {
+                visible: backend.rttText.length > 0
+                text: backend.isCongested ? backend.rttText + " (congested)" : backend.rttText
+                color: backend.isCongested ? "#e6a23c" : root.palette.windowText
+                opacity: 0.85
+            }
+
+            Label {
+                text: "Mic: " + backend.micSummary
+                opacity: 0.75
+                elide: Text.ElideRight
+                Layout.maximumWidth: 200
+            }
+
+            Button {
+                id: connectBtn
+                visible: backend.activeTarget.length > 0
+                activeFocusOnTab: true
+                text: backend.isConnected || backend.isConnecting ? "Disconnect" : "Connect"
+                KeyNavigation.tab: serverList
+                KeyNavigation.backtab: settingsBtn
+                onClicked: {
+                    if (backend.isConnected || backend.isConnecting) {
+                        backend.disconnect_host(backend.activeTarget)
+                    } else {
+                        backend.connect_host(backend.activeTarget)
+                        root.focusSearch()
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Main layout: SplitView (left sidebar + right launcher)
     // -----------------------------------------------------------------------
     ColumnLayout {
         anchors.fill: parent
@@ -323,12 +376,6 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         padding: 2
-                        background: Rectangle {
-                            color: "transparent"
-                            radius: 4
-                            border.width: serverList.activeFocus ? 1 : 0
-                            border.color: root.palette.highlight
-                        }
 
                         ListView {
                             id: serverList
@@ -823,11 +870,9 @@ ApplicationWindow {
                                         onActivated: (idx) => backend.select_global_max_scale(idx)
                                     }
 
-                                    Rectangle {
+                                    ToolSeparator {
                                         Layout.fillWidth: true
-                                        implicitHeight: 1
-                                        color: root.palette.mid
-                                        opacity: 0.35
+                                        orientation: Qt.Horizontal
                                     }
 
                                     RowLayout {
@@ -1133,57 +1178,6 @@ ApplicationWindow {
                 }
             }
         }
-
-        // --- Bottom Status Bar ---
-        ToolBar {
-            Layout.fillWidth: true
-
-            RowLayout {
-                anchors.fill: parent
-                anchors.leftMargin: 10
-                anchors.rightMargin: 10
-                spacing: 10
-
-                Label {
-                    text: backend.activeLabel.length > 0
-                        ? backend.activeLabel + " — " + backend.statusText
-                        : backend.statusText
-                    elide: Text.ElideRight
-                    Layout.fillWidth: true
-                }
-
-                Label {
-                    visible: backend.rttText.length > 0
-                    text: backend.isCongested ? backend.rttText + " (congested)" : backend.rttText
-                    color: backend.isCongested ? "#e6a23c" : root.palette.windowText
-                    opacity: 0.85
-                }
-
-                Label {
-                    text: "Mic: " + backend.micSummary
-                    opacity: 0.75
-                    elide: Text.ElideRight
-                    Layout.maximumWidth: 200
-                }
-
-                Button {
-                    id: connectBtn
-                    visible: backend.activeTarget.length > 0
-                    activeFocusOnTab: true
-                    text: backend.isConnected || backend.isConnecting ? "Disconnect" : "Connect"
-                    KeyNavigation.tab: serverList
-                    KeyNavigation.backtab: settingsBtn
-                    onClicked: {
-                        if (backend.isConnected || backend.isConnecting) {
-                            backend.disconnect_host(backend.activeTarget)
-                        } else {
-                            backend.connect_host(backend.activeTarget)
-                            root.focusSearch()
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1192,10 +1186,20 @@ ApplicationWindow {
     Dialog {
         id: manageDialog
         title: "Manage Connections"
+        // Real top-level dialog window (Qt::Dialog, transient for the main window; an
+        // xdg_toplevel dialog on Wayland) rather than an overlay inside the main window. The
+        // title goes to the window decoration; the KDE style hides its in-window header.
+        popupType: Popup.Window
         modal: true
+        // Positions the window over the main window where the platform allows it (X11);
+        // on Wayland the compositor places transient dialogs itself.
         anchors.centerIn: parent
-        width: Math.min(680, root.width - 48)
-        height: Math.min(440, root.height - 48)
+        // Its own window, so not tied to the main window's size. Set as implicit size: a
+        // window-type popup re-sizes itself to its implicit size when its content is reparented
+        // into the window on open(), which overrode an explicit `height`. If the platform falls
+        // back to an in-window popup, the style's margins shrink it to fit.
+        implicitWidth: 680
+        implicitHeight: 440
         standardButtons: Dialog.Close
 
         property string selectedTarget: ""
@@ -1311,12 +1315,8 @@ ApplicationWindow {
                 }
             }
 
-            // Vertical divider
-            Rectangle {
+            ToolSeparator {
                 Layout.fillHeight: true
-                implicitWidth: 1
-                color: root.palette.mid
-                opacity: 0.4
             }
 
             // Right pane: Server editor form
