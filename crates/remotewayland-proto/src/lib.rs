@@ -14,6 +14,109 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// clients would keep taking the session from each other.
 pub const CLOSE_CODE_SUPERSEDED: u32 = 0x5257_0001;
 
+/// An inclusive range of UDP ports the server may listen on; a single port is a range
+/// of one. Written as `7443` or `7443-7462`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortRange {
+    start: u16,
+    end: u16,
+}
+
+impl PortRange {
+    /// `start..=end`; port 0 is not allowed, since it means "any port" to the OS.
+    pub fn new(start: u16, end: u16) -> Result<Self> {
+        if start == 0 {
+            bail!("port 0 is not a valid port (leave the port out to use any free port)");
+        }
+        if start > end {
+            bail!("port range {start}-{end} is empty (the first port must not exceed the last)");
+        }
+        Ok(Self { start, end })
+    }
+
+    pub fn start(&self) -> u16 {
+        self.start
+    }
+
+    pub fn end(&self) -> u16 {
+        self.end
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        (self.start..=self.end).contains(&port)
+    }
+
+    pub fn ports(&self) -> std::ops::RangeInclusive<u16> {
+        self.start..=self.end
+    }
+}
+
+impl std::fmt::Display for PortRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}", self.start)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
+        }
+    }
+}
+
+impl std::str::FromStr for PortRange {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let parse_port = |p: &str| -> Result<u16> {
+            let p = p.trim();
+            p.parse::<u16>()
+                .with_context(|| format!("'{p}' is not a port number (1-65535)"))
+        };
+        match s.split_once('-') {
+            Some((start, end)) => Self::new(parse_port(start)?, parse_port(end)?),
+            None => {
+                let port = parse_port(s)?;
+                Self::new(port, port)
+            }
+        }
+    }
+}
+
+impl Serialize for PortRange {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Accepts the string form, or a bare port number (as saved by older clients).
+impl<'de> Deserialize<'de> for PortRange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = PortRange;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a UDP port or a port range like \"7443-7462\"")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PortRange, E> {
+                let port =
+                    u16::try_from(v).map_err(|_| E::custom(format!("port {v} is out of range")))?;
+                PortRange::new(port, port).map_err(E::custom)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PortRange, E> {
+                let v =
+                    u64::try_from(v).map_err(|_| E::custom(format!("port {v} is out of range")))?;
+                self.visit_u64(v)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PortRange, E> {
+                v.parse().map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -564,6 +667,23 @@ pub async fn read_audio_packet<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_ranges_parse_and_display() {
+        let single: PortRange = "7443".parse().unwrap();
+        assert_eq!((single.start(), single.end()), (7443, 7443));
+        assert_eq!(single.to_string(), "7443");
+
+        let range: PortRange = " 7443 - 7462 ".parse().unwrap();
+        assert_eq!((range.start(), range.end()), (7443, 7462));
+        assert_eq!(range.to_string(), "7443-7462");
+        assert!(range.contains(7450) && !range.contains(7463) && !range.contains(7442));
+        assert_eq!(range.ports().count(), 20);
+
+        for bad in ["", "0", "0-10", "7462-7443", "65536", "a", "1-", "-5", "1-2-3"] {
+            assert!(bad.parse::<PortRange>().is_err(), "{bad:?} should not parse");
+        }
+    }
 
     #[tokio::test]
     async fn control_message_roundtrip() {

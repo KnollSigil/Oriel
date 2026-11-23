@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use remotewayland_proto::PortRange;
 use serde::{Deserialize, Serialize};
 
 /// Maximum render scale cap for remote HiDPI windows.
@@ -106,16 +107,14 @@ pub struct HostProfile {
     pub ssh_target: String,
     #[serde(default)]
     pub server_bin: Option<String>,
-    #[serde(default = "default_port")]
-    pub port: u16,
+    /// UDP port or port range the server may listen on; `None` lets it use any free port.
+    /// Older clients saved a plain `port` number, which loads as that single port.
+    #[serde(default, alias = "port", skip_serializing_if = "Option::is_none")]
+    pub ports: Option<PortRange>,
     #[serde(default = "default_true")]
     pub audio_enabled: bool,
     #[serde(default)]
     pub max_scale: Option<RenderScaleCap>,
-}
-
-fn default_port() -> u16 {
-    7443
 }
 
 fn default_true() -> bool {
@@ -190,10 +189,12 @@ pub fn ssh_hostname(ssh_target: &str) -> &str {
 
 /// Run `ssh <ssh_target> <server_bin> attach` to start or attach to a persistent
 /// `remotewayland-server` session and return the `remotewayland://...` connect URI.
+/// Start (or attach to) the user's server on `ssh_target` and return its connect URI. With
+/// `ports`, the server must listen on one of them; otherwise it may use any free port.
 pub fn ssh_bootstrap(
     ssh_target: &str,
     server_bin: Option<&str>,
-    listen_port: u16,
+    ports: Option<PortRange>,
 ) -> Result<String> {
     let host_part = ssh_hostname(ssh_target);
     let connect_host = if host_part == "localhost" || host_part == "127.0.0.1" {
@@ -207,10 +208,14 @@ pub fn ssh_bootstrap(
         .filter(|s| !s.is_empty())
         .unwrap_or("remotewayland-server");
 
+    let listen = match ports {
+        Some(ports) => format!("0.0.0.0:{ports}"),
+        None => "0.0.0.0".to_string(),
+    };
     let remote_cmd = format!(
-        "{} attach --listen 0.0.0.0:{} --host {}",
+        "{} attach --listen {} --host {}",
         shell_escape(bin),
-        listen_port,
+        shell_escape(&listen),
         shell_escape(connect_host),
     );
 
@@ -322,5 +327,24 @@ mod tests {
         let json = r#"{"label":"Box","ssh_target":"u@h","port":7443,"audio_enabled":true}"#;
         let profile: HostProfile = serde_json::from_str(json).unwrap();
         assert_eq!(profile.max_scale, None);
+    }
+
+    #[test]
+    fn host_profile_ports_default_to_any_and_keep_legacy_port() {
+        let any: HostProfile =
+            serde_json::from_str(r#"{"label":"Box","ssh_target":"u@h"}"#).unwrap();
+        assert_eq!(any.ports, None);
+        assert!(!serde_json::to_string(&any).unwrap().contains("port"));
+
+        let legacy: HostProfile =
+            serde_json::from_str(r#"{"label":"Box","ssh_target":"u@h","port":7443}"#).unwrap();
+        assert_eq!(legacy.ports, Some("7443".parse().unwrap()));
+
+        let mut ranged = legacy;
+        ranged.ports = Some("7443-7462".parse().unwrap());
+        let json = serde_json::to_string(&ranged).unwrap();
+        assert!(json.contains(r#""ports":"7443-7462""#), "{json}");
+        let back: HostProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ports, ranged.ports);
     }
 }

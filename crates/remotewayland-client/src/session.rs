@@ -38,7 +38,6 @@ use crate::pty::{pty_tunnel_socket_path, spawn_local_terminal_pty_socket_with_te
 use crate::quic::{self, LauncherNetEvent};
 use crate::window::{self, ClientUiEvent};
 
-pub const DEFAULT_QUIC_PORT: u16 = 7443;
 const INITIAL_RECONNECT_BACKOFF_SECS: u64 = 2;
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 15;
 /// Shown when another client took over the host's session.
@@ -899,7 +898,7 @@ fn prepare_connection(profile: &HostProfile) -> std::result::Result<Prepared, St
     let uri = ssh_bootstrap(
         &profile.ssh_target,
         profile.server_bin.as_deref(),
-        profile.port,
+        profile.ports,
     )
     .map_err(|e| e.to_string())?;
     let (server, fingerprint, token) = parse_uri(&uri).map_err(|e| e.to_string())?;
@@ -1035,7 +1034,7 @@ mod tests {
             label: target.to_string(),
             ssh_target: target.to_string(),
             server_bin: None,
-            port: DEFAULT_QUIC_PORT,
+            ports: None,
             audio_enabled: true,
             max_scale: None,
         }

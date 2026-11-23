@@ -67,7 +67,7 @@ mod cli_ui {
                     label: input.to_string(),
                     ssh_target: input.to_string(),
                     server_bin: None,
-                    port: 7443,
+                    ports: None,
                     audio_enabled: true,
                     max_scale: None,
                 };
@@ -81,7 +81,7 @@ mod cli_ui {
         let uri = ssh_bootstrap(
             &target.ssh_target,
             target.server_bin.as_deref(),
-            target.port,
+            target.ports,
         )?;
         let (server, fp, token) = parse_uri(&uri)?;
         let pty_sock = pty_tunnel_socket_path(&target.ssh_target)?;

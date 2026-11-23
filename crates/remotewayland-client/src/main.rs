@@ -77,9 +77,10 @@ enum ClientSubcommand {
         #[arg(long)]
         server_bin: Option<String>,
 
-        /// Remote QUIC UDP port to bind if starting a new server daemon.
-        #[arg(long, default_value_t = 7443)]
-        port: u16,
+        /// UDP port or inclusive port range (`7443`, `7443-7462`) the remote server must
+        /// listen on. Without it, the server uses any free port.
+        #[arg(long, value_name = "PORT[-END]")]
+        port: Option<remotewayland_proto::PortRange>,
 
         /// Disable PipeWire audio bridging.
         #[arg(long)]

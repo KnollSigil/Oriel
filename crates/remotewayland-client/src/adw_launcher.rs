@@ -18,14 +18,12 @@ use anyhow::Result;
 use gtk::gdk_pixbuf::PixbufLoader;
 use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
-use remotewayland_proto::{LaunchState, RemoteAppEntry};
+use remotewayland_proto::{LaunchState, PortRange, RemoteAppEntry};
 
 use crate::hosts::{HostProfile, RenderScaleCap};
 use crate::pty::{available_local_terminals, terminal_basename};
 use crate::search::{self, MatchTier, SearchIndexEntry};
-use crate::session::{
-    Changes, ConnStatus, HostEditError, SessionEvents, SessionManager, DEFAULT_QUIC_PORT,
-};
+use crate::session::{Changes, ConnStatus, HostEditError, SessionEvents, SessionManager};
 
 /// Must match the Flatpak app ID: the sandbox only lets the app own D-Bus names under it,
 /// and compositors match the Wayland app ID to the installed `.desktop` file.
@@ -1666,11 +1664,27 @@ struct ManageCtx {
     apply_changes: ApplyChanges,
 }
 
-fn port_row(port: u16) -> adw::SpinRow {
-    let row = adw::SpinRow::with_range(1.0, 65535.0, 1.0);
-    row.set_title("QUIC Port");
-    row.set_value(f64::from(port));
+/// The server's UDP port or port range. Left empty, the server uses any free port.
+fn ports_row(ports: Option<PortRange>, show_apply_button: bool) -> adw::EntryRow {
+    let row = adw::EntryRow::builder()
+        .title("UDP Port or Range (optional)")
+        .text(ports.map(|p| p.to_string()).unwrap_or_default())
+        .show_apply_button(show_apply_button)
+        .build();
+    row.connect_changed(|row| row.remove_css_class("error"));
     row
+}
+
+/// The ports entered in `row` (`None` when empty). An invalid entry is marked and
+/// explained in the returned message.
+fn ports_from_row(row: &adw::EntryRow) -> Result<Option<PortRange>, String> {
+    let Some(text) = optional_text(row) else {
+        return Ok(None);
+    };
+    text.parse().map(Some).map_err(|err: anyhow::Error| {
+        row.add_css_class("error");
+        format!("Invalid port: {err}. Use a port like 7443 or a range like 7443-7462.")
+    })
 }
 
 fn host_scale_row(selected: Option<RenderScaleCap>) -> adw::ComboRow {
@@ -1705,7 +1719,7 @@ fn open_manage_connections_dialog(ctx: ManageCtx) {
     let add_target = adw::EntryRow::builder()
         .title("SSH Target (user@host)")
         .build();
-    let add_port = port_row(DEFAULT_QUIC_PORT);
+    let add_port = ports_row(None, false);
     let add_bin = adw::EntryRow::builder()
         .title("Server Binary (optional)")
         .build();
@@ -1733,12 +1747,19 @@ fn open_manage_connections_dialog(ctx: ManageCtx) {
             if target.is_empty() {
                 return;
             }
+            let ports = match ports_from_row(&add_port) {
+                Ok(ports) => ports,
+                Err(msg) => {
+                    show_dialog_toast(&ctx.dialog, &msg);
+                    return;
+                }
+            };
             let label = optional_text(&add_label).unwrap_or_else(|| target.clone());
             let profile = HostProfile {
                 label: label.clone(),
                 ssh_target: target.clone(),
                 server_bin: optional_text(&add_bin),
-                port: add_port.value() as u16,
+                ports,
                 audio_enabled: true,
                 max_scale: RenderScaleCap::option_from_index(add_scale.selected() as usize),
             };
@@ -1753,7 +1774,7 @@ fn open_manage_connections_dialog(ctx: ManageCtx) {
             add_label.set_text("");
             add_target.set_text("");
             add_bin.set_text("");
-            add_port.set_value(f64::from(DEFAULT_QUIC_PORT));
+            add_port.set_text("");
             add_scale.set_selected(0);
             populate_saved_connections(&ctx);
             (ctx.apply_changes)(changes);
@@ -1804,7 +1825,7 @@ fn populate_saved_connections(ctx: &ManageCtx) {
 }
 
 /// One expandable row per saved host. Edits are saved as they are applied (Enter or
-/// the entry's apply button, or a port/scale change).
+/// the entry's apply button, or a scale change).
 fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::ExpanderRow {
     let expander = adw::ExpanderRow::builder()
         .title(&profile.label)
@@ -1829,7 +1850,7 @@ fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::Expander
         .text(&profile.ssh_target)
         .show_apply_button(true)
         .build();
-    let port = port_row(profile.port);
+    let port = ports_row(profile.ports, true);
     let bin_row = adw::EntryRow::builder()
         .title("Server Binary (optional)")
         .text(profile.server_bin.as_deref().unwrap_or(""))
@@ -1861,7 +1882,13 @@ fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::Expander
             };
             profile.ssh_target = target_row.text().trim().to_string();
             profile.label = optional_text(&label_row).unwrap_or_else(|| profile.ssh_target.clone());
-            profile.port = port.value() as u16;
+            profile.ports = match ports_from_row(&port) {
+                Ok(ports) => ports,
+                Err(msg) => {
+                    show_dialog_toast(&ctx.dialog, &msg);
+                    return;
+                }
+            };
             profile.server_bin = optional_text(&bin_row);
             profile.max_scale = RenderScaleCap::option_from_index(scale_row.selected() as usize);
             let (new_label, new_target) = (profile.label.clone(), profile.ssh_target.clone());
@@ -1888,14 +1915,10 @@ fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::Expander
             (ctx.apply_changes)(changes);
         }
     });
-    for entry in [&label_row, &target_row, &bin_row] {
+    for entry in [&label_row, &target_row, &port, &bin_row] {
         let save = Rc::clone(&save);
         entry.connect_apply(move |_| save());
     }
-    port.connect_value_notify({
-        let save = Rc::clone(&save);
-        move |_| save()
-    });
     scale_row.connect_selected_notify({
         let save = Rc::clone(&save);
         move |_| save()

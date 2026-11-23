@@ -12,7 +12,6 @@ mod pty;
 mod quic;
 mod session;
 
-use std::net::SocketAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -41,9 +40,11 @@ struct Cli {
     #[command(subcommand)]
     subcommand: Option<ServerSubcommand>,
 
-    /// Address and UDP port to bind the QUIC server on.
-    #[arg(long, default_value = "0.0.0.0:7443")]
-    listen: SocketAddr,
+    /// IP to bind the QUIC server on, optionally with a UDP port or inclusive port range:
+    /// `0.0.0.0`, `0.0.0.0:7443`, `0.0.0.0:7443-7462`, `[::]:7443`. Without a port, any
+    /// free port is used; with one, the server only starts if it can bind a port in it.
+    #[arg(long, default_value = "0.0.0.0", value_name = "IP[:PORT[-END]]")]
+    listen: quic::ListenSpec,
 
     /// Ephemeral session token (auto-generated via CSPRNG if omitted).
     #[arg(long)]
@@ -66,9 +67,11 @@ struct Cli {
 enum ServerSubcommand {
     /// Attach to an existing persistent user session (or start one) and print a fresh connect URI.
     Attach {
-        /// Address and UDP port to bind if starting a new server daemon.
-        #[arg(long, default_value = "0.0.0.0:7443")]
-        listen: SocketAddr,
+        /// Where a newly started daemon listens, as for the server's own `--listen`. With a
+        /// port or range, attaching to an already running daemon also requires its port to
+        /// be in it.
+        #[arg(long, default_value = "0.0.0.0", value_name = "IP[:PORT[-END]]")]
+        listen: quic::ListenSpec,
 
         /// Hostname or IP to embed in the printed URI (defaults to listen IP).
         #[arg(long)]
@@ -111,14 +114,6 @@ async fn main() -> Result<()> {
     // the server process to its isolated session XDG_RUNTIME_DIR.
     let control_sock = session::control_socket_path(&host_runtime_dir);
 
-    let mut session_guard = session::SessionGuard::init(&host_runtime_dir)?;
-
-    // Start the isolated virtual-only PipeWire + WirePlumber + pipewire-pulse stack eagerly
-    // so GUI apps, Flatpaks, and remote PTYs immediately see live audio sockets.
-    if let Err(err) = audio::ensure_virtual_audio_devices() {
-        warn!(error = %err, "isolated PipeWire audio session unavailable at startup");
-    }
-
     let token = match cli.token {
         Some(t) => t,
         None => generate_ephemeral_token()?,
@@ -130,6 +125,22 @@ async fn main() -> Result<()> {
     };
     let creds = Arc::new(quic::generate_ephemeral_credentials(token, initial_ttl)?);
 
+    // Bind before setting up the session, so a server that cannot get a port in the
+    // requested range fails without starting anything.
+    let endpoint = quic::bind_endpoint(creds.server_config.clone(), cli.listen)?;
+    let port = endpoint
+        .local_addr()
+        .context("failed to read the bound QUIC address")?
+        .port();
+
+    let mut session_guard = session::SessionGuard::init(&host_runtime_dir)?;
+
+    // Start the isolated virtual-only PipeWire + WirePlumber + pipewire-pulse stack eagerly
+    // so GUI apps, Flatpaks, and remote PTYs immediately see live audio sockets.
+    if let Err(err) = audio::ensure_virtual_audio_devices() {
+        warn!(error = %err, "isolated PipeWire audio session unavailable at startup");
+    }
+
     let (comp_handle, event_rx) = compositor::start_compositor(cli.command, !cli.no_xwayland)?;
     info!(
         socket = ?comp_handle.socket_name,
@@ -139,17 +150,12 @@ async fn main() -> Result<()> {
     session_guard.set_wayland_socket_and_start_portal(&comp_handle.socket_name);
 
     let owns_control_sock = Arc::new(AtomicBool::new(false));
-    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
     let sock_creds = Arc::clone(&creds);
     let sock_path_task = control_sock.clone();
     let owns_flag = Arc::clone(&owns_control_sock);
     tokio::spawn(async move {
-        if let Ok(actual_addr) = bound_rx.await {
-            if let Err(err) =
-                run_control_socket(&sock_path_task, actual_addr.port(), sock_creds, owns_flag).await
-            {
-                warn!(error = %err, "control Unix socket failed");
-            }
+        if let Err(err) = run_control_socket(&sock_path_task, port, sock_creds, owns_flag).await {
+            warn!(error = %err, "control Unix socket failed");
         }
     });
 
@@ -163,13 +169,7 @@ async fn main() -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
 
     let server_res = tokio::select! {
-        res = quic::run_server(
-            cli.listen,
-            server_creds,
-            comp_handle,
-            event_rx,
-            Some(bound_tx),
-        ) => res,
+        res = quic::run_server(endpoint, server_creds, comp_handle, event_rx) => res,
         _ = sigterm.recv() => {
             info!("received SIGTERM; shutting down isolated session");
             Ok(())
@@ -237,12 +237,20 @@ async fn run_control_socket(
 
 async fn run_attach(
     host_runtime_dir: &Path,
-    listen: SocketAddr,
+    listen: quic::ListenSpec,
     host: Option<String>,
     no_xwayland: bool,
 ) -> Result<()> {
     let sock_path = session::control_socket_path(host_runtime_dir);
     if let Ok(info) = query_control_socket(&sock_path).await {
+        if let Some(range) = listen.ports.filter(|r| !r.contains(info.port)) {
+            anyhow::bail!(
+                "a RemoteWayland server is already running for this user on UDP port {}, \
+                 outside the requested ports {range}; stop that server or allow port {}",
+                info.port,
+                info.port
+            );
+        }
         print_attach_uri(&host, listen, &info);
         return Ok(());
     }
@@ -257,6 +265,11 @@ async fn run_attach(
         .open(&log_path)
         .ok();
     let _ = session::set_mode(&log_path, 0o600);
+    // Where this daemon's output starts, to report its error if it fails to start.
+    let log_start = log_file
+        .as_ref()
+        .and_then(|f| f.metadata().ok())
+        .map_or(0, |m| m.len());
 
     let mut cmd = Command::new(exe);
     cmd.arg("--daemon")
@@ -267,9 +280,16 @@ async fn run_attach(
         cmd.arg("--no-xwayland");
     }
     if let Some(file) = log_file {
-        let err_file = file.try_clone().unwrap_or(file);
-        cmd.stdout(Stdio::from(err_file));
-        cmd.stderr(Stdio::null());
+        match file.try_clone() {
+            Ok(err_file) => {
+                cmd.stdout(Stdio::from(file));
+                cmd.stderr(Stdio::from(err_file));
+            }
+            Err(_) => {
+                cmd.stdout(Stdio::from(file));
+                cmd.stderr(Stdio::null());
+            }
+        }
     } else {
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
@@ -279,7 +299,8 @@ async fn run_attach(
             Ok(())
         });
     }
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .context("failed to spawn remotewayland-server daemon")?;
 
     for _ in 0..80 {
@@ -288,9 +309,35 @@ async fn run_attach(
             print_attach_uri(&host, listen, &info);
             return Ok(());
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            match daemon_startup_error(&log_path, log_start) {
+                Some(err) => anyhow::bail!("remotewayland-server failed to start: {err}"),
+                None => anyhow::bail!(
+                    "remotewayland-server exited during startup ({status}); see {}",
+                    log_path.display()
+                ),
+            }
+        }
     }
 
-    anyhow::bail!("timed out waiting for remotewayland-server daemon to start")
+    anyhow::bail!(
+        "timed out waiting for remotewayland-server daemon to start; see {}",
+        log_path.display()
+    )
+}
+
+/// The error a daemon printed on exit (`Error: ...` from `main`), from its part of the log.
+fn daemon_startup_error(log_path: &Path, log_start: u64) -> Option<String> {
+    let log = std::fs::read(log_path).ok()?;
+    let ours = log.get(usize::try_from(log_start).ok()?..)?;
+    let text = String::from_utf8_lossy(ours);
+    let start = text
+        .match_indices("Error: ")
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || text.as_bytes()[i - 1] == b'\n')
+        .last()?;
+    let err = text[start + "Error: ".len()..].trim();
+    (!err.is_empty()).then(|| err.to_string())
 }
 
 async fn query_control_socket(path: &Path) -> Result<ControlSockInfo> {
@@ -303,8 +350,11 @@ async fn query_control_socket(path: &Path) -> Result<ControlSockInfo> {
     Ok(info)
 }
 
-fn print_attach_uri(host: &Option<String>, listen: SocketAddr, info: &ControlSockInfo) {
-    let host_str = host.clone().unwrap_or_else(|| listen.ip().to_string());
+fn print_attach_uri(host: &Option<String>, listen: quic::ListenSpec, info: &ControlSockInfo) {
+    let host_str = host.clone().unwrap_or_else(|| match listen.ip {
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        ip => ip.to_string(),
+    });
     println!(
         "remotewayland://{}:{}?fp={}&token={}",
         host_str, info.port, info.fp, info.token

@@ -1,7 +1,7 @@
 //! QUIC server transport and ephemeral TLS/token authentication.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,9 +11,9 @@ use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
 use remotewayland_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_stream_header,
     write_audio_packet, write_control_message, write_stream_header, write_video_frame,
-    AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage, LaunchState, StreamHeader,
-    VideoCodec, VideoFrameHeader, WindowId, CLOSE_CODE_SUPERSEDED, MAX_VIDEO_FRAME_BYTES,
-    PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
+    AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage, LaunchState, PortRange,
+    StreamHeader, VideoCodec, VideoFrameHeader, WindowId, CLOSE_CODE_SUPERSEDED,
+    MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
@@ -91,6 +91,92 @@ pub fn generate_ephemeral_credentials(
     })
 }
 
+/// Where the QUIC server listens: an IP, and either a port range or (`None`) any free port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenSpec {
+    pub ip: IpAddr,
+    pub ports: Option<PortRange>,
+}
+
+impl std::fmt::Display for ListenSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.ip, self.ports) {
+            (IpAddr::V4(ip), None) => write!(f, "{ip}"),
+            (IpAddr::V6(ip), None) => write!(f, "[{ip}]"),
+            (IpAddr::V4(ip), Some(ports)) => write!(f, "{ip}:{ports}"),
+            (IpAddr::V6(ip), Some(ports)) => write!(f, "[{ip}]:{ports}"),
+        }
+    }
+}
+
+/// Parses `IP`, `IP:PORT` or `IP:START-END` (IPv6 in brackets when a port follows, e.g.
+/// `[::]:7443`). Port `0` means any free port, like leaving the port out.
+impl std::str::FromStr for ListenSpec {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            return Ok(Self { ip, ports: None });
+        }
+        let (ip, ports) = if let Some(rest) = s.strip_prefix('[') {
+            let (ip, rest) = rest
+                .split_once(']')
+                .with_context(|| format!("'{s}': missing ']' after the IPv6 address"))?;
+            match rest {
+                "" => (ip, None),
+                _ => {
+                    let ports = rest.strip_prefix(':').with_context(|| {
+                        format!("'{s}': expected ':' and a port after the IPv6 address")
+                    })?;
+                    (ip, Some(ports))
+                }
+            }
+        } else {
+            let (ip, ports) = s
+                .rsplit_once(':')
+                .with_context(|| format!("'{s}' is not an IP address, IP:PORT or IP:START-END"))?;
+            (ip, Some(ports))
+        };
+        let ip: IpAddr = ip
+            .parse()
+            .with_context(|| format!("'{ip}' is not an IP address"))?;
+        let ports = match ports.map(str::trim) {
+            None | Some("0") => None,
+            Some(ports) => Some(
+                ports
+                    .parse::<PortRange>()
+                    .with_context(|| format!("invalid port or port range '{ports}'"))?,
+            ),
+        };
+        Ok(Self { ip, ports })
+    }
+}
+
+/// Bind the QUIC endpoint. Without a port range the OS picks any free port; with one, the
+/// first free port in it is used, and binding fails if none is.
+pub fn bind_endpoint(server_config: ServerConfig, listen: ListenSpec) -> Result<Endpoint> {
+    let Some(range) = listen.ports else {
+        let addr = SocketAddr::new(listen.ip, 0);
+        return Endpoint::server(server_config, addr)
+            .with_context(|| format!("failed to bind a UDP port on {}", listen.ip));
+    };
+    for port in range.ports() {
+        let addr = SocketAddr::new(listen.ip, port);
+        match Endpoint::server(server_config.clone(), addr) {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to bind UDP {addr}"));
+            }
+        }
+    }
+    if range.start() == range.end() {
+        anyhow::bail!("UDP port {range} on {} is already in use", listen.ip)
+    }
+    anyhow::bail!("every UDP port in {range} on {} is already in use", listen.ip)
+}
+
 /// How long a newly authenticated display client waits for the client it replaces to tear
 /// down (release input, stop its audio bridge) before starting anyway.
 const TAKEOVER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -104,20 +190,16 @@ struct Shared {
     display: Arc<Mutex<DisplaySlot>>,
 }
 
-/// Bind the QUIC endpoint and handle incoming authenticated client sessions.
+/// Handle incoming authenticated client sessions on an endpoint from [`bind_endpoint`].
 pub async fn run_server(
-    listen_addr: SocketAddr,
+    endpoint: Endpoint,
     creds: EphemeralCredentials,
     comp_handle: CompositorHandle,
     mut event_rx: mpsc::UnboundedReceiver<CompositorEvent>,
-    bound_addr_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> Result<()> {
-    let endpoint = Endpoint::server(creds.server_config, listen_addr)
-        .with_context(|| format!("failed to bind QUIC endpoint on {listen_addr}"))?;
-    let actual_addr = endpoint.local_addr().unwrap_or(listen_addr);
-    if let Some(tx) = bound_addr_tx {
-        let _ = tx.send(actual_addr);
-    }
+    let actual_addr = endpoint
+        .local_addr()
+        .context("failed to read the bound QUIC address")?;
 
     // The connect URI carries a session token, so it is never written to the
     // server's own output; `remotewayland-server attach` mints one on request.
@@ -1556,6 +1638,92 @@ mod tests {
         assert!(!consume_token(&map, "expired"));
         assert!(!consume_token(&map, "nonexistent"));
         assert!(map.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn listen_specs_parse_and_round_trip() {
+        let any_v4 = ListenSpec {
+            ip: "0.0.0.0".parse().unwrap(),
+            ports: None,
+        };
+        let cases = [
+            ("0.0.0.0", any_v4, "0.0.0.0"),
+            ("0.0.0.0:0", any_v4, "0.0.0.0"),
+            (
+                "127.0.0.1:7443",
+                ListenSpec {
+                    ip: "127.0.0.1".parse().unwrap(),
+                    ports: Some("7443".parse().unwrap()),
+                },
+                "127.0.0.1:7443",
+            ),
+            (
+                "0.0.0.0:7443-7462",
+                ListenSpec {
+                    ports: Some("7443-7462".parse().unwrap()),
+                    ..any_v4
+                },
+                "0.0.0.0:7443-7462",
+            ),
+            (
+                "::",
+                ListenSpec {
+                    ip: "::".parse().unwrap(),
+                    ports: None,
+                },
+                "[::]",
+            ),
+            (
+                "[::1]:7443-7444",
+                ListenSpec {
+                    ip: "::1".parse().unwrap(),
+                    ports: Some("7443-7444".parse().unwrap()),
+                },
+                "[::1]:7443-7444",
+            ),
+        ];
+        for (input, spec, display) in cases {
+            let parsed: ListenSpec = input.parse().unwrap();
+            assert_eq!(parsed, spec, "{input}");
+            assert_eq!(parsed.to_string(), display, "{input}");
+            assert_eq!(display.parse::<ListenSpec>().unwrap(), spec, "{display}");
+        }
+        for bad in ["", "7443", "host:7443", "0.0.0.0:", "0.0.0.0:9-1", "[::1", "[::1]7443"] {
+            assert!(bad.parse::<ListenSpec>().is_err(), "{bad:?} should not parse");
+        }
+    }
+
+    fn test_server_config() -> ServerConfig {
+        generate_ephemeral_credentials("t".into(), Duration::from_secs(1))
+            .unwrap()
+            .server_config
+    }
+
+    fn listen(spec: &str) -> ListenSpec {
+        spec.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn bind_endpoint_stays_inside_the_requested_ports() {
+        let any = bind_endpoint(test_server_config(), listen("127.0.0.1")).unwrap();
+        let taken = any.local_addr().unwrap().port();
+        assert_ne!(taken, 0);
+
+        // A single port that is taken fails instead of falling back to another port.
+        let err = bind_endpoint(test_server_config(), listen(&format!("127.0.0.1:{taken}")))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("already in use"), "{err:#}");
+
+        // A range skips the taken port and stays inside the range.
+        let end = taken.saturating_add(8);
+        let ranged = bind_endpoint(
+            test_server_config(),
+            listen(&format!("127.0.0.1:{taken}-{end}")),
+        )
+        .unwrap();
+        let port = ranged.local_addr().unwrap().port();
+        assert!(port > taken && port <= end, "bound {port}");
     }
 
     fn app_state(launch_id: u64, state: LaunchState) -> CompositorEvent {
