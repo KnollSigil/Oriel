@@ -11,9 +11,9 @@ use anyhow::{bail, Context, Result};
 use quinn::{ClientConfig, ConnectionError, Endpoint, TransportConfig, VarInt};
 use remotewayland_proto::{
     read_audio_packet, read_control_message, read_stream_header, read_video_frame,
-    write_audio_packet, write_control_message, write_stream_header, AudioPacketHeader, ClientRole,
-    ControlMessage, LaunchState, RemoteAppEntry, StreamHeader, VideoCodec, WindowId,
-    CLOSE_CODE_SUPERSEDED, PROTOCOL_VERSION,
+    write_audio_packet, write_control_message, write_protocol_preamble, write_stream_header,
+    AudioPacketHeader, ClientRole, ControlMessage, LaunchState, RemoteAppEntry, StreamHeader,
+    VideoCodec, WindowId, CLOSE_CODE_PROTOCOL_MISMATCH, CLOSE_CODE_SUPERSEDED,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -161,10 +161,10 @@ pub async fn connect_and_auth(
         .await
         .context("failed to open control stream")?;
 
+    write_protocol_preamble(&mut send).await?;
     write_control_message(
         &mut send,
         &ControlMessage::AuthRequest {
-            protocol_version: PROTOCOL_VERSION,
             token,
             role,
             supported_codecs: vec![VideoCodec::SmartTile, VideoCodec::Lz4Delta],
@@ -174,7 +174,11 @@ pub async fn connect_and_auth(
     )
     .await?;
 
-    let selected_codec = match read_control_message(&mut recv).await? {
+    let response = match read_control_message(&mut recv).await {
+        Ok(response) => response,
+        Err(err) => return Err(auth_read_error(&conn, err)),
+    };
+    let selected_codec = match response {
         Some(ControlMessage::AuthResponse {
             accepted: true,
             selected_codec,
@@ -197,6 +201,28 @@ pub async fn connect_and_auth(
     };
 
     Ok((conn, send, recv, selected_codec))
+}
+
+/// Explain why reading the server's `AuthResponse` failed, using the QUIC close reason
+/// when the server closed the connection.
+fn auth_read_error(conn: &quinn::Connection, err: anyhow::Error) -> anyhow::Error {
+    match conn.close_reason() {
+        Some(ConnectionError::ApplicationClosed(close))
+            if close.error_code == VarInt::from_u32(CLOSE_CODE_PROTOCOL_MISMATCH) =>
+        {
+            anyhow::anyhow!(
+                "server rejected the connection: {}",
+                String::from_utf8_lossy(&close.reason)
+            )
+        }
+        // Servers older than protocol version 9 do not understand the preamble and drop
+        // the connection without a reason.
+        Some(ConnectionError::ApplicationClosed(close)) if close.reason.is_empty() => err.context(
+            "server closed the connection during authentication; \
+             it may be running an older, incompatible version",
+        ),
+        _ => err.context("failed to read authentication response"),
+    }
 }
 
 /// Events sent from the QUIC client to the launcher UI.

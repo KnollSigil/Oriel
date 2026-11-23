@@ -6,8 +6,15 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Current protocol version negotiated during the initial handshake.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// Current protocol version, sent in the control-stream preamble.
+pub const PROTOCOL_VERSION: u32 = 9;
+
+/// Magic bytes that open the control-stream preamble (see [`write_protocol_preamble`]).
+pub const PROTOCOL_MAGIC: [u8; 4] = *b"RWLD";
+
+/// QUIC application close code the server sends when the client speaks a different
+/// protocol version. The close reason carries a human-readable explanation.
+pub const CLOSE_CODE_PROTOCOL_MISMATCH: u32 = 0x5257_0002;
 
 /// QUIC application close code the server sends to a display client whose session was
 /// taken over by a newer display client. Clients must not auto-reconnect on it, or two
@@ -252,7 +259,6 @@ pub enum ClientRole {
 pub enum ControlMessage {
     /// Client -> Server authentication and capability advertisement.
     AuthRequest {
-        protocol_version: u32,
         token: String,
         role: ClientRole,
         supported_codecs: Vec<VideoCodec>,
@@ -443,12 +449,48 @@ pub struct AudioPacketHeader {
     pub payload_len: u32,
 }
 
+/// The protocol a peer announced at the start of the control stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerProtocol {
+    /// The peer sent the preamble with this protocol version.
+    Version(u32),
+    /// The peer did not send the preamble: it predates protocol version 9, which
+    /// introduced it, and starts directly with a length-prefixed message.
+    Legacy,
+}
+
+/// Write the fixed-size preamble that opens the control stream: [`PROTOCOL_MAGIC`]
+/// followed by [`PROTOCOL_VERSION`] as a big-endian `u32`. Its layout never depends on
+/// the message encoding, so peers can always detect a version mismatch.
+pub async fn write_protocol_preamble<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
+    writer.write_all(&PROTOCOL_MAGIC).await?;
+    writer.write_u32(PROTOCOL_VERSION).await?;
+    Ok(())
+}
+
+/// Read the control-stream preamble written by [`write_protocol_preamble`].
+pub async fn read_protocol_preamble<R: AsyncRead + Unpin>(reader: &mut R) -> Result<PeerProtocol> {
+    let mut magic = [0u8; 4];
+    reader
+        .read_exact(&mut magic)
+        .await
+        .context("failed to read protocol preamble")?;
+    if magic != PROTOCOL_MAGIC {
+        return Ok(PeerProtocol::Legacy);
+    }
+    let version = reader
+        .read_u32()
+        .await
+        .context("failed to read protocol version")?;
+    Ok(PeerProtocol::Version(version))
+}
+
 /// Serialize and write a length-prefixed `ControlMessage` to an async writer.
 pub async fn write_control_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     msg: &ControlMessage,
 ) -> Result<()> {
-    let encoded = bincode::serialize(msg).context("failed to serialize ControlMessage")?;
+    let encoded = postcard::to_allocvec(msg).context("failed to serialize ControlMessage")?;
     if encoded.len() > MAX_CONTROL_FRAME_BYTES {
         bail!("control message exceeds max frame size: {}", encoded.len());
     }
@@ -472,7 +514,7 @@ pub async fn read_control_message<R: AsyncRead + Unpin>(
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
-    let msg = bincode::deserialize(&buf).context("failed to deserialize ControlMessage")?;
+    let msg = postcard::from_bytes(&buf).context("failed to deserialize ControlMessage")?;
     Ok(Some(msg))
 }
 
@@ -481,7 +523,7 @@ pub async fn write_stream_header<W: AsyncWrite + Unpin>(
     writer: &mut W,
     header: &StreamHeader,
 ) -> Result<()> {
-    let encoded = bincode::serialize(header).context("failed to serialize StreamHeader")?;
+    let encoded = postcard::to_allocvec(header).context("failed to serialize StreamHeader")?;
     let len = u32::try_from(encoded.len()).context("stream header length overflow")?;
     writer.write_u32(len).await?;
     writer.write_all(&encoded).await?;
@@ -496,7 +538,7 @@ pub async fn read_stream_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
-    bincode::deserialize(&buf).context("failed to deserialize StreamHeader")
+    postcard::from_bytes(&buf).context("failed to deserialize StreamHeader")
 }
 
 /// Write a `BidiStreamHeader` at the start of a secondary bidirectional QUIC stream.
@@ -504,7 +546,7 @@ pub async fn write_bidi_stream_header<W: AsyncWrite + Unpin>(
     writer: &mut W,
     header: &BidiStreamHeader,
 ) -> Result<()> {
-    let encoded = bincode::serialize(header).context("failed to serialize BidiStreamHeader")?;
+    let encoded = postcard::to_allocvec(header).context("failed to serialize BidiStreamHeader")?;
     let len = u32::try_from(encoded.len()).context("bidi stream header length overflow")?;
     writer.write_u32(len).await?;
     writer.write_all(&encoded).await?;
@@ -521,7 +563,7 @@ pub async fn read_bidi_stream_header<R: AsyncRead + Unpin>(
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
-    bincode::deserialize(&buf).context("failed to deserialize BidiStreamHeader")
+    postcard::from_bytes(&buf).context("failed to deserialize BidiStreamHeader")
 }
 
 /// Write a length-prefixed `PtyMessage` to a PTY QUIC stream.
@@ -529,7 +571,7 @@ pub async fn write_pty_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     msg: &PtyMessage,
 ) -> Result<()> {
-    let encoded = bincode::serialize(msg).context("failed to serialize PtyMessage")?;
+    let encoded = postcard::to_allocvec(msg).context("failed to serialize PtyMessage")?;
     if encoded.len() > MAX_CONTROL_FRAME_BYTES {
         bail!("pty message exceeds max frame size: {}", encoded.len());
     }
@@ -551,7 +593,7 @@ pub async fn read_pty_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Op
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
-    let msg = bincode::deserialize(&buf).context("failed to deserialize PtyMessage")?;
+    let msg = postcard::from_bytes(&buf).context("failed to deserialize PtyMessage")?;
     Ok(Some(msg))
 }
 
@@ -561,7 +603,8 @@ pub async fn write_video_frame<W: AsyncWrite + Unpin>(
     header: &VideoFrameHeader,
     payload: &[u8],
 ) -> Result<()> {
-    let encoded_hdr = bincode::serialize(header).context("failed to serialize VideoFrameHeader")?;
+    let encoded_hdr =
+        postcard::to_allocvec(header).context("failed to serialize VideoFrameHeader")?;
     let hdr_len = u32::try_from(encoded_hdr.len()).context("video header length overflow")?;
     writer.write_u32(hdr_len).await?;
     writer.write_all(&encoded_hdr).await?;
@@ -584,7 +627,7 @@ pub async fn read_video_frame<R: AsyncRead + Unpin>(
     let mut hdr_buf = vec![0u8; hdr_len];
     reader.read_exact(&mut hdr_buf).await?;
     let header: VideoFrameHeader =
-        bincode::deserialize(&hdr_buf).context("failed to deserialize VideoFrameHeader")?;
+        postcard::from_bytes(&hdr_buf).context("failed to deserialize VideoFrameHeader")?;
     if header.payload_len as usize > MAX_VIDEO_FRAME_BYTES {
         bail!("video payload too large: {}", header.payload_len);
     }
@@ -600,7 +643,7 @@ pub async fn write_audio_packet<W: AsyncWrite + Unpin>(
     payload: &[u8],
 ) -> Result<()> {
     let encoded_hdr =
-        bincode::serialize(header).context("failed to serialize AudioPacketHeader")?;
+        postcard::to_allocvec(header).context("failed to serialize AudioPacketHeader")?;
     let hdr_len = u32::try_from(encoded_hdr.len()).context("audio header length overflow")?;
     writer.write_u32(hdr_len).await?;
     writer.write_all(&encoded_hdr).await?;
@@ -623,7 +666,7 @@ pub async fn read_audio_packet<R: AsyncRead + Unpin>(
     let mut hdr_buf = vec![0u8; hdr_len];
     reader.read_exact(&mut hdr_buf).await?;
     let header: AudioPacketHeader =
-        bincode::deserialize(&hdr_buf).context("failed to deserialize AudioPacketHeader")?;
+        postcard::from_bytes(&hdr_buf).context("failed to deserialize AudioPacketHeader")?;
     if header.payload_len as usize > MAX_CONTROL_FRAME_BYTES {
         bail!("audio payload too large: {}", header.payload_len);
     }
@@ -664,6 +707,28 @@ mod tests {
                 "{bad:?} should not parse"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn protocol_preamble_roundtrip() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        write_protocol_preamble(&mut tx).await.unwrap();
+        assert_eq!(
+            read_protocol_preamble(&mut rx).await.unwrap(),
+            PeerProtocol::Version(PROTOCOL_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_is_detected_without_preamble() {
+        // Pre-v9 peers open the control stream with a big-endian u32 frame length.
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_u32(57).await.unwrap();
+        tx.write_all(&[0u8; 8]).await.unwrap();
+        assert_eq!(
+            read_protocol_preamble(&mut rx).await.unwrap(),
+            PeerProtocol::Legacy
+        );
     }
 
     #[tokio::test]

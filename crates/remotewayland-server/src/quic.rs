@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
 use remotewayland_proto::{
-    read_audio_packet, read_bidi_stream_header, read_control_message, read_stream_header,
-    write_audio_packet, write_control_message, write_stream_header, write_video_frame,
-    AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage, LaunchState, PortRange,
-    StreamHeader, VideoCodec, VideoFrameHeader, WindowId, CLOSE_CODE_SUPERSEDED,
-    MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
+    read_audio_packet, read_bidi_stream_header, read_control_message, read_protocol_preamble,
+    read_stream_header, write_audio_packet, write_control_message, write_stream_header,
+    write_video_frame, AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage,
+    LaunchState, PeerProtocol, PortRange, StreamHeader, VideoCodec, VideoFrameHeader, WindowId,
+    CLOSE_CODE_PROTOCOL_MISMATCH, CLOSE_CODE_SUPERSEDED, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION,
+    PTY_LAUNCH_ID_BASE,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
@@ -245,35 +246,45 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         .await
         .context("failed to accept control stream")?;
 
+    // The preamble's layout is independent of the message encoding, so a client of any
+    // version can be told about a mismatch through the QUIC close reason.
+    let mismatch = match read_protocol_preamble(&mut recv).await? {
+        PeerProtocol::Version(PROTOCOL_VERSION) => None,
+        PeerProtocol::Version(v) => Some(format!(
+            "unsupported protocol version {v} (server speaks {PROTOCOL_VERSION})"
+        )),
+        PeerProtocol::Legacy => Some(format!(
+            "client uses a protocol older than version 9 (server speaks {PROTOCOL_VERSION}); \
+             update the client"
+        )),
+    };
+    if let Some(reason) = mismatch {
+        warn!(%remote, %reason, "rejecting client");
+        conn.close(
+            VarInt::from_u32(CLOSE_CODE_PROTOCOL_MISMATCH),
+            reason.as_bytes(),
+        );
+        return Ok(());
+    }
+
     let auth_msg = read_control_message(&mut recv)
         .await?
         .context("control stream closed before AuthRequest")?;
 
     let (token, role, supported_codecs, enable_audio_bridge, initial_scale) = match auth_msg {
         ControlMessage::AuthRequest {
-            protocol_version,
             token,
             role,
             supported_codecs,
             enable_audio_bridge,
             initial_scale,
-        } => {
-            if protocol_version != PROTOCOL_VERSION {
-                reject_auth(
-                    &mut send,
-                    format!("unsupported protocol version {protocol_version}"),
-                )
-                .await?;
-                return Ok(());
-            }
-            (
-                token,
-                role,
-                supported_codecs,
-                enable_audio_bridge,
-                initial_scale,
-            )
-        }
+        } => (
+            token,
+            role,
+            supported_codecs,
+            enable_audio_bridge,
+            initial_scale,
+        ),
         other => {
             warn!(?other, "unexpected initial control message");
             return Ok(());
@@ -329,6 +340,9 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
     res
 }
 
+/// How long to wait for the client to acknowledge an authentication rejection.
+const REJECT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn reject_auth(send: &mut quinn::SendStream, reason: String) -> Result<()> {
     write_control_message(
         send,
@@ -338,7 +352,12 @@ async fn reject_auth(send: &mut quinn::SendStream, reason: String) -> Result<()>
             selected_codec: VideoCodec::Lz4Delta,
         },
     )
-    .await
+    .await?;
+    // The caller drops the connection next, which discards unacknowledged stream data;
+    // wait until the client has the rejection so it can show the reason.
+    let _ = send.finish();
+    let _ = tokio::time::timeout(REJECT_DELIVERY_TIMEOUT, send.stopped()).await;
+    Ok(())
 }
 
 /// Accept secondary bidirectional QUIC streams (persistent remote PTYs) on `conn`.
