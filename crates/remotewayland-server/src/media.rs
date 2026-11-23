@@ -5,7 +5,7 @@
 //!   (Intra I-tiles & Inter residual P-tiles with alpha support), and Golomb-Rice lossless idle refinement.
 
 use remotewayland_proto::smart_tile::{
-    SmartTileEncoder, DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES,
+    xor_encode_row, SmartTileEncoder, DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES,
 };
 use remotewayland_proto::VideoCodec;
 
@@ -124,16 +124,8 @@ impl VideoEncoder {
             self.prev_bgra.extend_from_slice(bgra);
             lz4_flex::compress_prepend_size(bgra)
         } else {
-            self.scratch_delta.resize(bgra.len(), 0);
-            for ((d, &cur), prev) in self
-                .scratch_delta
-                .iter_mut()
-                .zip(bgra.iter())
-                .zip(self.prev_bgra.iter_mut())
-            {
-                *d = cur ^ *prev;
-                *prev = cur;
-            }
+            self.scratch_delta.clear();
+            xor_encode_row(&mut self.prev_bgra, bgra, &mut self.scratch_delta);
             lz4_flex::compress_prepend_size(&self.scratch_delta)
         };
 

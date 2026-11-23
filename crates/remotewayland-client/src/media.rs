@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use remotewayland_proto::smart_tile::{
-    decompress_lz4_bounded, validate_frame_dims, SmartTileDecoder,
+    decompress_lz4_bounded, validate_frame_dims, xor_decode_row, SmartTileDecoder,
 };
 use remotewayland_proto::VideoCodec;
 
@@ -89,9 +89,7 @@ impl VideoDecoder {
             self.height = height;
             self.prev_bgra = decompressed;
         } else {
-            for (prev, &delta) in self.prev_bgra.iter_mut().zip(decompressed.iter()) {
-                *prev ^= delta;
-            }
+            xor_decode_row(&mut self.prev_bgra, &decompressed);
         }
 
         Ok(DecodedFrame {

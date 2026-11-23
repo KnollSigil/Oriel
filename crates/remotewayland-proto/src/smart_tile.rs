@@ -10,10 +10,21 @@
 //!   and automatic lossless refinement on idle.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+
+#[path = "smart_tile_simd.rs"]
+pub mod simd;
+
+static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn use_simd() -> bool {
+    !FORCE_SCALAR.load(Ordering::Relaxed)
+}
 
 /// Tile edge length in pixels (must be a multiple of 16 for 4:2:0 8x8 DCT blocks).
 pub const TILE_SIZE: u32 = 64;
@@ -199,115 +210,83 @@ fn dct_1d(x: [i32; 8], shift: u32) -> [i32; 8] {
 #[inline]
 fn idct_1d(x: [i32; 8], shift: u32) -> [i32; 8] {
     let round = 1i32 << (shift - 1);
-    let a0 = C4 * (x[0] + x[4]);
-    let a1 = C4 * (x[0] - x[4]);
-    let b0 = C2 * x[2] + C6 * x[6];
-    let b1 = C6 * x[2] - C2 * x[6];
+    let a0 = C4.wrapping_mul(x[0].wrapping_add(x[4]));
+    let a1 = C4.wrapping_mul(x[0].wrapping_sub(x[4]));
+    let b0 = C2.wrapping_mul(x[2]).wrapping_add(C6.wrapping_mul(x[6]));
+    let b1 = C6.wrapping_mul(x[2]).wrapping_sub(C2.wrapping_mul(x[6]));
 
-    let e0 = a0 + b0;
-    let e1 = a1 + b1;
-    let e2 = a1 - b1;
-    let e3 = a0 - b0;
+    let e0 = a0.wrapping_add(b0);
+    let e1 = a1.wrapping_add(b1);
+    let e2 = a1.wrapping_sub(b1);
+    let e3 = a0.wrapping_sub(b0);
 
-    let o0 = C1 * x[1] + C3 * x[3] + C5 * x[5] + C7 * x[7];
-    let o1 = C3 * x[1] - C7 * x[3] - C1 * x[5] - C5 * x[7];
-    let o2 = C5 * x[1] - C1 * x[3] + C7 * x[5] + C3 * x[7];
-    let o3 = C7 * x[1] - C5 * x[3] + C3 * x[5] - C1 * x[7];
+    let o0 = C1
+        .wrapping_mul(x[1])
+        .wrapping_add(C3.wrapping_mul(x[3]))
+        .wrapping_add(C5.wrapping_mul(x[5]))
+        .wrapping_add(C7.wrapping_mul(x[7]));
+    let o1 = C3
+        .wrapping_mul(x[1])
+        .wrapping_sub(C7.wrapping_mul(x[3]))
+        .wrapping_sub(C1.wrapping_mul(x[5]))
+        .wrapping_sub(C5.wrapping_mul(x[7]));
+    let o2 = C5
+        .wrapping_mul(x[1])
+        .wrapping_sub(C1.wrapping_mul(x[3]))
+        .wrapping_add(C7.wrapping_mul(x[5]))
+        .wrapping_add(C3.wrapping_mul(x[7]));
+    let o3 = C7
+        .wrapping_mul(x[1])
+        .wrapping_sub(C5.wrapping_mul(x[3]))
+        .wrapping_add(C3.wrapping_mul(x[5]))
+        .wrapping_sub(C1.wrapping_mul(x[7]));
 
     [
-        (e0 + o0 + round) >> shift,
-        (e1 + o1 + round) >> shift,
-        (e2 + o2 + round) >> shift,
-        (e3 + o3 + round) >> shift,
-        (e3 - o3 + round) >> shift,
-        (e2 - o2 + round) >> shift,
-        (e1 - o1 + round) >> shift,
-        (e0 - o0 + round) >> shift,
+        e0.wrapping_add(o0).wrapping_add(round) >> shift,
+        e1.wrapping_add(o1).wrapping_add(round) >> shift,
+        e2.wrapping_add(o2).wrapping_add(round) >> shift,
+        e3.wrapping_add(o3).wrapping_add(round) >> shift,
+        e3.wrapping_sub(o3).wrapping_add(round) >> shift,
+        e2.wrapping_sub(o2).wrapping_add(round) >> shift,
+        e1.wrapping_sub(o1).wrapping_add(round) >> shift,
+        e0.wrapping_sub(o0).wrapping_add(round) >> shift,
     ]
 }
 
 /// Forward 2D 8x8 integer DCT. Input values are in `[-255, 255]`.
 pub fn dct_8x8(input: &[i32; 64]) -> [i32; 64] {
-    let mut tmp = [0i32; 64];
-    for r in 0..8 {
-        let off = r * 8;
-        let row = dct_1d(
-            [
-                input[off],
-                input[off + 1],
-                input[off + 2],
-                input[off + 3],
-                input[off + 4],
-                input[off + 5],
-                input[off + 6],
-                input[off + 7],
-            ],
-            11,
-        );
-        tmp[off..off + 8].copy_from_slice(&row);
-    }
-    let mut out = [0i32; 64];
-    for c in 0..8 {
-        let col = dct_1d(
-            [
-                tmp[c],
-                tmp[8 + c],
-                tmp[16 + c],
-                tmp[24 + c],
-                tmp[32 + c],
-                tmp[40 + c],
-                tmp[48 + c],
-                tmp[56 + c],
-            ],
-            17,
-        );
-        for r in 0..8 {
-            out[r * 8 + c] = col[r];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { simd::avx2::dct_8x8(input) };
         }
     }
-    out
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            return unsafe { simd::neon::dct_8x8(input) };
+        }
+    }
+    #[allow(unreachable_code)]
+    simd::dct_8x8_scalar(input)
 }
 
 /// Inverse 2D 8x8 integer DCT.
 pub fn idct_8x8(coeffs: &[i32; 64]) -> [i32; 64] {
-    let mut tmp = [0i32; 64];
-    for c in 0..8 {
-        let col = idct_1d(
-            [
-                coeffs[c],
-                coeffs[8 + c],
-                coeffs[16 + c],
-                coeffs[24 + c],
-                coeffs[32 + c],
-                coeffs[40 + c],
-                coeffs[48 + c],
-                coeffs[56 + c],
-            ],
-            11,
-        );
-        for r in 0..8 {
-            tmp[r * 8 + c] = col[r];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { simd::avx2::idct_8x8(coeffs) };
         }
     }
-    let mut out = [0i32; 64];
-    for r in 0..8 {
-        let off = r * 8;
-        let row = idct_1d(
-            [
-                tmp[off],
-                tmp[off + 1],
-                tmp[off + 2],
-                tmp[off + 3],
-                tmp[off + 4],
-                tmp[off + 5],
-                tmp[off + 6],
-                tmp[off + 7],
-            ],
-            17,
-        );
-        out[off..off + 8].copy_from_slice(&row);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            return unsafe { simd::neon::idct_8x8(coeffs) };
+        }
     }
-    out
+    #[allow(unreachable_code)]
+    simd::idct_8x8_scalar(coeffs)
 }
 
 const ZIGZAG: [usize; 64] = [
@@ -374,6 +353,7 @@ fn ycbcr_to_rgb(y: i32, cb: i32, cr: i32) -> (u8, u8, u8) {
 
 /// Extract a tile `(x0, y0, tw, th)` from a BGRA framebuffer into padded 64x64 Y and 32x32 Cb/Cr planes.
 /// Edge pixels are replicated to fill partial tiles so 8x8 DCT blocks have no artificial sharp borders.
+#[allow(clippy::too_many_arguments)]
 fn bgra_tile_to_ycbcr420(
     bgra: &[u8],
     fb_w: u32,
@@ -385,39 +365,30 @@ fn bgra_tile_to_ycbcr420(
     cb_plane: &mut [i32; 32 * 32],
     cr_plane: &mut [i32; 32 * 32],
 ) {
-    let stride = fb_w as usize * 4;
-    let mut cb_full = [0i32; 64 * 64];
-    let mut cr_full = [0i32; 64 * 64];
-
-    for py in 0..64usize {
-        let sy = (y0 as usize) + py.min(th as usize - 1);
-        let row_base = sy * stride;
-        for px in 0..64usize {
-            let sx = (x0 as usize) + px.min(tw as usize - 1);
-            let idx = row_base + sx * 4;
-            let b = bgra[idx] as i32;
-            let g = bgra[idx + 1] as i32;
-            let r = bgra[idx + 2] as i32;
-            let (y, cb, cr) = rgb_to_ycbcr(r, g, b);
-            let out_idx = py * 64 + px;
-            y_plane[out_idx] = y;
-            cb_full[out_idx] = cb;
-            cr_full[out_idx] = cr;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::bgra_tile_to_ycbcr420(
+                    bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane,
+                );
+            }
+            return;
         }
     }
-
-    for cy in 0..32usize {
-        let y2 = cy * 2;
-        for cx in 0..32usize {
-            let x2 = cx * 2;
-            let i00 = y2 * 64 + x2;
-            let i01 = i00 + 1;
-            let i10 = i00 + 64;
-            let i11 = i10 + 1;
-            cb_plane[cy * 32 + cx] = (cb_full[i00] + cb_full[i01] + cb_full[i10] + cb_full[i11] + 2) >> 2;
-            cr_plane[cy * 32 + cx] = (cr_full[i00] + cr_full[i01] + cr_full[i10] + cr_full[i11] + 2) >> 2;
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            unsafe {
+                simd::neon::bgra_tile_to_ycbcr420(
+                    bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane,
+                );
+            }
+            return;
         }
     }
+    #[allow(unreachable_code)]
+    simd::bgra_tile_to_ycbcr420_scalar(bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane);
 }
 
 /// Write reconstructed 64x64 Y + 32x32 Cb/Cr (+ optional 64x64 Alpha) planes back into a BGRA tile.
@@ -435,32 +406,32 @@ fn ycbcr420_to_bgra_tile(
     tw: u32,
     th: u32,
 ) {
-    let stride = fb_w as usize * 4;
-    for py in 0..(th as usize) {
-        let row_base = (y0 as usize + py) * stride + (x0 as usize) * 4;
-        let cy = py >> 1;
-        for px in 0..(tw as usize) {
-            let y_idx = py * 64 + px;
-            let y = y_plane[y_idx];
-            let c_idx = cy * 32 + (px >> 1);
-            let (mut r, mut g, mut b) = ycbcr_to_rgb(y, cb_plane[c_idx], cr_plane[c_idx]);
-            let a = match a_plane {
-                Some(ap) => {
-                    let av = ap[y_idx].clamp(0, 255) as u8;
-                    r = r.min(av);
-                    g = g.min(av);
-                    b = b.min(av);
-                    av
-                }
-                None => 255,
-            };
-            let dst = row_base + px * 4;
-            bgra[dst] = b;
-            bgra[dst + 1] = g;
-            bgra[dst + 2] = r;
-            bgra[dst + 3] = a;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::ycbcr420_to_bgra_tile(
+                    y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+                );
+            }
+            return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            unsafe {
+                simd::neon::ycbcr420_to_bgra_tile(
+                    y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+                );
+            }
+            return;
+        }
+    }
+    #[allow(unreachable_code)]
+    simd::ycbcr420_to_bgra_tile_scalar(
+        y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+    );
 }
 
 /// Extract the alpha channel of a tile `(x0, y0, tw, th)` into a padded 64x64 plane.
@@ -488,6 +459,7 @@ fn bgra_tile_to_alpha(
 
 /// Extract a 2x2-downsampled tile `(x0, y0, tw, th)` into padded 32x32 Y and 16x16 Cb/Cr planes.
 /// Used for progressive fast motion/scroll encoding at HiDPI (4x fewer pixels & DCT blocks).
+#[allow(clippy::too_many_arguments)]
 fn bgra_tile_to_ycbcr420_half(
     bgra: &[u8],
     fb_w: u32,
@@ -499,47 +471,20 @@ fn bgra_tile_to_ycbcr420_half(
     cb_plane: &mut [i32; 16 * 16],
     cr_plane: &mut [i32; 16 * 16],
 ) {
-    let stride = fb_w as usize * 4;
-    let max_x = tw as usize - 1;
-    let max_y = th as usize - 1;
-    let mut cb_half = [0i32; 32 * 32];
-    let mut cr_half = [0i32; 32 * 32];
-
-    for hy in 0..32usize {
-        let sy0 = (y0 as usize) + (hy * 2).min(max_y);
-        let sy1 = (y0 as usize) + (hy * 2 + 1).min(max_y);
-        let row0 = sy0 * stride;
-        let row1 = sy1 * stride;
-        for hx in 0..32usize {
-            let sx0 = (x0 as usize) + (hx * 2).min(max_x);
-            let sx1 = (x0 as usize) + (hx * 2 + 1).min(max_x);
-            let i00 = row0 + sx0 * 4;
-            let i01 = row0 + sx1 * 4;
-            let i10 = row1 + sx0 * 4;
-            let i11 = row1 + sx1 * 4;
-            let b = (bgra[i00] as i32 + bgra[i01] as i32 + bgra[i10] as i32 + bgra[i11] as i32 + 2) >> 2;
-            let g = (bgra[i00 + 1] as i32 + bgra[i01 + 1] as i32 + bgra[i10 + 1] as i32 + bgra[i11 + 1] as i32 + 2) >> 2;
-            let r = (bgra[i00 + 2] as i32 + bgra[i01 + 2] as i32 + bgra[i10 + 2] as i32 + bgra[i11 + 2] as i32 + 2) >> 2;
-            let (y, cb, cr) = rgb_to_ycbcr(r, g, b);
-            let out_idx = hy * 32 + hx;
-            y_plane[out_idx] = y;
-            cb_half[out_idx] = cb;
-            cr_half[out_idx] = cr;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::bgra_tile_to_ycbcr420_half(
+                    bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane,
+                );
+            }
+            return;
         }
     }
-
-    for cy in 0..16usize {
-        let y2 = cy * 2;
-        for cx in 0..16usize {
-            let x2 = cx * 2;
-            let i00 = y2 * 32 + x2;
-            let i01 = i00 + 1;
-            let i10 = i00 + 32;
-            let i11 = i10 + 1;
-            cb_plane[cy * 16 + cx] = (cb_half[i00] + cb_half[i01] + cb_half[i10] + cb_half[i11] + 2) >> 2;
-            cr_plane[cy * 16 + cx] = (cr_half[i00] + cr_half[i01] + cr_half[i10] + cr_half[i11] + 2) >> 2;
-        }
-    }
+    simd::bgra_tile_to_ycbcr420_half_scalar(
+        bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane,
+    );
 }
 
 /// Write reconstructed 32x32 Y + 16x16 Cb/Cr (+ optional 32x32 Alpha) planes back into a BGRA tile
@@ -557,38 +502,20 @@ fn ycbcr420_half_to_bgra_tile(
     tw: u32,
     th: u32,
 ) {
-    let stride = fb_w as usize * 4;
-    for py in 0..(th as usize) {
-        let row_base = (y0 as usize + py) * stride + (x0 as usize) * 4;
-        let hy0 = py >> 1;
-        let hy1 = if (py & 1) == 0 { hy0 } else { (hy0 + 1).min(31) };
-        let r0 = hy0 * 32;
-        let r1 = hy1 * 32;
-        let cy = hy0 >> 1;
-        for px in 0..(tw as usize) {
-            let hx0 = px >> 1;
-            let hx1 = if (px & 1) == 0 { hx0 } else { (hx0 + 1).min(31) };
-            let y = (y_plane[r0 + hx0] + y_plane[r0 + hx1] + y_plane[r1 + hx0] + y_plane[r1 + hx1] + 2) >> 2;
-            let c_idx = cy * 16 + (hx0 >> 1);
-            let (mut r, mut g, mut b) = ycbcr_to_rgb(y, cb_plane[c_idx], cr_plane[c_idx]);
-            let a = match a_plane {
-                Some(ap) => {
-                    let av_i = (ap[r0 + hx0] + ap[r0 + hx1] + ap[r1 + hx0] + ap[r1 + hx1] + 2) >> 2;
-                    let av = av_i.clamp(0, 255) as u8;
-                    r = r.min(av);
-                    g = g.min(av);
-                    b = b.min(av);
-                    av
-                }
-                None => 255,
-            };
-            let dst = row_base + px * 4;
-            bgra[dst] = b;
-            bgra[dst + 1] = g;
-            bgra[dst + 2] = r;
-            bgra[dst + 3] = a;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::ycbcr420_half_to_bgra_tile(
+                    y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+                );
+            }
+            return;
         }
     }
+    simd::ycbcr420_half_to_bgra_tile_scalar(
+        y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+    );
 }
 
 /// Extract a 2x2-downsampled alpha plane `(32x32)` for a tile `(x0, y0, tw, th)`.
@@ -2709,15 +2636,7 @@ fn should_use_inter_tile_quarter(cur_y: &[i32; 16 * 16], ref_y: &[i32; 16 * 16])
 }
 
 fn tile_equals(a: &[u8], b: &[u8], fb_w: u32, x0: u32, y0: u32, tw: u32, th: u32) -> bool {
-    let stride = fb_w as usize * 4;
-    let row_bytes = tw as usize * 4;
-    for py in 0..(th as usize) {
-        let off = (y0 as usize + py) * stride + (x0 as usize) * 4;
-        if a[off..off + row_bytes] != b[off..off + row_bytes] {
-            return false;
-        }
-    }
-    true
+    tile_equals_shifted(a, b, fb_w, x0, y0, x0, y0, tw, th)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2732,16 +2651,24 @@ fn tile_equals_shifted(
     tw: u32,
     th: u32,
 ) -> bool {
-    let stride = fb_w as usize * 4;
-    let row_bytes = tw as usize * 4;
-    for py in 0..(th as usize) {
-        let s_off = (sy as usize + py) * stride + (sx as usize) * 4;
-        let d_off = (dy as usize + py) * stride + (dx as usize) * 4;
-        if src_fb[s_off..s_off + row_bytes] != dst_fb[d_off..d_off + row_bytes] {
-            return false;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe {
+                simd::avx2::tile_equals_shifted(src_fb, dst_fb, fb_w, sx, sy, dx, dy, tw, th)
+            };
         }
     }
-    true
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            return unsafe {
+                simd::neon::tile_equals_shifted(src_fb, dst_fb, fb_w, sx, sy, dx, dy, tw, th)
+            };
+        }
+    }
+    #[allow(unreachable_code)]
+    simd::tile_equals_shifted_scalar(src_fb, dst_fb, fb_w, sx, sy, dx, dy, tw, th)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2931,16 +2858,20 @@ fn search_local_mv_2d(
 }
 
 fn tile_is_opaque(bgra: &[u8], fb_w: u32, x0: u32, y0: u32, tw: u32, th: u32) -> bool {
-    let stride = fb_w as usize * 4;
-    for py in 0..(th as usize) {
-        let row_base = (y0 as usize + py) * stride + (x0 as usize) * 4;
-        for px in 0..(tw as usize) {
-            if bgra[row_base + px * 4 + 3] != 255 {
-                return false;
-            }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { simd::avx2::tile_is_opaque(bgra, fb_w, x0, y0, tw, th) };
         }
     }
-    true
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            return unsafe { simd::neon::tile_is_opaque(bgra, fb_w, x0, y0, tw, th) };
+        }
+    }
+    #[allow(unreachable_code)]
+    simd::tile_is_opaque_scalar(bgra, fb_w, x0, y0, tw, th)
 }
 
 /// Compare temporal residual energy vs. spatial intra energy on the luma plane.
@@ -2958,6 +2889,81 @@ fn should_use_inter_tile(cur_y: &[i32; 64 * 64], ref_y: &[i32; 64 * 64]) -> bool
         intra_sad += (cur_y[i] - mean).abs() as i64;
     }
     inter_sad * 10 <= intra_sad * 9
+}
+
+fn count_identical_pixels(
+    ref_bgra: &[u8],
+    cur_bgra: &[u8],
+    fb_w: u32,
+    x0: u32,
+    y0: u32,
+    tw: u32,
+    th: u32,
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe {
+                simd::avx2::count_identical_pixels(ref_bgra, cur_bgra, fb_w, x0, y0, tw, th)
+            };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            return unsafe {
+                simd::neon::count_identical_pixels(ref_bgra, cur_bgra, fb_w, x0, y0, tw, th)
+            };
+        }
+    }
+    #[allow(unreachable_code)]
+    simd::count_identical_pixels_scalar(ref_bgra, cur_bgra, fb_w, x0, y0, tw, th)
+}
+
+pub fn xor_encode_row(ref_row: &mut [u8], cur_row: &[u8], out: &mut Vec<u8>) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::xor_encode_row(ref_row, cur_row, out);
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            unsafe {
+                simd::neon::xor_encode_row(ref_row, cur_row, out);
+            }
+            return;
+        }
+    }
+    #[allow(unreachable_code)]
+    simd::xor_encode_row_scalar(ref_row, cur_row, out);
+}
+
+pub fn xor_decode_row(dst_row: &mut [u8], src_row: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::xor_decode_row(dst_row, src_row);
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if use_simd() {
+            unsafe {
+                simd::neon::xor_decode_row(dst_row, src_row);
+            }
+            return;
+        }
+    }
+    #[allow(unreachable_code)]
+    simd::xor_decode_row_scalar(dst_row, src_row);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2978,29 +2984,21 @@ fn write_lossless_tile(
         false
     } else {
         // Count unchanged pixels: if >= 40% are identical, XOR produces long zero runs for LZ4.
-        let mut same = 0usize;
+        let same = count_identical_pixels(ref_bgra, cur_bgra, fb_w, x0, y0, tw, th);
         let total = (tw as usize) * (th as usize);
-        for py in 0..(th as usize) {
-            let off = (y0 as usize + py) * stride + (x0 as usize) * 4;
-            for px in 0..(tw as usize) {
-                let p = off + px * 4;
-                if ref_bgra[p..p + 4] == cur_bgra[p..p + 4] {
-                    same += 1;
-                }
-            }
-        }
         same * 5 >= total * 2
     };
 
     if use_xor {
         out.push(MODE_LOSSLESS_XOR);
+        out.reserve(row_bytes * (th as usize));
         for py in 0..(th as usize) {
             let off = (y0 as usize + py) * stride + (x0 as usize) * 4;
-            for b in 0..row_bytes {
-                let c = cur_bgra[off + b];
-                out.push(c ^ ref_bgra[off + b]);
-                ref_bgra[off + b] = c;
-            }
+            xor_encode_row(
+                &mut ref_bgra[off..off + row_bytes],
+                &cur_bgra[off..off + row_bytes],
+                out,
+            );
         }
     } else {
         out.push(MODE_LOSSLESS_RAW);
@@ -3521,9 +3519,10 @@ impl SmartTileDecoder {
                     }
                     for py in 0..(th as usize) {
                         let dst = (y0 as usize + py) * stride + (x0 as usize) * 4;
-                        for b in 0..row_bytes {
-                            bgra_mut[dst + b] ^= raw[pos + b];
-                        }
+                        xor_decode_row(
+                            &mut bgra_mut[dst..dst + row_bytes],
+                            &raw[pos..pos + row_bytes],
+                        );
                         pos += row_bytes;
                     }
                 }
@@ -4567,6 +4566,466 @@ mod tests {
                 src_x: 0,
                 src_y: 0,
             },
+        );
+    }
+
+    #[test]
+    fn simd_kernels_match_scalar_bit_for_bit() {
+        let mut rng = 0x853c_49e6_748f_ea9bu64;
+        let mut next_u32 = || -> u32 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 32) as u32
+        };
+
+        // 1. 2D 8x8 DCT and IDCT bit-exactness across 256 random blocks (including full [-255, 255] & [-32768, 32768] bounds).
+        for iter in 0..256 {
+            let mut input = [0i32; 64];
+            for v in &mut input {
+                *v = match iter {
+                    0 => -255,
+                    1 => 255,
+                    _ => (next_u32() % 511) as i32 - 255,
+                };
+            }
+            let dct_simd = dct_8x8(&input);
+            let dct_ref = simd::dct_8x8_scalar(&input);
+            assert_eq!(dct_simd, dct_ref, "DCT mismatch on iteration {iter}");
+
+            let idct_simd = idct_8x8(&dct_simd);
+            let idct_ref = simd::idct_8x8_scalar(&dct_ref);
+            assert_eq!(idct_simd, idct_ref, "IDCT mismatch on iteration {iter}");
+        }
+
+        // Also test full valid DCT output range (e.g. DC up to 32768, AC coefficients in [-4096, 4096]) on IDCT.
+        let mut extreme_coeffs = [0i32; 64];
+        extreme_coeffs[0] = 32_768;
+        for (i, v) in extreme_coeffs.iter_mut().enumerate().skip(1) {
+            *v = if i % 2 == 0 { 4096 } else { -4096 };
+        }
+        assert_eq!(
+            idct_8x8(&extreme_coeffs),
+            simd::idct_8x8_scalar(&extreme_coeffs)
+        );
+
+        // 2. Full-res and half-res BGRA <-> YCbCr 4:2:0 conversions (with and without alpha, full 64x64 and partial tiles).
+        let fb_w = 140u32;
+        let fb_h = 140u32;
+        let mut src_bgra = vec![0u8; (fb_w * fb_h * 4) as usize];
+        for b in &mut src_bgra {
+            *b = (next_u32() & 0xFF) as u8;
+        }
+
+        for &(x0, y0, tw, th) in &[(0u32, 0u32, 64u32, 64u32), (12, 8, 64, 53), (64, 64, 45, 37)]
+        {
+            // Full-res forward
+            let mut y_simd = [0i32; 64 * 64];
+            let mut cb_simd = [0i32; 32 * 32];
+            let mut cr_simd = [0i32; 32 * 32];
+            let mut y_ref = [0i32; 64 * 64];
+            let mut cb_ref = [0i32; 32 * 32];
+            let mut cr_ref = [0i32; 32 * 32];
+
+            bgra_tile_to_ycbcr420(
+                &src_bgra,
+                fb_w,
+                x0,
+                y0,
+                tw,
+                th,
+                &mut y_simd,
+                &mut cb_simd,
+                &mut cr_simd,
+            );
+            simd::bgra_tile_to_ycbcr420_scalar(
+                &src_bgra,
+                fb_w,
+                x0,
+                y0,
+                tw,
+                th,
+                &mut y_ref,
+                &mut cb_ref,
+                &mut cr_ref,
+            );
+            assert_eq!(y_simd, y_ref);
+            assert_eq!(cb_simd, cb_ref);
+            assert_eq!(cr_simd, cr_ref);
+
+            // Full-res inverse (opaque & transparent)
+            let mut a_plane = [0i32; 64 * 64];
+            bgra_tile_to_alpha(&src_bgra, fb_w, x0, y0, tw, th, &mut a_plane);
+
+            for alpha_opt in [None, Some(&a_plane)] {
+                let mut out_simd = vec![0u8; src_bgra.len()];
+                let mut out_ref = vec![0u8; src_bgra.len()];
+                ycbcr420_to_bgra_tile(
+                    &y_simd,
+                    &cb_simd,
+                    &cr_simd,
+                    alpha_opt,
+                    &mut out_simd,
+                    fb_w,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                );
+                simd::ycbcr420_to_bgra_tile_scalar(
+                    &y_ref,
+                    &cb_ref,
+                    &cr_ref,
+                    alpha_opt,
+                    &mut out_ref,
+                    fb_w,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                );
+                assert_eq!(out_simd, out_ref);
+            }
+
+            // Half-res forward
+            let mut hy_simd = [0i32; 32 * 32];
+            let mut hcb_simd = [0i32; 16 * 16];
+            let mut hcr_simd = [0i32; 16 * 16];
+            let mut hy_ref = [0i32; 32 * 32];
+            let mut hcb_ref = [0i32; 16 * 16];
+            let mut hcr_ref = [0i32; 16 * 16];
+
+            bgra_tile_to_ycbcr420_half(
+                &src_bgra,
+                fb_w,
+                x0,
+                y0,
+                tw,
+                th,
+                &mut hy_simd,
+                &mut hcb_simd,
+                &mut hcr_simd,
+            );
+            simd::bgra_tile_to_ycbcr420_half_scalar(
+                &src_bgra,
+                fb_w,
+                x0,
+                y0,
+                tw,
+                th,
+                &mut hy_ref,
+                &mut hcb_ref,
+                &mut hcr_ref,
+            );
+            assert_eq!(hy_simd, hy_ref);
+            assert_eq!(hcb_simd, hcb_ref);
+            assert_eq!(hcr_simd, hcr_ref);
+
+            // Half-res inverse (opaque & transparent)
+            let mut ha_plane = [0i32; 32 * 32];
+            bgra_tile_to_alpha_half(&src_bgra, fb_w, x0, y0, tw, th, &mut ha_plane);
+
+            for alpha_opt in [None, Some(&ha_plane)] {
+                let mut out_simd = vec![0u8; src_bgra.len()];
+                let mut out_ref = vec![0u8; src_bgra.len()];
+                ycbcr420_half_to_bgra_tile(
+                    &hy_simd,
+                    &hcb_simd,
+                    &hcr_simd,
+                    alpha_opt,
+                    &mut out_simd,
+                    fb_w,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                );
+                simd::ycbcr420_half_to_bgra_tile_scalar(
+                    &hy_ref,
+                    &hcb_ref,
+                    &hcr_ref,
+                    alpha_opt,
+                    &mut out_ref,
+                    fb_w,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                );
+                assert_eq!(out_simd, out_ref);
+            }
+        }
+
+        // 3. tile_equals_shifted, tile_is_opaque, count_identical_pixels, and xor_encode/decode_row.
+        let mut other_bgra = src_bgra.clone();
+        for &(tw, th) in &[(64u32, 64u32), (61, 47), (15, 9)] {
+            assert!(tile_equals(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th));
+            assert_eq!(
+                tile_equals(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th),
+                simd::tile_equals_scalar(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th)
+            );
+            assert_eq!(
+                count_identical_pixels(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th),
+                (tw * th) as usize
+            );
+        }
+
+        // Flip every 3rd pixel and test count_identical_pixels + tile_equals
+        for (i, px) in other_bgra.chunks_exact_mut(4).enumerate() {
+            if i % 3 == 0 {
+                px[1] ^= 0x55;
+            }
+        }
+        for &(tw, th) in &[(64u32, 64u32), (61, 47), (15, 9)] {
+            assert_eq!(
+                tile_equals(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th),
+                simd::tile_equals_scalar(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th)
+            );
+            assert_eq!(
+                count_identical_pixels(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th),
+                simd::count_identical_pixels_scalar(&src_bgra, &other_bgra, fb_w, 4, 4, tw, th)
+            );
+            assert_eq!(
+                tile_is_opaque(&src_bgra, fb_w, 4, 4, tw, th),
+                simd::tile_is_opaque_scalar(&src_bgra, fb_w, 4, 4, tw, th)
+            );
+        }
+
+        // Test opaque detection when all alphas are 255 vs. one non-255 pixel at the tail
+        let mut opaque_buf = vec![255u8; (fb_w * fb_h * 4) as usize];
+        assert!(tile_is_opaque(&opaque_buf, fb_w, 0, 0, 64, 64));
+        assert!(tile_is_opaque(&opaque_buf, fb_w, 0, 0, 61, 47));
+        // Perturb the very last pixel's alpha in a 61x47 partial tile
+        let last_alpha_idx = ((46 * fb_w + 60) * 4 + 3) as usize;
+        opaque_buf[last_alpha_idx] = 254;
+        assert!(!tile_is_opaque(&opaque_buf, fb_w, 0, 0, 61, 47));
+        assert_eq!(
+            tile_is_opaque(&opaque_buf, fb_w, 0, 0, 61, 47),
+            simd::tile_is_opaque_scalar(&opaque_buf, fb_w, 0, 0, 61, 47)
+        );
+
+        // Test XOR encode/decode row across non-multiple-of-32 lengths
+        for len in [256usize, 244, 63, 7, 1] {
+            let mut ref_simd = src_bgra[..len].to_vec();
+            let mut ref_scalar = ref_simd.clone();
+            let cur = &other_bgra[..len];
+            let mut out_simd = Vec::new();
+            let mut out_scalar = Vec::new();
+
+            xor_encode_row(&mut ref_simd, cur, &mut out_simd);
+            simd::xor_encode_row_scalar(&mut ref_scalar, cur, &mut out_scalar);
+            assert_eq!(out_simd, out_scalar);
+            assert_eq!(ref_simd, ref_scalar);
+
+            let mut dec_simd = src_bgra[..len].to_vec();
+            xor_decode_row(&mut dec_simd, &out_simd);
+            assert_eq!(&dec_simd[..], cur);
+        }
+
+        // Quick throughput sanity check comparing SIMD vs Scalar kernels.
+        let iters = 2000usize;
+        let sample_block = [42i32; 64];
+        let t0 = Instant::now();
+        let mut acc_simd = 0i32;
+        for _ in 0..iters {
+            let d = dct_8x8(&sample_block);
+            let id = idct_8x8(&d);
+            acc_simd = acc_simd.wrapping_add(id[0]);
+        }
+        let d_simd = t0.elapsed();
+
+        let t1 = Instant::now();
+        let mut acc_scalar = 0i32;
+        for _ in 0..iters {
+            let d = simd::dct_8x8_scalar(&sample_block);
+            let id = simd::idct_8x8_scalar(&d);
+            acc_scalar = acc_scalar.wrapping_add(id[0]);
+        }
+        let d_scalar = t1.elapsed();
+        assert_eq!(acc_simd, acc_scalar);
+
+        let mut y_p = [0i32; 64 * 64];
+        let mut cb_p = [0i32; 32 * 32];
+        let mut cr_p = [0i32; 32 * 32];
+        let mut out_fb = src_bgra.clone();
+        let c_iters = 400usize;
+        let tc0 = Instant::now();
+        for _ in 0..c_iters {
+            bgra_tile_to_ycbcr420(&src_bgra, fb_w, 0, 0, 64, 64, &mut y_p, &mut cb_p, &mut cr_p);
+            ycbcr420_to_bgra_tile(&y_p, &cb_p, &cr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64);
+        }
+        let dc_simd = tc0.elapsed();
+
+        let tc1 = Instant::now();
+        for _ in 0..c_iters {
+            simd::bgra_tile_to_ycbcr420_scalar(
+                &src_bgra, fb_w, 0, 0, 64, 64, &mut y_p, &mut cb_p, &mut cr_p,
+            );
+            simd::ycbcr420_to_bgra_tile_scalar(
+                &y_p, &cb_p, &cr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64,
+            );
+        }
+        let dc_scalar = tc1.elapsed();
+        println!(
+            "SIMD vs Scalar: DCT+IDCT {:?} vs {:?} ({:.2}x), YCbCr420 {:?} vs {:?} ({:.2}x)",
+            d_simd,
+            d_scalar,
+            d_scalar.as_secs_f64() / d_simd.as_secs_f64().max(1e-9),
+            dc_simd,
+            dc_scalar,
+            dc_scalar.as_secs_f64() / dc_simd.as_secs_f64().max(1e-9),
+        );
+
+        // Additional kernel benchmarks: Half-res YCbCr, tile_equals, tile_is_opaque, count_identical_pixels, xor_encode/decode
+        let mut hy_p = [0i32; 32 * 32];
+        let mut hcb_p = [0i32; 16 * 16];
+        let mut hcr_p = [0i32; 16 * 16];
+        let th0 = Instant::now();
+        for _ in 0..c_iters {
+            bgra_tile_to_ycbcr420_half(&src_bgra, fb_w, 0, 0, 64, 64, &mut hy_p, &mut hcb_p, &mut hcr_p);
+            ycbcr420_half_to_bgra_tile(&hy_p, &hcb_p, &hcr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64);
+        }
+        let dh_simd = th0.elapsed();
+
+        let th1 = Instant::now();
+        for _ in 0..c_iters {
+            simd::bgra_tile_to_ycbcr420_half_scalar(&src_bgra, fb_w, 0, 0, 64, 64, &mut hy_p, &mut hcb_p, &mut hcr_p);
+            simd::ycbcr420_half_to_bgra_tile_scalar(&hy_p, &hcb_p, &hcr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64);
+        }
+        let dh_scalar = th1.elapsed();
+
+        // Tile opaque check (10000 tiles)
+        opaque_buf[last_alpha_idx] = 255;
+        let op_iters = 10_000usize;
+        let top0 = Instant::now();
+        let mut op_acc = 0usize;
+        for _ in 0..op_iters {
+            op_acc += std::hint::black_box(tile_is_opaque(&opaque_buf, fb_w, 0, 0, 64, 64)) as usize;
+        }
+        let dop_simd = top0.elapsed();
+
+        let top1 = Instant::now();
+        for _ in 0..op_iters {
+            op_acc += std::hint::black_box(simd::tile_is_opaque_scalar(&opaque_buf, fb_w, 0, 0, 64, 64)) as usize;
+        }
+        let dop_scalar = top1.elapsed();
+        assert_eq!(op_acc, op_iters * 2);
+
+        // Count identical pixels (5000 tiles)
+        let id_iters = 5_000usize;
+        let tid0 = Instant::now();
+        let mut id_acc_s = 0usize;
+        for _ in 0..id_iters {
+            id_acc_s += std::hint::black_box(count_identical_pixels(&src_bgra, &other_bgra, fb_w, 0, 0, 64, 64));
+        }
+        let did_simd = tid0.elapsed();
+
+        let tid1 = Instant::now();
+        let mut id_acc_r = 0usize;
+        for _ in 0..id_iters {
+            id_acc_r += std::hint::black_box(simd::count_identical_pixels_scalar(&src_bgra, &other_bgra, fb_w, 0, 0, 64, 64));
+        }
+        let did_scalar = tid1.elapsed();
+        assert_eq!(id_acc_s, id_acc_r);
+
+        // 1080p full-frame XOR delta encode + decode (1920x1080 * 4 = 8.29 MB, 100 frames)
+        let xor_len = 1920 * 1080 * 4;
+        let mut xor_ref = vec![0xAAu8; xor_len];
+        let xor_cur = vec![0x55u8; xor_len];
+        let mut xor_out = Vec::with_capacity(xor_len);
+        let xor_iters = 100usize;
+        let tx0 = Instant::now();
+        for _ in 0..xor_iters {
+            xor_out.clear();
+            xor_encode_row(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_cur), &mut xor_out);
+            xor_decode_row(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_out));
+        }
+        let dx_simd = tx0.elapsed();
+
+        let tx1 = Instant::now();
+        for _ in 0..xor_iters {
+            xor_out.clear();
+            simd::xor_encode_row_scalar(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_cur), &mut xor_out);
+            simd::xor_decode_row_scalar(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_out));
+        }
+        let dx_scalar = tx1.elapsed();
+
+        println!(
+            "Half-res YCbCr420: {:?} vs {:?} ({:.2}x)\n\
+             tile_is_opaque (10k tiles): {:?} vs {:?} ({:.2}x)\n\
+             count_identical_pixels (5k tiles): {:?} vs {:?} ({:.2}x)\n\
+             1080p XOR encode+decode (100 frames): {:?} vs {:?} ({:.2}x)",
+            dh_simd, dh_scalar, dh_scalar.as_secs_f64() / dh_simd.as_secs_f64().max(1e-9),
+            dop_simd, dop_scalar, dop_scalar.as_secs_f64() / dop_simd.as_secs_f64().max(1e-9),
+            did_simd, did_scalar, did_scalar.as_secs_f64() / did_simd.as_secs_f64().max(1e-9),
+            dx_simd, dx_scalar, dx_scalar.as_secs_f64() / dx_simd.as_secs_f64().max(1e-9),
+        );
+
+        // End-to-end 1080p (1920x1080) SmartTileEncoder & SmartTileDecoder benchmark:
+        // 1. Full-res 1080p lossy DCT motion sequence (q = 75)
+        // 2. Half-res 1080p lossy DCT motion sequence (q = 50)
+        // 3. Stationary/partial UI frame diffing (95% unchanged tiles)
+        let w = 1920u32;
+        let h = 1080u32;
+        let frames: Vec<Vec<u8>> = (0..6u32)
+            .map(|step| {
+                let mut buf = vec![0u8; (w * h * 4) as usize];
+                for y in 0..h {
+                    let row = (y * w * 4) as usize;
+                    for x in 0..w {
+                        let idx = row + (x * 4) as usize;
+                        buf[idx] = ((x.wrapping_mul(3) + step * 11) & 0xFF) as u8;
+                        buf[idx + 1] = ((y.wrapping_mul(5) + step * 7) & 0xFF) as u8;
+                        buf[idx + 2] = (((x ^ y) + step * 13) & 0xFF) as u8;
+                        buf[idx + 3] = 255;
+                    }
+                }
+                buf
+            })
+            .collect();
+
+        let run_e2e = |force_scalar: bool, quality: u8| -> (Duration, Duration, Vec<u8>) {
+            FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
+            let mut enc = SmartTileEncoder::new();
+            let mut dec = SmartTileDecoder::new();
+            // Prime with keyframe + first motion frame
+            let p0 = enc.encode(w, h, &frames[0], quality);
+            let _ = dec.decode(w, h, &p0.payload).unwrap();
+            let p1 = enc.encode(w, h, &frames[1], quality);
+            let _ = dec.decode(w, h, &p1.payload).unwrap();
+
+            let mut enc_time = Duration::ZERO;
+            let mut dec_time = Duration::ZERO;
+            let mut last_dec = Vec::new();
+            for f in &frames[2..6] {
+                let t_e = Instant::now();
+                let pkt = enc.encode(w, h, f, quality);
+                enc_time += t_e.elapsed();
+
+                let t_d = Instant::now();
+                let (buf, _) = dec.decode_with_damage(w, h, &pkt.payload).unwrap();
+                dec_time += t_d.elapsed();
+                last_dec = (*buf).clone();
+            }
+            FORCE_SCALAR.store(false, Ordering::Relaxed);
+            (enc_time / 4, dec_time / 4, last_dec)
+        };
+
+        let (e_full_simd, d_full_simd, out_full_simd) = run_e2e(false, 75);
+        let (e_full_scal, d_full_scal, out_full_scal) = run_e2e(true, 75);
+        assert_eq!(out_full_simd, out_full_scal, "end-to-end 1080p full-res must be bit-identical");
+
+        let (e_half_simd, d_half_simd, out_half_simd) = run_e2e(false, 50);
+        let (e_half_scal, d_half_scal, out_half_scal) = run_e2e(true, 50);
+        assert_eq!(out_half_simd, out_half_scal, "end-to-end 1080p half-res must be bit-identical");
+
+        println!(
+            "1080p Full-Res Motion (per frame): Encode {:?} vs {:?} ({:.2}x) | Decode {:?} vs {:?} ({:.2}x)\n\
+             1080p Half-Res Motion (per frame): Encode {:?} vs {:?} ({:.2}x) | Decode {:?} vs {:?} ({:.2}x)",
+            e_full_simd, e_full_scal, e_full_scal.as_secs_f64() / e_full_simd.as_secs_f64().max(1e-9),
+            d_full_simd, d_full_scal, d_full_scal.as_secs_f64() / d_full_simd.as_secs_f64().max(1e-9),
+            e_half_simd, e_half_scal, e_half_scal.as_secs_f64() / e_half_simd.as_secs_f64().max(1e-9),
+            d_half_simd, d_half_scal, d_half_scal.as_secs_f64() / d_half_simd.as_secs_f64().max(1e-9),
         );
     }
 }
