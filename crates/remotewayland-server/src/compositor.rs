@@ -1601,21 +1601,18 @@ impl AppState {
                 window_id,
                 server_side: tracked.server_side_decoration,
             });
-            let mut linked = false;
-            for app in self.launched_apps.values_mut() {
-                if app.state == LaunchState::Launching {
-                    app.state = LaunchState::Running;
-                    app.linked_window_id = Some(window_id);
-                    linked = true;
-                    let _ = self.event_tx.send(CompositorEvent::AppState {
-                        launch_id: app.launch_id,
-                        name: app.name.clone(),
-                        state: LaunchState::Running,
-                    });
-                    break;
-                }
-            }
-            if !linked {
+            let client_pid = root_surface
+                .client()
+                .and_then(|c| c.get_credentials(&self.display_handle).ok())
+                .map(|creds| creds.pid);
+            let claimed = claim_launch_for_window(&mut self.launched_apps, client_pid, window_id);
+            if let Some((launch_id, name)) = claimed {
+                let _ = self.event_tx.send(CompositorEvent::AppState {
+                    launch_id,
+                    name,
+                    state: LaunchState::Running,
+                });
+            } else {
                 tracked.has_window_entry = true;
                 let win_name = if !title.is_empty() {
                     title
@@ -2513,16 +2510,11 @@ impl AppState {
                 server_side: ssd,
             });
 
-            // Link to an in-flight launched app if any, or emit a standalone window AppState.
-            let mut matched_launch = None;
-            for app in self.launched_apps.values_mut() {
-                if app.state == LaunchState::Launching && app.linked_window_id.is_none() {
-                    app.state = LaunchState::Running;
-                    app.linked_window_id = Some(window_id);
-                    matched_launch = Some((app.launch_id, app.name.clone()));
-                    break;
-                }
-            }
+            // Link to the launched app that owns this window's process, or emit a standalone
+            // window AppState. (The Wayland client here is Xwayland, so use the X11 pid.)
+            let x11_pid = xwin.surface.pid().and_then(|p| i32::try_from(p).ok());
+            let matched_launch =
+                claim_launch_for_window(&mut self.launched_apps, x11_pid, window_id);
             if let Some((lid, lname)) = matched_launch {
                 let _ = self.event_tx.send(CompositorEvent::AppState {
                     launch_id: lid,
@@ -3890,6 +3882,75 @@ fn spawn_gui_shell(
     Ok(pid)
 }
 
+/// Link a newly announced window to the launch it belongs to and mark that launch
+/// `Running`. Returns the launch's id and name, or `None` if the window should get its own
+/// entry.
+///
+/// Launches run in their own process group (`spawn_gui_shell`), so a window belongs to the
+/// still-launching app whose group contains, or whose group leader is an ancestor of, the
+/// window's client process. Without a client pid this only guesses when exactly one launch
+/// is pending, so a launch that never opens a window can't swallow another app's window.
+fn claim_launch_for_window(
+    apps: &mut BTreeMap<u64, LaunchedApp>,
+    client_pid: Option<i32>,
+    window_id: WindowId,
+) -> Option<(u64, String)> {
+    let is_pending =
+        |app: &LaunchedApp| app.state == LaunchState::Launching && app.linked_window_id.is_none();
+    let launch_id = match client_pid.filter(|&pid| pid > 0) {
+        Some(pid) => {
+            let owner = launch_owning_process(apps, pid)?;
+            apps.get(&owner).filter(|app| is_pending(app))?.launch_id
+        }
+        None => {
+            let mut pending = apps.values().filter(|app| is_pending(app));
+            match (pending.next(), pending.next()) {
+                (Some(app), None) => app.launch_id,
+                _ => return None,
+            }
+        }
+    };
+    let app = apps.get_mut(&launch_id)?;
+    app.state = LaunchState::Running;
+    app.linked_window_id = Some(window_id);
+    Some((app.launch_id, app.name.clone()))
+}
+
+/// The launch whose process group contains `pid`, or whose group leader is an ancestor of
+/// `pid` (for children that moved to a new process group).
+fn launch_owning_process(apps: &BTreeMap<u64, LaunchedApp>, pid: i32) -> Option<u64> {
+    let by_group = |pgid: i32| {
+        apps.values()
+            .find(|app| app.pgid > 0 && app.pgid == pgid)
+            .map(|app| app.launch_id)
+    };
+    // SAFETY: getpgid only reads process state.
+    let pgid = unsafe { libc::getpgid(pid) };
+    if let Some(id) = (pgid > 0).then(|| by_group(pgid)).flatten() {
+        return Some(id);
+    }
+    let mut cur = pid;
+    for _ in 0..64 {
+        if let Some(id) = by_group(cur) {
+            return Some(id);
+        }
+        cur = parent_pid(cur).filter(|&ppid| ppid > 1)?;
+    }
+    None
+}
+
+fn parent_pid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat_ppid(&stat)
+}
+
+/// Parse the parent pid from `/proc/<pid>/stat` (`pid (comm) state ppid ...`; `comm` may
+/// contain spaces and parentheses).
+fn parse_stat_ppid(stat: &str) -> Option<i32> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn apply_gui_env(proc: &mut Command, socket_name: &OsString) {
     crate::session::apply_session_env(proc, Some(socket_name.as_os_str()));
 }
@@ -4124,6 +4185,85 @@ fn blit_rgba_over(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pgid no process can have (above Linux's maximum pid).
+    const UNRELATED_PGID: i32 = 1 << 30;
+
+    fn launch(launch_id: u64, pgid: i32) -> (u64, LaunchedApp) {
+        let app = LaunchedApp {
+            launch_id,
+            name: format!("app {launch_id}"),
+            pgid,
+            state: LaunchState::Launching,
+            linked_window_id: None,
+        };
+        (launch_id, app)
+    }
+
+    /// A `sleep` in its own process group, like `spawn_gui_shell` starts apps.
+    fn spawn_group_leader() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[test]
+    fn window_links_to_the_launch_owning_its_process_not_the_oldest() {
+        let mut child = spawn_group_leader();
+        let pid = child.id() as i32;
+        // Launch 1 never opens a window; launch 2's process opens one.
+        let mut apps = BTreeMap::from([launch(1, UNRELATED_PGID), launch(2, pid)]);
+
+        let claimed = claim_launch_for_window(&mut apps, Some(pid), 7);
+        assert_eq!(claimed, Some((2, "app 2".to_string())));
+        assert_eq!(apps[&2].state, LaunchState::Running);
+        assert_eq!(apps[&2].linked_window_id, Some(7));
+        assert_eq!(apps[&1].state, LaunchState::Launching);
+
+        // A second window from the same app gets its own entry.
+        assert_eq!(claim_launch_for_window(&mut apps, Some(pid), 8), None);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn window_from_an_unrelated_process_claims_nothing() {
+        let mut apps = BTreeMap::from([launch(1, UNRELATED_PGID)]);
+        let own_pid = std::process::id() as i32;
+        assert_eq!(claim_launch_for_window(&mut apps, Some(own_pid), 7), None);
+        assert_eq!(apps[&1].state, LaunchState::Launching);
+    }
+
+    #[test]
+    fn window_from_a_descendant_process_links_to_its_launch() {
+        // This test process descends from its parent; treat the parent as the launch.
+        let parent = parent_pid(std::process::id() as i32).expect("parent pid");
+        let mut apps = BTreeMap::from([launch(1, UNRELATED_PGID), launch(2, parent)]);
+        let own_pid = std::process::id() as i32;
+        assert_eq!(launch_owning_process(&apps, own_pid), Some(2));
+        assert!(claim_launch_for_window(&mut apps, Some(own_pid), 7).is_some());
+    }
+
+    #[test]
+    fn window_without_a_pid_only_links_when_one_launch_is_pending() {
+        let mut apps = BTreeMap::from([launch(1, UNRELATED_PGID), launch(2, UNRELATED_PGID)]);
+        assert_eq!(claim_launch_for_window(&mut apps, None, 7), None);
+        apps.remove(&1);
+        assert_eq!(
+            claim_launch_for_window(&mut apps, None, 7),
+            Some((2, "app 2".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_ppid_from_proc_stat_with_odd_comm() {
+        let stat = "1234 (we (ird) name) S 42 1234 1234 0";
+        assert_eq!(parse_stat_ppid(stat), Some(42));
+        assert_eq!(parse_stat_ppid("garbage"), None);
+    }
 
     #[test]
     fn pick_preferred_text_mime_prefers_utf8_over_legacy() {
