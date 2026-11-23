@@ -350,6 +350,36 @@ ApplicationWindow {
             Layout.fillHeight: true
             orientation: Qt.Horizontal
 
+            // Thin separator line with a wider grab area that shows the resize cursor across all of it.
+            //
+            // The KDE style's handle already widens its grab area with a containmentMask, but
+            // gives no feedback there: Qt's cursor lookup skips items whose children all lie
+            // inside their bounds without consulting containmentMask, so the resize cursor only
+            // appeared over the handle's real 1-4 px. Here `grabArea` is a real child extending
+            // past the line: it is the containmentMask (press/hover hit-testing) *and* carries
+            // the cursor, so the grab area and the cursor always cover the same width.
+            handle: Item {
+                id: splitHandle
+                implicitWidth: 1
+                implicitHeight: 1
+
+                Kirigami.Separator {
+                    anchors.fill: parent
+                }
+
+                containmentMask: grabArea
+                Item {
+                    id: grabArea
+                    x: -Kirigami.Units.largeSpacing
+                    width: splitHandle.width + Kirigami.Units.largeSpacing * 2
+                    height: splitHandle.height
+
+                    HoverHandler {
+                        cursorShape: Qt.SplitHCursor
+                    }
+                }
+            }
+
             // --- Left Server Sidebar ---
             Pane {
                 SplitView.preferredWidth: 210
