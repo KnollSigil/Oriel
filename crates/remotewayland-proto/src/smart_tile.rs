@@ -19,11 +19,20 @@ use anyhow::{bail, Context, Result};
 #[path = "smart_tile_simd.rs"]
 pub mod simd;
 
+#[path = "smart_tile_gpu.rs"]
+pub mod gpu;
+
 static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
+static FORCE_DISABLE_GPU: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 fn use_simd() -> bool {
     !FORCE_SCALAR.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn use_gpu() -> bool {
+    !FORCE_DISABLE_GPU.load(Ordering::Relaxed) && !FORCE_SCALAR.load(Ordering::Relaxed)
 }
 
 /// Tile edge length in pixels (must be a multiple of 16 for 4:2:0 8x8 DCT blocks).
@@ -1708,13 +1717,6 @@ impl SmartTileEncoder {
         // Large motion/scroll/video updates immediately enter fast progressive lossy mode.
         let massive_motion = !is_keyframe && dirty_tiles.len() >= (total_tiles / 6).max(12);
         let enable_local_mv = !is_keyframe && frame_mv.is_none() && massive_motion;
-        let prev_ref_slice: Option<&[u8]> = if frame_mv.is_some() || enable_local_mv {
-            self.prev_ref_bgra.resize(expected_len, 0);
-            self.prev_ref_bgra.copy_from_slice(&self.ref_bgra);
-            Some(self.prev_ref_bgra.as_slice())
-        } else {
-            None
-        };
         let is_hidpi = width >= 1600 || height >= 1000;
         let full_screen_video = !is_keyframe && frame_mv.is_none() && dirty_tiles.len() * 2 >= total_tiles;
 
@@ -1772,7 +1774,54 @@ impl SmartTileEncoder {
             1
         };
 
-        let (used_lossy, used_local_mv) = if num_workers > 1 {
+        // Attempt unified hardware GPU compute shader batching when encoding a large batch of full-res tiles.
+        let mut source_copied_during_gpu = false;
+        let gpu_encoded = if use_gpu()
+            && !is_keyframe
+            && !prefer_half_res
+            && !prefer_quarter_res
+            && dirty_tile_count >= gpu::GPU_MIN_BATCH_TILES
+        {
+            let source_bgra_ref = &mut self.source_bgra;
+            let prev_ref_buf = &mut self.prev_ref_bgra;
+            gpu::global_gpu_engine().and_then(|engine| {
+                encode_tiles_with_gpu(
+                    engine,
+                    &mut self.ref_bgra,
+                    prev_ref_buf,
+                    frame_mv.is_some() || enable_local_mv,
+                    bgra,
+                    &mut self.tiles,
+                    width,
+                    height,
+                    &dirty_tiles,
+                    massive_motion,
+                    frame_mv,
+                    &luma_q,
+                    &chroma_q,
+                    &mut self.scratch_packet,
+                    || {
+                        source_bgra_ref.resize(expected_len, 0);
+                        source_bgra_ref.copy_from_slice(bgra);
+                        source_copied_during_gpu = true;
+                    },
+                )
+            })
+        } else {
+            None
+        };
+
+        let (used_lossy, used_local_mv) = if let Some(res) = gpu_encoded {
+            res
+        } else {
+            let prev_ref_slice: Option<&[u8]> = if frame_mv.is_some() || enable_local_mv {
+                self.prev_ref_bgra.resize(expected_len, 0);
+                self.prev_ref_bgra.copy_from_slice(&self.ref_bgra);
+                Some(self.prev_ref_bgra.as_slice())
+            } else {
+                None
+            };
+            if num_workers > 1 {
             // Partition dirty tiles by horizontal tile-row bands so each worker owns
             // a disjoint mutable slice of `self.ref_bgra` and `self.tiles` with zero locks.
             let rows_per_band = rows.div_ceil(num_workers);
@@ -1862,32 +1911,33 @@ impl SmartTileEncoder {
                 any_lossy |= lossy;
                 any_local_mv |= lmv;
             }
-            (any_lossy, any_local_mv)
-        } else {
-            let mut any_lossy = false;
-            let mut any_local_mv = false;
-            encode_tile_batch(
-                &mut self.ref_bgra,
-                prev_ref_slice,
-                bgra,
-                &mut self.tiles,
-                width,
-                height,
-                0,
-                0,
-                &dirty_tiles,
-                is_keyframe,
-                massive_motion,
-                prefer_half_res,
-                prefer_quarter_res,
-                frame_mv,
-                &luma_q,
-                &chroma_q,
-                &mut self.scratch_packet,
-                &mut any_lossy,
-                &mut any_local_mv,
-            );
-            (any_lossy, any_local_mv)
+                (any_lossy, any_local_mv)
+            } else {
+                let mut any_lossy = false;
+                let mut any_local_mv = false;
+                encode_tile_batch(
+                    &mut self.ref_bgra,
+                    prev_ref_slice,
+                    bgra,
+                    &mut self.tiles,
+                    width,
+                    height,
+                    0,
+                    0,
+                    &dirty_tiles,
+                    is_keyframe,
+                    massive_motion,
+                    prefer_half_res,
+                    prefer_quarter_res,
+                    frame_mv,
+                    &luma_q,
+                    &chroma_q,
+                    &mut self.scratch_packet,
+                    &mut any_lossy,
+                    &mut any_local_mv,
+                );
+                (any_lossy, any_local_mv)
+            }
         };
 
         if used_local_mv {
@@ -1896,7 +1946,7 @@ impl SmartTileEncoder {
 
         // Only keep a lossless source copy when at least one tile is lossy and awaits idle refresh.
         // Saves a full 33 MB memcpy on every lossless UI frame at 4K!
-        if used_lossy || self.has_pending_lossless_refresh() {
+        if !source_copied_during_gpu && (used_lossy || self.has_pending_lossless_refresh()) {
             self.source_bgra.resize(expected_len, 0);
             self.source_bgra.copy_from_slice(bgra);
         }
@@ -2011,6 +2061,539 @@ impl SmartTileEncoder {
             payload,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_tiles_with_gpu(
+    engine: &gpu::SmartTileGpuEngine,
+    ref_bgra: &mut [u8],
+    prev_ref_buf: &mut Vec<u8>,
+    has_prev_ref: bool,
+    cur_bgra: &[u8],
+    tiles: &mut [TileTrack],
+    fb_w: u32,
+    fb_h: u32,
+    items: &[(usize, usize, u32, u32, u32, u32, usize)],
+    massive_motion: bool,
+    frame_mv: Option<(i16, i16)>,
+    luma_q: &[i32; 64],
+    chroma_q: &[i32; 64],
+    out: &mut Vec<u8>,
+    on_submitted: impl FnOnce(),
+) -> Option<(bool, bool)> {
+    #[allow(clippy::large_enum_variant)]
+    enum TilePlan {
+        MvSkip {
+            tx: usize,
+            ty: usize,
+            x0: u32,
+            y0: u32,
+            tw: u32,
+            th: u32,
+            tidx: usize,
+            sx: u32,
+            sy: u32,
+        },
+        GpuOpaqueLossy {
+            tx: usize,
+            ty: usize,
+            x0: u32,
+            y0: u32,
+            tw: u32,
+            th: u32,
+            tidx: usize,
+            batch_idx: usize,
+        },
+        CpuFallback {
+            item: (usize, usize, u32, u32, u32, u32, usize),
+        },
+    }
+
+    let mut plans = Vec::with_capacity(items.len());
+    let mut gpu_descs = Vec::with_capacity(items.len());
+    let mut needs_prev_copy_on_cpu = false;
+    let rows_per_band = if items.len() >= 48 && fb_h.div_ceil(TILE_SIZE) >= 4 {
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get().min(4))
+            .unwrap_or(1);
+        (fb_h.div_ceil(TILE_SIZE) as usize).div_ceil(num_workers)
+    } else {
+        usize::MAX
+    };
+
+    for &item in items {
+        let (tx, ty, x0, y0, tw, th, tidx) = item;
+        let mv_src: Option<(u32, u32)> = match (has_prev_ref, frame_mv) {
+            (true, Some((dx, dy))) => {
+                let sx = x0 as i32 - dx as i32;
+                let sy = y0 as i32 - dy as i32;
+                if sx >= 0 && sy >= 0 && (sx as u32) + tw <= fb_w && (sy as u32) + th <= fb_h {
+                    Some((sx as u32, sy as u32))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some((sx, sy)) = mv_src {
+            if tile_equals_shifted(ref_bgra, cur_bgra, fb_w, sx, sy, x0, y0, tw, th) {
+                needs_prev_copy_on_cpu = true;
+                plans.push(TilePlan::MvSkip {
+                    tx,
+                    ty,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    tidx,
+                    sx,
+                    sy,
+                });
+                continue;
+            }
+        }
+
+        let wants_lossy = tiles[tidx].motion_streak >= MOTION_STREAK_THRESHOLD || massive_motion;
+        if !wants_lossy || !tile_is_opaque(cur_bgra, fb_w, x0, y0, tw, th) {
+            if has_prev_ref {
+                needs_prev_copy_on_cpu = true;
+            }
+            plans.push(TilePlan::CpuFallback { item });
+            continue;
+        }
+
+        // Perform 2D motion estimation across up to 4 parallel bands when `gpu_descs.len() >= 48`.
+        let batch_idx = gpu_descs.len();
+        gpu_descs.push(gpu::GpuTileDesc {
+            x0,
+            y0,
+            tw,
+            th,
+            pred_x: x0,
+            pred_y: y0,
+            has_alpha: 0,
+            use_inter: 1,
+        });
+        plans.push(TilePlan::GpuOpaqueLossy {
+            tx,
+            ty,
+            x0,
+            y0,
+            tw,
+            th,
+            tidx,
+            batch_idx,
+        });
+    }
+
+    if gpu_descs.len() < gpu::GPU_MIN_BATCH_TILES {
+        return None;
+    }
+
+    if needs_prev_copy_on_cpu {
+        prev_ref_buf.resize(ref_bgra.len(), 0);
+        prev_ref_buf.copy_from_slice(ref_bgra);
+    }
+    let prev_ref_full: Option<&[u8]> = if needs_prev_copy_on_cpu {
+        Some(prev_ref_buf.as_slice())
+    } else {
+        None
+    };
+
+    let prepare_descs = |ref_slice: &[u8], descs: &mut [gpu::GpuTileDesc]| -> Vec<(u8, Option<(i8, i8)>)> {
+        let eval_mv_range = |slice: &mut [gpu::GpuTileDesc]| {
+            let mut last_mv: (i8, i8) = (0, 0);
+            let mut cur_b = usize::MAX;
+            for desc in slice.iter_mut() {
+                let ty = (desc.y0 / TILE_SIZE) as usize;
+                let b = ty / rows_per_band;
+                if b != cur_b {
+                    cur_b = b;
+                    last_mv = (0, 0);
+                }
+                if let (true, Some((dx, dy))) = (has_prev_ref, frame_mv) {
+                    let sx = desc.x0 as i32 - dx as i32;
+                    let sy = desc.y0 as i32 - dy as i32;
+                    if sx >= 0
+                        && sy >= 0
+                        && (sx as u32) + desc.tw <= fb_w
+                        && (sy as u32) + desc.th <= fb_h
+                    {
+                        let mv_sad = tile_bgra_sad(
+                            ref_slice,
+                            cur_bgra,
+                            fb_w,
+                            sx as u32,
+                            sy as u32,
+                            desc.x0,
+                            desc.y0,
+                            desc.tw,
+                            desc.th,
+                        );
+                        let zero_sad = tile_bgra_sad(
+                            ref_slice,
+                            cur_bgra,
+                            fb_w,
+                            desc.x0,
+                            desc.y0,
+                            desc.x0,
+                            desc.y0,
+                            desc.tw,
+                            desc.th,
+                        );
+                        if mv_sad < zero_sad {
+                            desc.pred_x = sx as u32;
+                            desc.pred_y = sy as u32;
+                            desc.has_alpha = MODE_FLAG_MV as u32;
+                        }
+                    }
+                } else if has_prev_ref {
+                    if let Some((ldx, ldy, sx, sy)) = search_local_mv_2d(
+                        ref_slice,
+                        cur_bgra,
+                        fb_w,
+                        fb_h,
+                        desc.x0,
+                        desc.y0,
+                        desc.y0,
+                        desc.tw,
+                        desc.th,
+                        last_mv,
+                    ) {
+                        last_mv = (ldx, ldy);
+                        desc.pred_x = sx;
+                        desc.pred_y = sy;
+                        desc.has_alpha = (MODE_FLAG_LOCAL_MV as u32)
+                            | ((ldx as u8 as u32) << 8)
+                            | ((ldy as u8 as u32) << 16);
+                    }
+                }
+            }
+        };
+
+        if rows_per_band < usize::MAX && descs.len() >= 48 {
+            // Split `descs` at exact band boundaries so each worker computes identical `last_local_mv` chains.
+            let mut band_splits = Vec::with_capacity(4);
+            let mut rem = &mut descs[..];
+            let mut next_band = 1usize;
+            while !rem.is_empty() && next_band < 4 {
+                let split_pos = rem
+                    .iter()
+                    .position(|d| ((d.y0 / TILE_SIZE) as usize) >= next_band * rows_per_band);
+                if let Some(pos) = split_pos {
+                    let (head, tail) = rem.split_at_mut(pos);
+                    if !head.is_empty() {
+                        band_splits.push(head);
+                    }
+                    rem = tail;
+                }
+                next_band += 1;
+            }
+            if !rem.is_empty() {
+                band_splits.push(rem);
+            }
+            std::thread::scope(|s| {
+                for chunk in band_splits {
+                    s.spawn(move || eval_mv_range(chunk));
+                }
+            });
+        } else {
+            eval_mv_range(descs);
+        }
+
+        let mut mv_info = Vec::with_capacity(descs.len());
+        for d in descs.iter_mut() {
+            let packed = d.has_alpha;
+            d.has_alpha = 0;
+            let flag = (packed & 0xFF) as u8;
+            let lmv = if flag == MODE_FLAG_LOCAL_MV {
+                let ldx = ((packed >> 8) & 0xFF) as u8 as i8;
+                let ldy = ((packed >> 16) & 0xFF) as u8 as i8;
+                Some((ldx, ldy))
+            } else {
+                None
+            };
+            mv_info.push((flag, lmv));
+        }
+        mv_info
+    };
+
+    let stride = fb_w as usize * 4;
+    let total_rows = fb_h.div_ceil(TILE_SIZE) as usize;
+    let cols = fb_w.div_ceil(TILE_SIZE) as usize;
+    let mut used_lossy = false;
+    let mut used_local_mv = false;
+
+    let apply_plan_range = |plan_slice: &[TilePlan],
+                            batch_mv_info: &[(u8, Option<(i8, i8)>)],
+                            ref_chunk: &mut [u8],
+                            cur_chunk: &[u8],
+                            tile_chunk: &mut [TileTrack],
+                            y_offset: u32,
+                            tidx_offset: usize,
+                            qblocks_flat: &[i32],
+                            recon_flat: &[u8],
+                            out_buf: &mut Vec<u8>,
+                            local_lossy: &mut bool,
+                            local_mv_used: &mut bool| {
+        let unpack_blk = |words: &[i32]| -> [i32; 64] {
+            let mut blk = [0i32; 64];
+            for i in 0..32 {
+                let w = words[i] as u32;
+                blk[i * 2] = (w & 0xFFFF) as u16 as i16 as i32;
+                blk[i * 2 + 1] = (w >> 16) as u16 as i16 as i32;
+            }
+            blk
+        };
+
+        for plan in plan_slice {
+            match *plan {
+                TilePlan::MvSkip {
+                    tx,
+                    ty,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    tidx,
+                    sx,
+                    sy,
+                } => {
+                    out_buf.extend_from_slice(&(tx as u16).to_le_bytes());
+                    out_buf.extend_from_slice(&(ty as u16).to_le_bytes());
+                    out_buf.push(MODE_MV_SKIP);
+                    copy_tile_from_prev(
+                        prev_ref_full.unwrap(),
+                        ref_chunk,
+                        fb_w,
+                        sx,
+                        sy,
+                        x0,
+                        y0 - y_offset,
+                        tw,
+                        th,
+                    );
+                    tile_chunk[tidx - tidx_offset].is_lossy = false;
+                }
+                TilePlan::GpuOpaqueLossy {
+                    tx,
+                    ty,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    tidx,
+                    batch_idx,
+                    ..
+                } => {
+                    *local_lossy = true;
+                    out_buf.extend_from_slice(&(tx as u16).to_le_bytes());
+                    out_buf.extend_from_slice(&(ty as u16).to_le_bytes());
+
+                    let (mv_flag, local_mv) = batch_mv_info[batch_idx];
+                    let q_tile_base = batch_idx * 3073;
+                    let use_inter = qblocks_flat[q_tile_base] != 0;
+                    let q_blocks_base = q_tile_base + 1;
+
+                    let luma_bx = (tw as usize).div_ceil(8);
+                    let luma_by = (th as usize).div_ceil(8);
+                    let chroma_bx = ((tw as usize).div_ceil(2)).div_ceil(8);
+                    let chroma_by = ((th as usize).div_ceil(2)).div_ceil(8);
+                    let num_luma = luma_bx * luma_by;
+                    let num_chroma = chroma_bx * chroma_by;
+
+                    if use_inter {
+                        out_buf.push(MODE_DCT_INTER | mv_flag);
+                        if let Some((ldx, ldy)) = local_mv {
+                            out_buf.push(ldx as u8);
+                            out_buf.push(ldy as u8);
+                            *local_mv_used = true;
+                        }
+                    } else {
+                        out_buf.push(MODE_DCT_INTRA);
+                    }
+
+                    let mut seq_blk = 0usize;
+                    let mut prev_dc_y = 0i32;
+                    for _ in 0..num_luma {
+                        let s = q_blocks_base + seq_blk * 32;
+                        let blk = unpack_blk(&qblocks_flat[s..s + 32]);
+                        encode_rle_block(&blk, &mut prev_dc_y, out_buf);
+                        seq_blk += 1;
+                    }
+                    let mut prev_dc_cb = 0i32;
+                    for _ in 0..num_chroma {
+                        let s = q_blocks_base + seq_blk * 32;
+                        let blk = unpack_blk(&qblocks_flat[s..s + 32]);
+                        encode_rle_block(&blk, &mut prev_dc_cb, out_buf);
+                        seq_blk += 1;
+                    }
+                    let mut prev_dc_cr = 0i32;
+                    for _ in 0..num_chroma {
+                        let s = q_blocks_base + seq_blk * 32;
+                        let blk = unpack_blk(&qblocks_flat[s..s + 32]);
+                        encode_rle_block(&blk, &mut prev_dc_cr, out_buf);
+                        seq_blk += 1;
+                    }
+
+                    // Scatter reconstructed 64x64 BGRA tile back into `ref_chunk`.
+                    let tile_byte_base = batch_idx * 4096 * 4;
+                    let row_bytes = tw as usize * 4;
+                    let rel_y0 = (y0 - y_offset) as usize;
+                    for py in 0..(th as usize) {
+                        let src_off = tile_byte_base + py * 64 * 4;
+                        let dst_off = (rel_y0 + py) * stride + (x0 as usize) * 4;
+                        ref_chunk[dst_off..dst_off + row_bytes]
+                            .copy_from_slice(&recon_flat[src_off..src_off + row_bytes]);
+                    }
+                    tile_chunk[tidx - tidx_offset].is_lossy = true;
+                }
+                TilePlan::CpuFallback { item } => {
+                    encode_tile_batch(
+                        ref_chunk,
+                        prev_ref_full,
+                        cur_chunk,
+                        tile_chunk,
+                        fb_w,
+                        fb_h,
+                        y_offset,
+                        tidx_offset,
+                        std::slice::from_ref(&item),
+                        false,
+                        massive_motion,
+                        false,
+                        false,
+                        frame_mv,
+                        luma_q,
+                        chroma_q,
+                        out_buf,
+                        local_lossy,
+                        local_mv_used,
+                    );
+                }
+            }
+        }
+    };
+
+    let plan_ty = |p: &TilePlan| -> usize {
+        match *p {
+            TilePlan::MvSkip { ty, .. } => ty,
+            TilePlan::GpuOpaqueLossy { ty, .. } => ty,
+            TilePlan::CpuFallback { item } => item.1,
+        }
+    };
+
+    engine.encode_fullres_tiles_batch_with(
+        cur_bgra,
+        ref_bgra,
+        prev_ref_full,
+        fb_w,
+        fb_h,
+        &mut gpu_descs,
+        luma_q,
+        chroma_q,
+        prepare_descs,
+        on_submitted,
+        |ref_bgra, batch_mv_info, qblocks_flat, recon_flat| {
+            let mv_info_ref = batch_mv_info.as_slice();
+            if rows_per_band < usize::MAX && plans.len() >= 48 {
+                let num_workers = total_rows.div_ceil(rows_per_band).max(1);
+                let mut band_slices = Vec::with_capacity(num_workers);
+                let mut ref_rem = &mut ref_bgra[..];
+                let mut tile_rem = &mut tiles[..];
+                let mut plan_rem = &plans[..];
+                let mut start_row = 0usize;
+
+                while start_row < total_rows {
+                    let end_row = (start_row + rows_per_band).min(total_rows);
+                    let y_offset = (start_row as u32) * TILE_SIZE;
+                    let y_end = ((end_row as u32) * TILE_SIZE).min(fb_h);
+                    let byte_len = ((y_end - y_offset) as usize) * stride;
+                    let (ref_chunk, next_ref) = ref_rem.split_at_mut(byte_len);
+                    ref_rem = next_ref;
+
+                    let tile_len = (end_row - start_row) * cols;
+                    let (tile_chunk, next_tiles) = tile_rem.split_at_mut(tile_len);
+                    tile_rem = next_tiles;
+
+                    let split_pos = plan_rem
+                        .iter()
+                        .position(|p| plan_ty(p) >= end_row)
+                        .unwrap_or(plan_rem.len());
+                    let (plan_chunk, next_plans) = plan_rem.split_at(split_pos);
+                    plan_rem = next_plans;
+
+                    let cur_start_byte = (y_offset as usize) * stride;
+                    let cur_chunk = &cur_bgra[cur_start_byte..cur_start_byte + byte_len];
+                    band_slices.push((
+                        plan_chunk,
+                        ref_chunk,
+                        cur_chunk,
+                        tile_chunk,
+                        y_offset,
+                        start_row * cols,
+                    ));
+                    start_row = end_row;
+                }
+
+                let mut band_outputs = Vec::with_capacity(band_slices.len());
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(band_slices.len());
+                    for (plan_chunk, ref_chunk, cur_chunk, tile_chunk, y_offset, tidx_offset) in
+                        band_slices
+                    {
+                        handles.push(s.spawn(move || {
+                            let mut local_out = Vec::with_capacity(plan_chunk.len() * 512);
+                            let mut l_lossy = false;
+                            let mut l_mv = false;
+                            apply_plan_range(
+                                plan_chunk,
+                                mv_info_ref,
+                                ref_chunk,
+                                cur_chunk,
+                                tile_chunk,
+                                y_offset,
+                                tidx_offset,
+                                qblocks_flat,
+                                recon_flat,
+                                &mut local_out,
+                                &mut l_lossy,
+                                &mut l_mv,
+                            );
+                            (local_out, l_lossy, l_mv)
+                        }));
+                    }
+                    for h in handles {
+                        band_outputs.push(h.join().expect("SmartTile RLE worker panicked"));
+                    }
+                });
+
+                for (chunk_out, l_lossy, l_mv) in band_outputs {
+                    out.extend_from_slice(&chunk_out);
+                    used_lossy |= l_lossy;
+                    used_local_mv |= l_mv;
+                }
+            } else {
+                apply_plan_range(
+                    &plans,
+                    mv_info_ref,
+                    ref_bgra,
+                    cur_bgra,
+                    tiles,
+                    0,
+                    0,
+                    qblocks_flat,
+                    recon_flat,
+                    out,
+                    &mut used_lossy,
+                    &mut used_local_mv,
+                );
+            }
+        },
+    )?;
+
+    Some((used_lossy, used_local_mv))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4984,8 +5567,9 @@ mod tests {
             })
             .collect();
 
-        let run_e2e = |force_scalar: bool, quality: u8| -> (Duration, Duration, Vec<u8>) {
+        let run_e2e = |force_scalar: bool, disable_gpu: bool, quality: u8| -> (Duration, Duration, Vec<u8>) {
             FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
+            FORCE_DISABLE_GPU.store(disable_gpu, Ordering::Relaxed);
             let mut enc = SmartTileEncoder::new();
             let mut dec = SmartTileDecoder::new();
             // Prime with keyframe + first motion frame
@@ -5008,24 +5592,211 @@ mod tests {
                 last_dec = (*buf).clone();
             }
             FORCE_SCALAR.store(false, Ordering::Relaxed);
+            FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
             (enc_time / 4, dec_time / 4, last_dec)
         };
 
-        let (e_full_simd, d_full_simd, out_full_simd) = run_e2e(false, 75);
-        let (e_full_scal, d_full_scal, out_full_scal) = run_e2e(true, 75);
-        assert_eq!(out_full_simd, out_full_scal, "end-to-end 1080p full-res must be bit-identical");
+        let (e_full_gpu, _d_full_gpu, out_full_gpu) = run_e2e(false, false, 75);
+        let (e_full_simd, d_full_simd, out_full_simd) = run_e2e(false, true, 75);
+        let (e_full_scal, d_full_scal, out_full_scal) = run_e2e(true, true, 75);
+        assert_eq!(out_full_simd, out_full_scal, "end-to-end 1080p full-res SIMD vs Scalar must be bit-identical");
+        assert_eq!(out_full_gpu, out_full_simd, "end-to-end 1080p full-res GPU vs SIMD must be bit-identical");
 
-        let (e_half_simd, d_half_simd, out_half_simd) = run_e2e(false, 50);
-        let (e_half_scal, d_half_scal, out_half_scal) = run_e2e(true, 50);
+        let (e_half_simd, d_half_simd, out_half_simd) = run_e2e(false, true, 50);
+        let (e_half_scal, d_half_scal, out_half_scal) = run_e2e(true, true, 50);
         assert_eq!(out_half_simd, out_half_scal, "end-to-end 1080p half-res must be bit-identical");
 
+        if let Some(eng) = gpu::global_gpu_engine() {
+            if let Ok(lt) = eng.last_timing.lock() {
+                println!(
+                    "GPU 1080p Stage Breakdown: PCIe Upload {:?} | GPU Compute+Readback {:?} | CPU RLE+Scatter {:?}",
+                    lt.0, lt.1, lt.2
+                );
+            }
+        }
         println!(
-            "1080p Full-Res Motion (per frame): Encode {:?} vs {:?} ({:.2}x) | Decode {:?} vs {:?} ({:.2}x)\n\
-             1080p Half-Res Motion (per frame): Encode {:?} vs {:?} ({:.2}x) | Decode {:?} vs {:?} ({:.2}x)",
-            e_full_simd, e_full_scal, e_full_scal.as_secs_f64() / e_full_simd.as_secs_f64().max(1e-9),
+            "1080p Full-Res Motion (per frame): Encode GPU {:?} | SIMD {:?} | Scalar {:?} (GPU {:.2}x vs Scalar, {:.2}x vs SIMD) | Decode SIMD {:?} vs Scalar {:?} ({:.2}x)\n\
+             1080p Half-Res Motion (per frame): Encode SIMD {:?} vs Scalar {:?} ({:.2}x) | Decode SIMD {:?} vs Scalar {:?} ({:.2}x)",
+            e_full_gpu, e_full_simd, e_full_scal,
+            e_full_scal.as_secs_f64() / e_full_gpu.as_secs_f64().max(1e-9),
+            e_full_simd.as_secs_f64() / e_full_gpu.as_secs_f64().max(1e-9),
             d_full_simd, d_full_scal, d_full_scal.as_secs_f64() / d_full_simd.as_secs_f64().max(1e-9),
             e_half_simd, e_half_scal, e_half_scal.as_secs_f64() / e_half_simd.as_secs_f64().max(1e-9),
             d_half_simd, d_half_scal, d_half_scal.as_secs_f64() / d_half_simd.as_secs_f64().max(1e-9),
+        );
+    }
+
+    #[test]
+    fn gpu_compute_shaders_match_cpu_bit_for_bit() {
+        let Some(engine) = gpu::SmartTileGpuEngine::try_new_any() else {
+            println!("No Vulkan/GLES wgpu adapter available in test environment; skipping GPU shader test");
+            return;
+        };
+        println!(
+            "Testing SmartTile GPU compute shaders on adapter '{}' ({:?})",
+            engine.adapter_name, engine.device_type
+        );
+
+        let mut rng = 0x7654_3210_fedc_ba98u64;
+        let mut next_u32 = || -> u32 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 32) as u32
+        };
+
+        // 1. Verify `batch_dct_quant_idct` and `batch_idct` against scalar `dct_8x8` + `quantize_div` + `idct_8x8`.
+        let num_blocks = 256usize;
+        let quant = build_quant_table(&BASE_LUMA_QUANT, 75);
+        let mut in_blocks = vec![[0i32; 64]; num_blocks];
+        for blk in &mut in_blocks {
+            for v in blk.iter_mut() {
+                *v = (next_u32() % 511) as i32 - 255;
+            }
+        }
+        let mut gpu_q = vec![[0i32; 64]; num_blocks];
+        let mut gpu_idct = vec![[0i32; 64]; num_blocks];
+        assert!(engine.batch_dct_quant_idct(&in_blocks, &quant, &mut gpu_q, &mut gpu_idct));
+
+        let mut dequant_blocks = vec![[0i32; 64]; num_blocks];
+        for i in 0..num_blocks {
+            let cpu_dct = simd::dct_8x8_scalar(&in_blocks[i]);
+            let mut cpu_q = [0i32; 64];
+            let mut cpu_deq = [0i32; 64];
+            for k in 0..64 {
+                let qv = quantize_div(cpu_dct[k], quant[k]);
+                cpu_q[k] = qv;
+                cpu_deq[k] = (qv * quant[k]).clamp(-32_768, 32_768);
+            }
+            let cpu_idct = simd::idct_8x8_scalar(&cpu_deq);
+            assert_eq!(gpu_q[i], cpu_q, "GPU vs CPU quantized DCT block mismatch at {i}");
+            assert_eq!(gpu_idct[i], cpu_idct, "GPU vs CPU IDCT block mismatch at {i}");
+            dequant_blocks[i] = cpu_deq;
+        }
+
+        let mut gpu_idct_only = vec![[0i32; 64]; num_blocks];
+        assert!(engine.batch_idct(&dequant_blocks, &mut gpu_idct_only));
+        assert_eq!(gpu_idct_only, gpu_idct, "GPU batch_idct_only must match batch_dct_quant_idct");
+
+        // 2. Verify `scan_dirty_and_opaque_tiles` on a 300x200 frame (5x4 = 20 tiles, including partial edge tiles).
+        let w = 300u32;
+        let h = 200u32;
+        let ref_fb = vec![255u8; (w * h * 4) as usize];
+        let mut cur_fb = ref_fb.clone();
+        // Mark tile (1, 1) dirty (opaque)
+        cur_fb[((70 * w + 70) * 4) as usize] = 12;
+        // Mark partial edge tile (4, 3) transparent (and dirty)
+        cur_fb[((195 * w + 295) * 4 + 3) as usize] = 128;
+
+        let flags = engine
+            .scan_dirty_and_opaque_tiles(&ref_fb, &cur_fb, w, h)
+            .expect("scan_dirty_and_opaque_tiles should succeed");
+        let cols = w.div_ceil(TILE_SIZE) as usize;
+        let rows = h.div_ceil(TILE_SIZE) as usize;
+        assert_eq!(flags.len(), cols * rows);
+        for ty in 0..rows {
+            let y0 = (ty as u32) * TILE_SIZE;
+            let th = (h - y0).min(TILE_SIZE);
+            for tx in 0..cols {
+                let x0 = (tx as u32) * TILE_SIZE;
+                let tw = (w - x0).min(TILE_SIZE);
+                let tidx = ty * cols + tx;
+                let cpu_dirty = !simd::tile_equals_scalar(&ref_fb, &cur_fb, w, x0, y0, tw, th);
+                let cpu_opaque = simd::tile_is_opaque_scalar(&cur_fb, w, x0, y0, tw, th);
+                let gpu_dirty = (flags[tidx] & 1) != 0;
+                let gpu_opaque = (flags[tidx] & 2) != 0;
+                assert_eq!(gpu_dirty, cpu_dirty, "dirty mismatch at tile ({tx}, {ty})");
+                assert_eq!(gpu_opaque, cpu_opaque, "opaque mismatch at tile ({tx}, {ty})");
+            }
+        }
+
+        // 3. Verify full end-to-end `encode_tiles_with_gpu` vs CPU `encode_tile_batch` bit-exactness!
+        let ew = 640u32;
+        let eh = 512u32;
+        let make_frame = |step: u32| -> Vec<u8> {
+            let mut buf = vec![0u8; (ew * eh * 4) as usize];
+            for y in 0..eh {
+                for x in 0..ew {
+                    let idx = ((y * ew + x) * 4) as usize;
+                    buf[idx] = ((x.wrapping_mul(5) + step * 13) & 0xFF) as u8;
+                    buf[idx + 1] = ((y.wrapping_mul(7) + step * 9) & 0xFF) as u8;
+                    buf[idx + 2] = (((x ^ y) + step * 17) & 0xFF) as u8;
+                    buf[idx + 3] = 255;
+                }
+            }
+            buf
+        };
+        let f0 = make_frame(0);
+        let f1 = make_frame(1);
+        let f2 = make_frame(2);
+
+        // Encode sequence with GPU enabled (using `engine` directly if global_gpu_engine skipped llvmpipe)
+        FORCE_DISABLE_GPU.store(true, Ordering::Relaxed);
+        let mut enc_cpu = SmartTileEncoder::new();
+        let _ = enc_cpu.encode(ew, eh, &f0, 75);
+        let p1_cpu = enc_cpu.encode(ew, eh, &f1, 75);
+        let p2_cpu = enc_cpu.encode(ew, eh, &f2, 75);
+        FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
+
+        // Now run the exact same sequence through `encode_tiles_with_gpu` using `engine`.
+        let mut enc_gpu = SmartTileEncoder::new();
+        let _ = enc_gpu.encode(ew, eh, &f0, 75);
+        for (frame, cpu_pkt) in [(&f1, &p1_cpu), (&f2, &p2_cpu)] {
+            let ecols = ew.div_ceil(TILE_SIZE) as usize;
+            let erows = eh.div_ceil(TILE_SIZE) as usize;
+            let mut dirty = Vec::new();
+            let now = Instant::now();
+            for ty in 0..erows {
+                let y0 = (ty as u32) * TILE_SIZE;
+                let th = (eh - y0).min(TILE_SIZE);
+                for tx in 0..ecols {
+                    let x0 = (tx as u32) * TILE_SIZE;
+                    let tw = (ew - x0).min(TILE_SIZE);
+                    let tidx = ty * ecols + tx;
+                    if !tile_equals(&enc_gpu.ref_bgra, frame, ew, x0, y0, tw, th) {
+                        enc_gpu.tiles[tidx].motion_streak =
+                            enc_gpu.tiles[tidx].motion_streak.saturating_add(1);
+                        enc_gpu.tiles[tidx].last_change = Some(now);
+                        dirty.push((tx, ty, x0, y0, tw, th, tidx));
+                    }
+                }
+            }
+            enc_gpu.prev_ref_bgra.resize(frame.len(), 0);
+            enc_gpu.prev_ref_bgra.copy_from_slice(&enc_gpu.ref_bgra);
+            let lq = build_quant_table(&BASE_LUMA_QUANT, 75);
+            let cq = build_quant_table(&BASE_CHROMA_QUANT, 75);
+            let mut raw_pkt = vec![PACKET_VERSION, 0, 75, 0];
+            raw_pkt.extend_from_slice(&(dirty.len() as u32).to_le_bytes());
+            let (_, used_lmv) = encode_tiles_with_gpu(
+                &engine,
+                &mut enc_gpu.ref_bgra,
+                &mut enc_gpu.prev_ref_bgra,
+                true,
+                frame,
+                &mut enc_gpu.tiles,
+                ew,
+                eh,
+                &dirty,
+                true,
+                None,
+                &lq,
+                &cq,
+                &mut raw_pkt,
+                || {},
+            )
+            .expect("GPU batch encode should succeed");
+            if used_lmv {
+                raw_pkt[1] |= FLAG_PREV_REF;
+            }
+            let gpu_payload = lz4_flex::compress_prepend_size(&raw_pkt);
+            assert_eq!(
+                gpu_payload, cpu_pkt.payload,
+                "GPU compute shader encoded packet must be 100% bit-identical to CPU!"
+            );
+        }
+        assert_eq!(
+            enc_gpu.ref_bgra, enc_cpu.ref_bgra,
+            "GPU and CPU reference framebuffers must match bit-for-bit!"
         );
     }
 }
