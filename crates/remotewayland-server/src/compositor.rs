@@ -2,14 +2,17 @@
 //!
 //! Runs on a dedicated `calloop` thread, accepts Wayland client connections on an
 //! isolated `WAYLAND_DISPLAY` socket, tracks `xdg_toplevel` and `xdg_popup`
-//! windows, extracts committed SHM frames, and forwards input/configure events.
+//! windows, extracts committed SHM and GPU (dmabuf) frames, and forwards input/configure events.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +23,8 @@ use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use remotewayland_proto::{
     LaunchState, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
 };
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::Buffer as _;
 use smithay::backend::input::{Axis, AxisSource, KeyState};
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::{PopupKind, PopupManager, Space, Window};
@@ -48,11 +53,18 @@ use smithay::reexports::wayland_server::{
 use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    get_parent, send_surface_state, with_states, with_surface_tree_downward,
+    add_blocker, add_pre_commit_hook, get_parent, send_surface_state, Blocker, BlockerState,
+    Cacheable, with_states, with_surface_tree_downward,
     CompositorClientState, CompositorHandler, CompositorState, SubsurfaceCachedState,
     TraversalAction,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::drm_syncobj::{
+    DrmSyncPoint, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
+};
+use smithay::wayland::dmabuf::{
+    get_dmabuf, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+};
 use smithay::wayland::fractional_scale::{
     self, FractionalScaleHandler, FractionalScaleManagerState,
 };
@@ -83,13 +95,20 @@ use smithay::xwayland::xwm::{
 };
 use smithay::xwayland::{X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler};
 use smithay::{
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_fractional_scale,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
+    delegate_drm_syncobj,
+    delegate_fractional_scale,
     delegate_kde_decoration, delegate_output, delegate_primary_selection, delegate_seat,
     delegate_shm, delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
     delegate_xwayland_shell,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+use crate::gpu::{BgraFrame, GpuImporter, GpuMode, PendingReadback, Readback};
+use calloop::timer::{TimeoutAction, Timer};
+use smithay::backend::egl::fence::EGLFence;
+use smithay::backend::renderer::sync::Fence as _;
 
 /// Events emitted by the headless compositor to the QUIC server loop.
 #[derive(Debug, Clone)]
@@ -473,6 +492,18 @@ struct AppState {
     cmd_tx: CalloopSender<CompositorCommand>,
     compositor_state: CompositorState,
     shm_state: ShmState,
+    dmabuf_state: DmabufState,
+    /// `zwp_linux_dmabuf_v1` global, present only when a GPU is available.
+    dmabuf_global: Option<DmabufGlobal>,
+    /// Offscreen GPU renderer reading client dmabufs back into CPU frames.
+    gpu: Option<GpuImporter>,
+    /// `wp_linux_drm_syncobj_v1` (explicit sync), when the GPU's kernel driver supports it.
+    syncobj_state: Option<DrmSyncobjState>,
+    /// Dmabuf readbacks for commits not yet applied, by job id.
+    readback_jobs: HashMap<u64, ReadbackJob>,
+    next_readback_job: u64,
+    /// Readback job ids per surface, in commit order.
+    surface_readbacks: HashMap<ObjectId, VecDeque<u64>>,
     xdg_shell_state: XdgShellState,
     xdg_decoration_state: XdgDecorationState,
     kde_decoration_state: KdeDecorationState,
@@ -1842,10 +1873,383 @@ impl CompositorHandler for AppState {
         panic!("unknown Wayland client data type");
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
+            state.queue_buffer_readback(surface);
+        });
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
 
-        let is_cursor_surface = self.cursor_surface.as_ref().is_some_and(|cs| cs == surface);
+        let buffer_opt = with_states(surface, |states| {
+            let mut attrs = states
+                .cached_state
+                .get::<smithay::wayland::compositor::SurfaceAttributes>();
+            let buffer = match attrs.current().buffer.take() {
+                Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buf)) => Some(buf),
+                _ => None,
+            };
+            let release_point = states
+                .cached_state
+                .get::<DrmSyncobjCachedState>()
+                .current()
+                .release_point
+                .take();
+            // Always consumed, so a job never outlives the commit it was merged into.
+            let readback_job = states
+                .cached_state
+                .get::<ReadbackJobState>()
+                .current()
+                .job
+                .take();
+            (buffer, release_point, readback_job)
+        });
+        let (buffer_opt, release_point, readback_job) = buffer_opt;
+        let readback_frame = readback_job.and_then(|id| self.take_readback(surface, id));
+
+        if let Some(buffer) = buffer_opt {
+            let frame = if get_dmabuf(&buffer).is_ok() {
+                // Read back before this commit was applied (see `queue_buffer_readback`).
+                readback_frame
+            } else {
+                read_shm_buffer(&buffer).map(|frame| {
+                    let crop = with_states(surface, |states| {
+                        let (scale, transform) = {
+                            let mut attrs = states
+                                .cached_state
+                                .get::<smithay::wayland::compositor::SurfaceAttributes>(
+                            );
+                            let current = attrs.current();
+                            (current.buffer_scale, current.buffer_transform)
+                        };
+                        let src = states
+                            .cached_state
+                            .get::<ViewportCachedState>()
+                            .current()
+                            .src;
+                        let size = (frame.0 as i32, frame.1 as i32).into();
+                        buffer_crop(src, size, scale, transform.into())
+                    });
+                    match crop {
+                        Some(rect) => crop_frame(&frame, rect),
+                        None => frame,
+                    }
+                })
+            };
+            if let Some(frame) = frame {
+                self.store_surface_buffer(surface, frame);
+            }
+            release_buffer(buffer, release_point);
+        }
+
+        self.surface_contents_updated(surface);
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.surface_buffers.remove(&surface.id());
+        if let Some(jobs) = self.surface_readbacks.remove(&surface.id()) {
+            for id in jobs {
+                self.readback_jobs.remove(&id);
+            }
+        }
+    }
+}
+
+/// The readback job for a commit's new dmabuf, double-buffered with the rest of the surface
+/// state. smithay's commit and merge (for synchronized subsurfaces) then decide which job
+/// belongs to the buffer that is finally applied.
+#[derive(Debug, Default)]
+struct ReadbackJobState {
+    job: Option<u64>,
+}
+
+impl Cacheable for ReadbackJobState {
+    fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+        Self {
+            job: self.job.take(),
+        }
+    }
+
+    fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+        if self.job.is_some() {
+            into.job = self.job;
+        }
+    }
+}
+
+/// A client dmabuf read back before the commit that attached it is applied.
+struct ReadbackJob {
+    /// The frame, once the readback succeeded.
+    frame: Option<BgraFrame>,
+}
+
+/// State carried through the stages of one readback.
+struct ReadbackContext {
+    id: u64,
+    dmabuf: Dmabuf,
+    crop: Option<Rectangle<f64, smithay::utils::Buffer>>,
+    client: Client,
+    released: Arc<AtomicBool>,
+}
+
+/// Holds a surface commit until its buffer has been read back.
+struct ReadbackBlocker(Arc<AtomicBool>);
+
+impl Blocker for ReadbackBlocker {
+    fn state(&self) -> BlockerState {
+        if self.0.load(Ordering::Acquire) {
+            BlockerState::Released
+        } else {
+            BlockerState::Pending
+        }
+    }
+}
+
+impl AppState {
+    /// On `wl_surface.commit` with a new dmabuf: hold the commit, wait for the client's GPU work
+    /// (explicit-sync acquire point, else the dmabuf's implicit fences), copy the buffer on the
+    /// GPU, and release the commit once the copy lands. Each commit is then applied together with
+    /// its own buffer contents, and the event loop never waits on the GPU.
+    fn queue_buffer_readback(&mut self, surface: &WlSurface) {
+        if self.gpu.is_none() {
+            return;
+        }
+        let Some(client) = surface.client() else {
+            return;
+        };
+        let pending = with_states(surface, |states| {
+            let (buffer, scale, transform) = {
+                let mut attrs = states
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>();
+                let pending = attrs.pending();
+                let Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buffer)) =
+                    pending.buffer.as_ref()
+                else {
+                    return None;
+                };
+                (
+                    buffer.clone(),
+                    pending.buffer_scale,
+                    pending.buffer_transform,
+                )
+            };
+            let dmabuf = get_dmabuf(&buffer).ok()?.clone();
+            let src = states
+                .cached_state
+                .get::<ViewportCachedState>()
+                .pending()
+                .src;
+            let crop = buffer_crop(src, dmabuf.size(), scale, transform.into());
+            let acquire_point = states
+                .cached_state
+                .get::<DrmSyncobjCachedState>()
+                .pending()
+                .acquire_point
+                .clone();
+            Some((dmabuf, crop, acquire_point))
+        });
+        let Some((dmabuf, crop, acquire_point)) = pending else {
+            return;
+        };
+
+        self.next_readback_job += 1;
+        let id = self.next_readback_job;
+        with_states(surface, |states| {
+            states.cached_state.get::<ReadbackJobState>().pending().job = Some(id);
+        });
+        self.readback_jobs.insert(id, ReadbackJob { frame: None });
+        self.surface_readbacks
+            .entry(surface.id())
+            .or_default()
+            .push_back(id);
+        let released = Arc::new(AtomicBool::new(false));
+        add_blocker(surface, ReadbackBlocker(released.clone()));
+        let ctx = ReadbackContext {
+            id,
+            dmabuf: dmabuf.clone(),
+            crop,
+            client,
+            released,
+        };
+
+        // Stage 1: wait until the client's rendering into the buffer has finished. Shared so it
+        // can still run here if the wait can't be set up.
+        let ctx = Rc::new(Cell::new(Some(ctx)));
+        let waiting_ctx = Rc::clone(&ctx);
+        let waiting = if let Some(acquire_point) = acquire_point {
+            // GL doesn't wait on syncobj timelines, so reading before the acquire point signals
+            // would copy a half-rendered frame. If it can't be watched, skip this frame.
+            let fd = acquire_point
+                .eventfd()
+                .or_else(|_| acquire_point.export_sync_file().map(Arc::new));
+            let inserted = match fd {
+                Ok(fd) => self
+                    .loop_handle
+                    .insert_source(
+                        Generic::new(fd, Interest::READ, Mode::OneShot),
+                        move |_, _, state| {
+                            if let Some(ctx) = waiting_ctx.take() {
+                                state.run_readback(ctx);
+                            }
+                            Ok(PostAction::Remove)
+                        },
+                    )
+                    .map_err(|err| anyhow::anyhow!("{err}")),
+                Err(err) => Err(err.into()),
+            };
+            if let Err(err) = inserted {
+                warn!(
+                    error = %err,
+                    "cannot wait for explicit-sync acquire point; skipping frame"
+                );
+                if let Some(ctx) = ctx.take() {
+                    self.complete_readback(ctx, None);
+                }
+                return;
+            }
+            true
+        } else {
+            match dmabuf.generate_blocker(Interest::READ) {
+                Ok((_blocker, source)) => self
+                    .loop_handle
+                    .insert_source(source, move |_, _, state| {
+                        if let Some(ctx) = waiting_ctx.take() {
+                            state.run_readback(ctx);
+                        }
+                        Ok(())
+                    })
+                    .is_ok(),
+                // The client's rendering already finished.
+                Err(_) => false,
+            }
+        };
+        if !waiting {
+            if let Some(ctx) = ctx.take() {
+                self.run_readback(ctx);
+            }
+        }
+    }
+
+    /// Stage 2: queue the GPU copy, then (stage 3) map it once its fence signals.
+    fn run_readback(&mut self, ctx: ReadbackContext) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            self.complete_readback(ctx, None);
+            return;
+        };
+        let (readback, fence) = match gpu.start_readback(&ctx.dmabuf, ctx.crop) {
+            Ok(Readback::Ready(frame)) => {
+                self.complete_readback(ctx, Some(frame));
+                return;
+            }
+            Ok(Readback::Pending { readback, fence }) => (readback, fence),
+            Ok(Readback::Polled { readback, fence }) => {
+                self.poll_readback(ctx, readback, fence);
+                return;
+            }
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "failed to read client dmabuf");
+                self.complete_readback(ctx, None);
+                return;
+            }
+        };
+
+        let job = Rc::new(Cell::new(Some((ctx, readback))));
+        let fenced_job = Rc::clone(&job);
+        let inserted = self.loop_handle.insert_source(
+            Generic::new(fence, Interest::READ, Mode::OneShot),
+            move |_, _, state| {
+                if let Some((ctx, readback)) = fenced_job.take() {
+                    state.finish_readback(ctx, readback);
+                }
+                Ok(PostAction::Remove)
+            },
+        );
+        if let Err(err) = inserted {
+            warn!(error = %err, "failed to watch readback fence; mapping synchronously");
+            if let Some((ctx, readback)) = job.take() {
+                self.finish_readback(ctx, readback);
+            }
+        }
+    }
+
+    /// Without an exportable fence, check it on a short timer instead of blocking the loop.
+    fn poll_readback(&mut self, ctx: ReadbackContext, readback: PendingReadback, fence: EGLFence) {
+        const POLL_INTERVAL: Duration = Duration::from_millis(1);
+        let job = Rc::new(Cell::new(Some((ctx, readback))));
+        let polled_job = Rc::clone(&job);
+        let inserted = self.loop_handle.insert_source(
+            Timer::from_duration(POLL_INTERVAL),
+            move |_, _, state| {
+                if !fence.is_signaled() {
+                    return TimeoutAction::ToDuration(POLL_INTERVAL);
+                }
+                if let Some((ctx, readback)) = polled_job.take() {
+                    state.finish_readback(ctx, readback);
+                }
+                TimeoutAction::Drop
+            },
+        );
+        if let Err(err) = inserted {
+            warn!(error = %err, "failed to poll readback fence; mapping synchronously");
+            if let Some((ctx, readback)) = job.take() {
+                self.finish_readback(ctx, readback);
+            }
+        }
+    }
+
+    fn finish_readback(&mut self, ctx: ReadbackContext, readback: PendingReadback) {
+        let frame = match self.gpu.as_mut().map(|gpu| gpu.finish_readback(readback)) {
+            Some(Ok(frame)) => Some(frame),
+            Some(Err(err)) => {
+                warn!(error = %format!("{err:#}"), "failed to read client dmabuf");
+                None
+            }
+            None => None,
+        };
+        self.complete_readback(ctx, frame);
+    }
+
+    /// Record the frame and let the held commit apply.
+    fn complete_readback(&mut self, ctx: ReadbackContext, frame: Option<BgraFrame>) {
+        if let Some(job) = self.readback_jobs.get_mut(&ctx.id) {
+            job.frame = frame;
+        }
+        ctx.released.store(true, Ordering::Release);
+        let dh = self.display_handle.clone();
+        self.client_compositor_state(&ctx.client)
+            .blocker_cleared(self, &dh);
+    }
+
+    /// Take the readback for the commit being applied. Earlier jobs of the surface belong to
+    /// commits that were applied or merged away, so they are dropped too.
+    fn take_readback(&mut self, surface: &WlSurface, id: u64) -> Option<BgraFrame> {
+        if let Some(queue) = self.surface_readbacks.get_mut(&surface.id()) {
+            while queue.front().is_some_and(|&queued| queued < id) {
+                if let Some(stale) = queue.pop_front() {
+                    self.readback_jobs.remove(&stale);
+                }
+            }
+            if queue.front() == Some(&id) {
+                queue.pop_front();
+            }
+        }
+        self.readback_jobs.remove(&id)?.frame
+    }
+
+    fn store_surface_buffer(&mut self, surface: &WlSurface, (w, h, bgra): BgraFrame) {
+        if w > 0 && h > 0 {
+            self.surface_buffers
+                .insert(surface.id(), (w, h, Arc::new(bgra)));
+        }
+    }
+
+    /// Re-emit the cursor or recomposite the window owning `surface` after its contents changed.
+    fn surface_contents_updated(&mut self, surface: &WlSurface) {
+        if self.cursor_surface.as_ref().is_some_and(|cs| cs == surface) {
+            self.emit_cursor_surface_bitmap(surface);
+        }
 
         let mut cur = surface.clone();
         let window_id_opt = loop {
@@ -1858,58 +2262,6 @@ impl CompositorHandler for AppState {
                 None => break None,
             }
         };
-
-        let buffer_opt: Option<WlBuffer> = with_states(surface, |states| {
-            let mut attrs = states
-                .cached_state
-                .get::<smithay::wayland::compositor::SurfaceAttributes>();
-            match attrs.current().buffer.take() {
-                Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buf)) => Some(buf),
-                _ => None,
-            }
-        });
-
-        if let Some(buffer) = buffer_opt {
-            let extracted = with_buffer_contents(&buffer, |ptr, len, spec| {
-                let width = spec.width.max(0) as u32;
-                let height = spec.height.max(0) as u32;
-                let stride = spec.stride.max(0) as usize;
-                let opaque = spec.format == wl_shm::Format::Xrgb8888;
-                let mut bgra = vec![0u8; (width * height * 4) as usize];
-                let src = unsafe { std::slice::from_raw_parts(ptr, len) };
-                for y in 0..(height as usize) {
-                    let row_start = spec.offset.max(0) as usize + y * stride;
-                    let row_bytes = (width as usize) * 4;
-                    let dst_start = y * row_bytes;
-                    if row_start + row_bytes <= src.len() {
-                        bgra[dst_start..dst_start + row_bytes]
-                            .copy_from_slice(&src[row_start..row_start + row_bytes]);
-                        if opaque {
-                            for px in bgra[dst_start..dst_start + row_bytes]
-                                .as_chunks_mut::<4>()
-                                .0
-                            {
-                                px[3] = 0xFF;
-                            }
-                        }
-                    }
-                }
-                (width, height, bgra)
-            });
-
-            if let Ok((w, h, bgra)) = extracted {
-                if w > 0 && h > 0 {
-                    self.surface_buffers
-                        .insert(surface.id(), (w, h, Arc::new(bgra)));
-                }
-            }
-            buffer.release();
-        }
-
-        if is_cursor_surface {
-            self.emit_cursor_surface_bitmap(surface);
-        }
-
         let Some(window_id) = window_id_opt else {
             return;
         };
@@ -1930,8 +2282,107 @@ impl CompositorHandler for AppState {
     }
 }
 
+/// Hand a buffer back to its client, signalling its explicit-sync release point if any.
+fn release_buffer(buffer: WlBuffer, release_point: Option<DrmSyncPoint>) {
+    if let Some(point) = release_point {
+        if let Err(err) = point.signal() {
+            warn!(error = %err, "failed to signal explicit-sync release point");
+        }
+    }
+    buffer.release();
+}
+
+/// The region of a buffer selected by a `wp_viewport` source rectangle, in buffer pixels, or
+/// `None` when the whole buffer is used. Clients such as Chromium allocate padded buffers and
+/// crop them this way.
+fn buffer_crop(
+    src: Option<Rectangle<f64, Logical>>,
+    buffer_size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    buffer_scale: i32,
+    transform: Transform,
+) -> Option<Rectangle<f64, smithay::utils::Buffer>> {
+    let src = src?;
+    let scale = buffer_scale.max(1);
+    let surface_size = buffer_size.to_logical(scale, transform).to_f64();
+    let full = Rectangle::from_size(buffer_size.to_f64());
+    let rect = src
+        .to_buffer(f64::from(scale), transform, &surface_size)
+        .intersection(full)?;
+    (rect != full).then_some(rect)
+}
+
+/// Crop a CPU frame to `rect` (buffer pixels, rounded to whole pixels).
+fn crop_frame((w, h, bgra): &BgraFrame, rect: Rectangle<f64, smithay::utils::Buffer>) -> BgraFrame {
+    let x = (rect.loc.x.round().max(0.0) as u32).min(*w);
+    let y = (rect.loc.y.round().max(0.0) as u32).min(*h);
+    let cw = (rect.size.w.round().max(1.0) as u32).min(w - x);
+    let ch = (rect.size.h.round().max(1.0) as u32).min(h - y);
+    let mut out = Vec::with_capacity((cw * ch * 4) as usize);
+    for row in y..y + ch {
+        let start = ((row * w + x) * 4) as usize;
+        out.extend_from_slice(&bgra[start..start + (cw * 4) as usize]);
+    }
+    (cw, ch, out)
+}
+
+/// Copy a `wl_shm` buffer into tightly packed BGRA rows.
+fn read_shm_buffer(buffer: &WlBuffer) -> Option<(u32, u32, Vec<u8>)> {
+    with_buffer_contents(buffer, |ptr, len, spec| {
+        let width = spec.width.max(0) as u32;
+        let height = spec.height.max(0) as u32;
+        let stride = spec.stride.max(0) as usize;
+        let opaque = spec.format == wl_shm::Format::Xrgb8888;
+        let mut bgra = vec![0u8; (width * height * 4) as usize];
+        let src = unsafe { std::slice::from_raw_parts(ptr, len) };
+        for y in 0..(height as usize) {
+            let row_start = spec.offset.max(0) as usize + y * stride;
+            let row_bytes = (width as usize) * 4;
+            let dst_start = y * row_bytes;
+            if row_start + row_bytes <= src.len() {
+                bgra[dst_start..dst_start + row_bytes]
+                    .copy_from_slice(&src[row_start..row_start + row_bytes]);
+                if opaque {
+                    for px in bgra[dst_start..dst_start + row_bytes]
+                        .as_chunks_mut::<4>()
+                        .0
+                    {
+                        px[3] = 0xFF;
+                    }
+                }
+            }
+        }
+        (width, height, bgra)
+    })
+    .ok()
+}
+
 impl BufferHandler for AppState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
+}
+
+impl DrmSyncobjHandler for AppState {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.syncobj_state.as_mut()
+    }
+}
+
+impl DmabufHandler for AppState {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        if self.gpu.as_mut().is_some_and(|gpu| gpu.can_import(&dmabuf)) {
+            let _ = notifier.successful::<AppState>();
+        } else {
+            notifier.failed();
+        }
+    }
 }
 
 impl ShmHandler for AppState {
@@ -3397,6 +3848,8 @@ impl FractionalScaleHandler for AppState {
 
 delegate_compositor!(AppState);
 delegate_shm!(AppState);
+delegate_dmabuf!(AppState);
+delegate_drm_syncobj!(AppState);
 delegate_xdg_shell!(AppState);
 delegate_xdg_decoration!(AppState);
 delegate_kde_decoration!(AppState);
@@ -3414,6 +3867,7 @@ delegate_xwayland_shell!(AppState);
 pub fn start_compositor(
     command: Vec<String>,
     enable_xwayland: bool,
+    gpu_mode: GpuMode,
 ) -> Result<(CompositorHandle, mpsc::UnboundedReceiver<CompositorEvent>)> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx): (CalloopSender<CompositorCommand>, Channel<CompositorCommand>) =
@@ -3432,6 +3886,7 @@ pub fn start_compositor(
                 ready_tx.clone(),
                 command,
                 enable_xwayland,
+                gpu_mode,
             ) {
                 error!(error = %err, "headless compositor exited with error");
                 let _ = ready_tx.send(Err(err));
@@ -3521,6 +3976,22 @@ fn spawn_xwayland_with_auth(
     anyhow::bail!("no free X11 display slot available in range :0..:63")
 }
 
+/// Open the GPU selected by `mode` and advertise its dmabuf formats to clients.
+fn init_gpu(
+    dh: &DisplayHandle,
+    dmabuf_state: &mut DmabufState,
+    mode: &GpuMode,
+) -> Result<Option<(GpuImporter, DmabufGlobal)>> {
+    let Some(gpu) = GpuImporter::new(mode)? else {
+        return Ok(None);
+    };
+    let feedback = DmabufFeedbackBuilder::new(gpu.node().dev_id(), gpu.formats())
+        .build()
+        .context("failed to build dmabuf feedback")?;
+    let global = dmabuf_state.create_global_with_default_feedback::<AppState>(dh, &feedback);
+    Ok(Some((gpu, global)))
+}
+
 fn run_compositor_loop(
     event_tx: mpsc::UnboundedSender<CompositorEvent>,
     cmd_rx: Channel<CompositorCommand>,
@@ -3528,6 +3999,7 @@ fn run_compositor_loop(
     ready_tx: std::sync::mpsc::SyncSender<Result<OsString>>,
     command: Vec<String>,
     enable_xwayland: bool,
+    gpu_mode: GpuMode,
 ) -> Result<()> {
     let mut event_loop: EventLoop<AppState> =
         EventLoop::try_new().context("failed to create calloop EventLoop")?;
@@ -3537,6 +4009,30 @@ fn run_compositor_loop(
 
     let compositor_state = CompositorState::new::<AppState>(&dh);
     let shm_state = ShmState::new::<AppState>(&dh, vec![]);
+    // Create the dmabuf global before Xwayland starts so glamor finds the render node.
+    let mut dmabuf_state = DmabufState::new();
+    let (gpu, dmabuf_global) = match init_gpu(&dh, &mut dmabuf_state, &gpu_mode) {
+        Ok(Some((gpu, global))) => (Some(gpu), Some(global)),
+        Ok(None) => {
+            info!("GPU acceleration disabled; apps render in software");
+            (None, None)
+        }
+        // The user asked for this GPU, so don't silently fall back to software.
+        Err(err) if matches!(gpu_mode, GpuMode::Node(_)) => {
+            return Err(err.context("the GPU given with --render-node is unusable"));
+        }
+        Err(err) => {
+            warn!(
+                error = %format!("{err:#}"),
+                "GPU acceleration unavailable; apps render in software"
+            );
+            (None, None)
+        }
+    };
+    let syncobj_state = gpu
+        .as_ref()
+        .and_then(GpuImporter::syncobj_device)
+        .map(|device| DrmSyncobjState::new::<AppState>(&dh, device));
     let xdg_shell_state = XdgShellState::new::<AppState>(&dh);
     let xdg_decoration_state = XdgDecorationState::new::<AppState>(&dh);
     let kde_decoration_state =
@@ -3665,6 +4161,13 @@ fn run_compositor_loop(
         cmd_tx,
         compositor_state,
         shm_state,
+        dmabuf_state,
+        dmabuf_global,
+        gpu,
+        syncobj_state,
+        readback_jobs: HashMap::new(),
+        next_readback_job: 0,
+        surface_readbacks: HashMap::new(),
         xdg_shell_state,
         xdg_decoration_state,
         kde_decoration_state,
@@ -4282,6 +4785,40 @@ mod tests {
             Some("text/plain;charset=utf-8")
         );
         assert_eq!(pick_preferred_text_mime(&["image/png".to_string()]), None);
+    }
+
+    #[test]
+    fn buffer_crop_maps_viewport_source_to_buffer_pixels() {
+        let size = (2226, 2459).into();
+        // Chromium-style padded buffer at buffer scale 1 with a source crop.
+        let src = Rectangle::new((0.0, 0.0).into(), (1826.0, 2036.0).into());
+        let crop = buffer_crop(Some(src), size, 1, Transform::Normal).unwrap();
+        assert_eq!(
+            crop,
+            Rectangle::new((0.0, 0.0).into(), (1826.0, 2036.0).into())
+        );
+        // Source coordinates are surface-local, so buffer scale 2 doubles them.
+        let src = Rectangle::new((10.0, 20.0).into(), (500.0, 600.0).into());
+        let crop = buffer_crop(Some(src), size, 2, Transform::Normal).unwrap();
+        assert_eq!(
+            crop,
+            Rectangle::new((20.0, 40.0).into(), (1000.0, 1200.0).into())
+        );
+        // No source, or a source covering the whole buffer, needs no crop.
+        assert_eq!(buffer_crop(None, size, 1, Transform::Normal), None);
+        let whole = Rectangle::new((0.0, 0.0).into(), (2226.0, 2459.0).into());
+        assert_eq!(buffer_crop(Some(whole), size, 1, Transform::Normal), None);
+    }
+
+    #[test]
+    fn crop_frame_copies_selected_rows() {
+        // 3x2 frame whose pixel bytes encode their index.
+        let bgra: Vec<u8> = (0..6u8).flat_map(|i| [i; 4]).collect();
+        let rect = Rectangle::new((1.0, 0.0).into(), (2.0, 2.0).into());
+        let (w, h, out) = crop_frame(&(3, 2, bgra), rect);
+        assert_eq!((w, h), (2, 2));
+        let firsts: Vec<u8> = out.chunks(4).map(|p| p[0]).collect();
+        assert_eq!(firsts, vec![1, 2, 4, 5]);
     }
 
     #[test]

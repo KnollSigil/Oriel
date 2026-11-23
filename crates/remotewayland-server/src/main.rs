@@ -7,6 +7,7 @@
 mod apps;
 mod audio;
 mod compositor;
+mod gpu;
 mod media;
 mod pty;
 mod quic;
@@ -14,7 +15,7 @@ mod session;
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,7 +38,9 @@ const FOREGROUND_TOKEN_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug, Parser)]
 #[command(
     name = "remotewayland-server",
-    about = "RemoteWayland headless app & PTY server"
+    about = "RemoteWayland headless app & PTY server",
+    // Server options belong after a subcommand (`attach --no-gpu`); before it they'd be ignored.
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,6 +64,9 @@ struct Cli {
     #[arg(long)]
     no_xwayland: bool,
 
+    #[command(flatten)]
+    gpu: GpuArgs,
+
     /// Target GUI application and arguments to launch inside the isolated session.
     #[arg(last = true)]
     command: Vec<String>,
@@ -83,7 +89,41 @@ enum ServerSubcommand {
         /// Disable embedded XWayland support when starting a new daemon.
         #[arg(long)]
         no_xwayland: bool,
+
+        #[command(flatten)]
+        gpu: GpuArgs,
     },
+}
+
+/// GPU acceleration options for apps in the session.
+#[derive(Debug, Clone, clap::Args)]
+struct GpuArgs {
+    /// DRM render node apps render on (default: the first hardware GPU EGL reports).
+    #[arg(long, value_name = "PATH", conflicts_with = "no_gpu")]
+    render_node: Option<PathBuf>,
+
+    /// Disable GPU acceleration; apps render in software and share frames via `wl_shm`.
+    #[arg(long)]
+    no_gpu: bool,
+}
+
+impl GpuArgs {
+    fn mode(&self) -> gpu::GpuMode {
+        match (&self.render_node, self.no_gpu) {
+            (_, true) => gpu::GpuMode::Disabled,
+            (Some(path), false) => gpu::GpuMode::Node(path.clone()),
+            (None, false) => gpu::GpuMode::Auto,
+        }
+    }
+
+    fn push_args(&self, cmd: &mut Command) {
+        if self.no_gpu {
+            cmd.arg("--no-gpu");
+        }
+        if let Some(path) = &self.render_node {
+            cmd.arg("--render-node").arg(path);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,13 +144,19 @@ async fn main() -> Result<()> {
         listen,
         host,
         no_xwayland,
+        gpu,
     }) = cli.subcommand
     {
-        return run_attach(&host_runtime_dir, listen, host, no_xwayland).await;
+        return run_attach(&host_runtime_dir, listen, host, no_xwayland, &gpu).await;
     }
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("info".parse()?)
+                // Render nodes never grant DRM master; smithay warns about it regardless.
+                .add_directive("smithay::backend::drm::device::fd=error".parse()?),
+        )
         .init();
 
     // Capture control socket path in the host XDG_RUNTIME_DIR before switching
@@ -144,7 +190,8 @@ async fn main() -> Result<()> {
         warn!(error = %err, "isolated PipeWire audio session unavailable at startup");
     }
 
-    let (comp_handle, event_rx) = compositor::start_compositor(cli.command, !cli.no_xwayland)?;
+    let (comp_handle, event_rx) =
+        compositor::start_compositor(cli.command, !cli.no_xwayland, cli.gpu.mode())?;
     info!(
         socket = ?comp_handle.socket_name,
         session_dir = %session_guard.runtime_dir().display(),
@@ -243,6 +290,7 @@ async fn run_attach(
     listen: quic::ListenSpec,
     host: Option<String>,
     no_xwayland: bool,
+    gpu: &GpuArgs,
 ) -> Result<()> {
     let sock_path = session::control_socket_path(host_runtime_dir);
     if let Ok(info) = query_control_socket(&sock_path).await {
@@ -252,6 +300,12 @@ async fn run_attach(
                  outside the requested ports {range}; stop that server or allow port {}",
                 info.port,
                 info.port
+            );
+        }
+        if gpu.no_gpu || gpu.render_node.is_some() {
+            eprintln!(
+                "warning: a RemoteWayland server is already running for this user; \
+                 --no-gpu/--render-node only apply when attach starts a new server"
             );
         }
         print_attach_uri(&host, listen, &info);
@@ -282,6 +336,7 @@ async fn run_attach(
     if no_xwayland {
         cmd.arg("--no-xwayland");
     }
+    gpu.push_args(&mut cmd);
     if let Some(file) = log_file {
         match file.try_clone() {
             Ok(err_file) => {

@@ -5,7 +5,7 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 ## Architecture
 
 - **`remotewayland-proto`**: Shared wire protocol, stream framing, and ephemeral TLS/token handshake types.
-- **`remotewayland-server`**: Headless Wayland compositor (`smithay`) with embedded `Xwayland` (`X11Wm`) for remote X11 apps, pure-Rust XOR-delta + LZ4 video encoder, isolated PipeWire/PulseAudio virtual sink/source bridge, and QUIC server.
+- **`remotewayland-server`**: Headless Wayland compositor (`smithay`) with embedded `Xwayland` (`X11Wm`) for remote X11 apps, pure-Rust XOR-delta + LZ4 video encoder, isolated PipeWire/PulseAudio virtual sink/source bridge, and QUIC server. Apps get GPU acceleration (OpenGL, Vulkan, Xwayland glamor) through `linux-dmabuf` on the first hardware render node EGL reports; pick another with `--render-node /dev/dri/renderD129` or turn it off with `--no-gpu` (both also accepted by `attach` when it starts a new server). Explicit sync (`linux-drm-syncobj`) is offered when the kernel driver supports it. Without `libEGL` or a usable GPU, apps fall back to software rendering.
 - **`remotewayland-client`**: Rootless multi-window & unbounded `xdg_popup` Wayland client (`smithay-client-toolkit`), pure-Rust LZ4 delta decoder, local PipeWire/PulseAudio bridge, and a GTK4/libadwaita launcher. Launcher connection logic lives in the toolkit-independent `session` module; the GTK front-end only renders it.
 
 ## System Dependencies
@@ -13,6 +13,8 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 ### Fedora / RHEL
 ```bash
 sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-utils xorg-x11-server-Xwayland
+# GPU acceleration for apps on the server (loaded at runtime)
+sudo dnf install mesa-libEGL
 ```
 
 The client launcher is built with GTK4 and libadwaita (1.5+); build with
@@ -24,6 +26,8 @@ sudo dnf install libadwaita-devel
 ### Ubuntu / Debian
 ```bash
 sudo apt install libwayland-dev libxkbcommon-dev pulseaudio-utils xwayland
+# GPU acceleration for apps on the server (loaded at runtime)
+sudo apt install libegl1
 # GTK4/libadwaita launcher
 sudo apt install libgtk-4-dev libadwaita-1-dev
 ```
