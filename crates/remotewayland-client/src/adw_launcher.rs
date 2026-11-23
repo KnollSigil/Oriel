@@ -1,140 +1,55 @@
-//! Native GTK4 + libadwaita launcher (`feature = "gtk4"` without `qt`).
+//! Native GTK4 + libadwaita launcher.
 //!
 //! Layout: an `AdwNavigationSplitView` with the server list in the sidebar and the
 //! searchable app grid as content (collapsing to a single pane on narrow windows),
 //! a bottom status bar listing running programs, and `AdwPreferencesDialog`s for
 //! preferences and connection management.
+//!
+//! Connection state lives in the toolkit-independent [`SessionManager`]; this module only
+//! renders it. Background session events are awaited on the GTK main loop and each one
+//! refreshes just the views its [`Changes`] name.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Child;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use anyhow::Result;
 use gtk::gdk_pixbuf::PixbufLoader;
 use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
-use remotewayland_proto::{ControlMessage, LaunchState, RemoteAppEntry, PTY_LAUNCH_ID_BASE};
-use tokio::sync::mpsc;
+use remotewayland_proto::{LaunchState, RemoteAppEntry};
 
-use crate::hosts::{
-    load_client_settings, load_hosts, parse_uri, save_client_settings, save_hosts, ssh_bootstrap,
-    ClientSettings, HostProfile, RenderScaleCap,
-};
-use crate::pty::{
-    available_local_terminals, pty_tunnel_socket_path, spawn_local_terminal_pty_socket,
-    spawn_local_terminal_pty_socket_with_terminal, terminal_basename,
-};
-use crate::quic::{self, LauncherNetEvent};
+use crate::hosts::{HostProfile, RenderScaleCap};
+use crate::pty::{available_local_terminals, terminal_basename};
 use crate::search::{self, MatchTier, SearchIndexEntry};
-use crate::window::{self, ClientUiEvent};
+use crate::session::{
+    Changes, ConnStatus, HostEditError, SessionEvents, SessionManager, DEFAULT_QUIC_PORT,
+};
 
+/// Must match the Flatpak app ID: the sandbox only lets the app own D-Bus names under it,
+/// and compositors match the Wayland app ID to the installed `.desktop` file.
+const APP_ID: &str = "dev.knoll.Oriel";
 /// Labels for [`RenderScaleCap::to_index`] / [`RenderScaleCap::from_index`].
 const SCALE_CAP_LABELS: [&str; 4] = ["Uncapped", "2.0x", "1.5x", "1.0x"];
 /// Labels for [`RenderScaleCap::option_to_index`] / [`RenderScaleCap::option_from_index`].
 const HOST_SCALE_CAP_LABELS: [&str; 5] = ["Global", "Uncapped", "2.0x", "1.5x", "1.0x"];
-const DEFAULT_PORT: u16 = 7443;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConnStatus {
-    Disconnected,
-    Connecting,
-    Connected,
-}
-
-struct TrackedProgram {
-    launch_id: u64,
-    name: String,
-    state: LaunchState,
-    term_sent: bool,
-    pty_child: Option<Child>,
-}
-
-struct HostSession {
-    status: ConnStatus,
-    error: Option<String>,
-    pty_socket: Option<PathBuf>,
-    ctrl_tx: Option<mpsc::UnboundedSender<ControlMessage>>,
-    ui_tx: Option<window::UiSender>,
-    net_rx: Option<mpsc::UnboundedReceiver<LauncherNetEvent>>,
-    connect_rx: Option<std::sync::mpsc::Receiver<Result<ConnectResult, String>>>,
-    apps: Vec<RemoteAppEntry>,
-    /// Set once the server has answered `ListApps`, so an empty list means "no apps".
-    apps_loaded: bool,
-    programs: Vec<TrackedProgram>,
-    rtt_ms: Option<u32>,
-    congested: bool,
-    auto_reconnect: bool,
-    reconnect_at: Option<Instant>,
-    reconnect_backoff_secs: u64,
-}
-
-struct ConnectResult {
-    pty_socket: PathBuf,
-    ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
-    ui_tx: window::UiSender,
-    net_rx: mpsc::UnboundedReceiver<LauncherNetEvent>,
-}
 
 struct AppUi {
-    hosts: Vec<HostProfile>,
-    sessions: HashMap<String, HostSession>,
-    active_target: Option<String>,
-    global_max_scale: RenderScaleCap,
-    cli_max_scale: Option<RenderScaleCap>,
-    next_launch_id: u64,
+    sessions: SessionManager,
     grid_apps: Vec<RemoteAppEntry>,
     grid_search: Vec<SearchIndexEntry>,
     grid_tiers: Vec<Option<MatchTier>>,
     icon_cache: HashMap<String, Option<gdk::Texture>>,
 }
 
-type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
-
-impl AppUi {
-    fn active_session_mut(&mut self) -> Option<&mut HostSession> {
-        let key = self.active_target.as_ref()?;
-        self.sessions.get_mut(key)
-    }
-
-    fn active_session(&self) -> Option<&HostSession> {
-        let key = self.active_target.as_ref()?;
-        self.sessions.get(key)
-    }
-
-    fn host_label(&self, target: &str) -> String {
-        self.hosts
-            .iter()
-            .find(|h| h.ssh_target == target)
-            .map(|h| h.label.clone())
-            .unwrap_or_else(|| target.to_string())
-    }
-
-    fn effective_max_scale(&self, host_override: Option<RenderScaleCap>) -> RenderScaleCap {
-        self.cli_max_scale
-            .or(host_override)
-            .unwrap_or(self.global_max_scale)
-    }
-
-    fn broadcast_max_scale(&self) {
-        for host in &self.hosts {
-            if let Some(sess) = self.sessions.get(&host.ssh_target) {
-                if let Some(ui_tx) = &sess.ui_tx {
-                    let cap = self.effective_max_scale(host.max_scale);
-                    let _ = ui_tx.send(ClientUiEvent::SetMaxScale { cap });
-                }
-            }
-        }
-    }
-}
+/// Refreshes the views named by a [`Changes`]. Bound once all views exist, so callbacks
+/// created earlier can still reach it.
+type ApplyChanges = Rc<dyn Fn(Changes)>;
+type ApplyChangesSlot = Rc<RefCell<Option<ApplyChanges>>>;
 
 pub fn run(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
-    let app = adw::Application::builder()
-        .application_id("org.remotewayland.Launcher")
-        .build();
+    let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|app| {
         install_css();
         app.set_accels_for_action("win.preferences", &["<Control>comma"]);
@@ -199,6 +114,10 @@ fn show_toast(overlay: &adw::ToastOverlay, title: &str) {
     overlay.add_toast(adw::Toast::builder().title(title).use_markup(false).build());
 }
 
+fn show_dialog_toast(dialog: &adw::PreferencesDialog, title: &str) {
+    dialog.add_toast(adw::Toast::builder().title(title).use_markup(false).build());
+}
+
 fn escape_markup(s: &str) -> String {
     glib::markup_escape_text(s).to_string()
 }
@@ -256,29 +175,25 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         .height_request(320)
         .build();
 
-    let initial_hosts = load_hosts();
-    let initial_target = initial_hosts.first().map(|h| h.ssh_target.clone());
-    let seed_id = ((std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64)
-        & 0xFFFF_FFFF)
-        << 16
-        | 1;
-    let initial_settings = load_client_settings();
+    let (sessions, session_events) = SessionManager::new(cli_max_scale);
     let state = Rc::new(RefCell::new(AppUi {
-        hosts: initial_hosts,
-        sessions: HashMap::new(),
-        active_target: initial_target,
-        global_max_scale: initial_settings.max_scale,
-        cli_max_scale,
-        next_launch_id: seed_id,
+        sessions,
         grid_apps: Vec::new(),
         grid_search: Vec::new(),
         grid_tiers: Vec::new(),
         icon_cache: HashMap::new(),
     }));
     let current_filter = Rc::new(RefCell::new(String::new()));
+    let apply_slot: ApplyChangesSlot = Rc::new(RefCell::new(None));
+    let apply_changes: ApplyChanges = {
+        let apply_slot = Rc::clone(&apply_slot);
+        Rc::new(move |changes| {
+            let apply = apply_slot.borrow().clone();
+            if let Some(apply) = apply {
+                apply(changes);
+            }
+        })
+    };
 
     // --- Sidebar: saved servers ---
     let manage_btn = gtk::Button::builder()
@@ -606,14 +521,15 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         let empty_spinner = empty_spinner.clone();
         Rc::new(move || {
             let st = state.borrow();
-            let active_label = st.active_target.as_deref().map(|t| st.host_label(t));
+            let sessions = &st.sessions;
+            let active_label = sessions.active_target().map(|t| sessions.host_label(t));
             content_page.set_title(active_label.as_deref().unwrap_or("Apps"));
 
             let mut busy = false;
             let mut offer_add = false;
             let (icon, title, description): (&str, &str, String) =
-                match (st.active_target.as_ref(), st.active_session()) {
-                    (None, _) if st.hosts.is_empty() => {
+                match (sessions.active_target(), sessions.active_session()) {
+                    (None, _) if sessions.hosts().is_empty() => {
                         offer_add = true;
                         (
                             "network-server-symbolic",
@@ -716,9 +632,9 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         Rc::new(move || {
             {
                 let st = state.borrow();
-                let (class, msg, connected) = match st.active_target.as_ref() {
+                let (class, msg, connected) = match st.sessions.active_target() {
                     None => ("dim-label", "No server selected".to_string(), false),
-                    Some(target) => match st.sessions.get(target) {
+                    Some(target) => match st.sessions.session(target) {
                         None => ("dim-label", format!("{target} · Disconnected"), false),
                         Some(sess) => match sess.status {
                             ConnStatus::Disconnected => {
@@ -730,7 +646,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                                 ("error", msg, false)
                             }
                             ConnStatus::Connecting => {
-                                ("accent", format!("{target} · Connecting via SSH…"), false)
+                                ("accent", format!("{target} · Connecting…"), false)
                             }
                             ConnStatus::Connected if sess.congested => {
                                 let rtt = sess.rtt_ms.unwrap_or(0);
@@ -762,6 +678,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         let status_count_lbl = status_count_lbl.clone();
         let programs_list = programs_list.clone();
         let programs_popover = programs_popover.clone();
+        let toasts = toasts.clone();
 
         Rc::new(move || {
             while let Some(c) = status_pills_box.first_child() {
@@ -773,9 +690,9 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
 
             let st = state.borrow();
             let Some((target, sess)) = st
-                .active_target
-                .as_ref()
-                .and_then(|t| st.sessions.get(t).map(|s| (t, s)))
+                .sessions
+                .active_target()
+                .and_then(|t| st.sessions.session(t).map(|s| (t, s)))
             else {
                 status_count_lbl.set_text("0 active");
                 programs_list.append(
@@ -818,19 +735,26 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 row.append(&name_lbl);
                 row.append(&state_lbl);
 
-                if (prog.launch_id & PTY_LAUNCH_ID_BASE) != 0 && prog.name.ends_with("(detached)") {
-                    if let Some(sock_path) = sess.pty_socket.clone() {
-                        let pty_id = prog.launch_id & !PTY_LAUNCH_ID_BASE;
-                        let reattach_btn = gtk::Button::builder()
-                            .icon_name("utilities-terminal-symbolic")
-                            .tooltip_text("Reattach detached terminal")
-                            .css_classes(["flat"])
-                            .build();
-                        reattach_btn.connect_clicked(move |_| {
-                            let _ = spawn_local_terminal_pty_socket(&sock_path, Some(pty_id), None);
-                        });
-                        row.append(&reattach_btn);
-                    }
+                if prog.is_detached_pty() && sess.status == ConnStatus::Connected {
+                    let reattach_btn = gtk::Button::builder()
+                        .icon_name("utilities-terminal-symbolic")
+                        .tooltip_text("Reattach detached terminal")
+                        .css_classes(["flat"])
+                        .build();
+                    let state_c = Rc::clone(&state);
+                    let toasts = toasts.clone();
+                    let target_c = target.to_string();
+                    let launch_id = prog.launch_id;
+                    reattach_btn.connect_clicked(move |_| {
+                        let res = state_c
+                            .borrow()
+                            .sessions
+                            .reattach_terminal(&target_c, launch_id);
+                        if let Err(err) = res {
+                            show_toast(&toasts, &format!("Couldn't reattach the terminal: {err}"));
+                        }
+                    });
+                    row.append(&reattach_btn);
                 }
 
                 let kill_btn = if prog.term_sent {
@@ -846,29 +770,18 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                         .css_classes(["flat", "circular"])
                         .build()
                 };
-                let target_c = target.clone();
+                let target_c = target.to_string();
                 let launch_id = prog.launch_id;
                 let state_c = Rc::clone(&state);
+                // Restyle in place rather than rebuilding the list, so focus stays put.
                 kill_btn.connect_clicked(move |btn| {
-                    let mut st = state_c.borrow_mut();
-                    let Some(sess) = st.sessions.get_mut(&target_c) else {
-                        return;
-                    };
-                    let Some(p) = sess.programs.iter_mut().find(|p| p.launch_id == launch_id)
-                    else {
-                        return;
-                    };
-                    if let Some(child) = p.pty_child.as_mut() {
-                        let _ = child.kill();
-                    } else if let Some(tx) = &sess.ctrl_tx {
-                        let force = p.term_sent;
-                        p.term_sent = true;
+                    let sent = state_c.borrow_mut().sessions.terminate(&target_c, launch_id);
+                    if sent {
                         btn.set_label("Kill");
                         btn.set_tooltip_text(Some("Force kill"));
                         btn.remove_css_class("flat");
                         btn.remove_css_class("circular");
                         btn.add_css_class("destructive-action");
-                        let _ = tx.send(ControlMessage::TerminateApp { launch_id, force });
                     }
                 });
                 row.append(&kill_btn);
@@ -902,32 +815,12 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     let launch_exec_or_app: Rc<dyn Fn(String, String)> = {
         let state = Rc::clone(&state);
         let search_entry = search_entry.clone();
-        let refresh_status_bar = Rc::clone(&refresh_status_bar);
+        let apply_changes = Rc::clone(&apply_changes);
         Rc::new(move |name: String, exec: String| {
-            {
-                let mut st = state.borrow_mut();
-                let launch_id = st.next_launch_id;
-                st.next_launch_id += 1;
-                if let Some(sess) = st.active_session_mut() {
-                    if let Some(tx) = &sess.ctrl_tx {
-                        sess.programs.push(TrackedProgram {
-                            launch_id,
-                            name: name.clone(),
-                            state: LaunchState::Launching,
-                            term_sent: false,
-                            pty_child: None,
-                        });
-                        let _ = tx.send(ControlMessage::LaunchApp {
-                            launch_id,
-                            name: Some(name),
-                            exec,
-                        });
-                    }
-                }
-            }
+            let changes = state.borrow_mut().sessions.launch(name, exec);
             search_entry.set_text("");
             search_entry.grab_focus();
-            refresh_status_bar();
+            apply_changes(changes);
         })
     };
 
@@ -959,6 +852,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
             let apps = {
                 let mut st = state.borrow_mut();
                 let apps = st
+                    .sessions
                     .active_session()
                     .map(|s| s.apps.clone())
                     .unwrap_or_default();
@@ -1007,140 +901,19 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         })
     };
 
-    let start_connect_inner: Rc<dyn Fn(HostProfile, bool)> = {
-        let state = Rc::clone(&state);
-        let refresh_status_bar = Rc::clone(&refresh_status_bar);
-        Rc::new(move |profile: HostProfile, is_auto_reconnect: bool| {
-            let target = profile.ssh_target.clone();
-            {
-                let mut st = state.borrow_mut();
-                if !is_auto_reconnect {
-                    st.active_target = Some(target.clone());
-                }
-                let (prev_backoff, prev_auto) = if let Some(existing) = st.sessions.get(&target) {
-                    if existing.status != ConnStatus::Disconnected {
-                        return;
-                    }
-                    (existing.reconnect_backoff_secs, existing.auto_reconnect)
-                } else {
-                    (2, false)
-                };
-                let (tx, rx) = std::sync::mpsc::channel::<Result<ConnectResult, String>>();
-                st.sessions.insert(
-                    target.clone(),
-                    HostSession {
-                        status: ConnStatus::Connecting,
-                        error: is_auto_reconnect.then(|| "Reconnecting…".to_string()),
-                        pty_socket: None,
-                        ctrl_tx: None,
-                        ui_tx: None,
-                        net_rx: None,
-                        connect_rx: Some(rx),
-                        apps: Vec::new(),
-                        apps_loaded: false,
-                        programs: Vec::new(),
-                        rtt_ms: None,
-                        congested: false,
-                        auto_reconnect: is_auto_reconnect && prev_auto,
-                        reconnect_at: None,
-                        reconnect_backoff_secs: if is_auto_reconnect { prev_backoff } else { 2 },
-                    },
-                );
-
-                let effective_max_scale = st.effective_max_scale(profile.max_scale);
-                std::thread::spawn(move || {
-                    let res = (|| -> anyhow::Result<ConnectResult> {
-                        let uri = ssh_bootstrap(
-                            &profile.ssh_target,
-                            profile.server_bin.as_deref(),
-                            profile.port,
-                        )?;
-                        let (server, fp, token) = parse_uri(&uri)?;
-                        let pty_socket = pty_tunnel_socket_path(&profile.ssh_target)?;
-                        let (ui_tx, ui_rx) = window::create_ui_channel();
-                        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-                        let (net_tx, net_rx) = mpsc::unbounded_channel();
-
-                        let ui_tx_net = ui_tx.clone();
-                        let pty_sock_net = pty_socket.clone();
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Builder::new_multi_thread()
-                                .enable_all()
-                                .build()
-                                .expect("tokio rt");
-                            rt.block_on(async move {
-                                if let Err(err) = quic::run_client(
-                                    server,
-                                    fp,
-                                    token,
-                                    profile.audio_enabled,
-                                    1.0,
-                                    ui_tx_net.clone(),
-                                    ctrl_rx,
-                                    Some(net_tx.clone()),
-                                    Some(pty_sock_net),
-                                )
-                                .await
-                                {
-                                    let _ = net_tx.send(LauncherNetEvent::Disconnected(Some(
-                                        err.to_string(),
-                                    )));
-                                    let _ = ui_tx_net.send(ClientUiEvent::Disconnected);
-                                }
-                            });
-                        });
-
-                        let ctrl_tx_ui = ctrl_tx.clone();
-                        std::thread::spawn(move || {
-                            let _ = window::run_event_loop(ui_rx, ctrl_tx_ui, effective_max_scale);
-                        });
-
-                        let _ = ctrl_tx.send(ControlMessage::ListApps);
-                        Ok(ConnectResult {
-                            pty_socket,
-                            ctrl_tx,
-                            ui_tx,
-                            net_rx,
-                        })
-                    })();
-                    let _ = tx.send(res.map_err(|e| e.to_string()));
-                });
-            }
-            refresh_status_bar();
-        })
-    };
-
-    let start_connect: Rc<dyn Fn(HostProfile)> = {
-        let inner = Rc::clone(&start_connect_inner);
-        Rc::new(move |profile: HostProfile| inner(profile, false))
-    };
-
     let rebuild_sidebar: Rc<dyn Fn()> = {
-        let state_cb = Rc::clone(&state);
-        let server_list_cb = server_list.clone();
-        let rebuild_grid_cb = Rc::clone(&rebuild_grid);
-        let refresh_status_bar_cb = Rc::clone(&refresh_status_bar);
-
-        let self_ref: CallbackSlot = Rc::new(RefCell::new(None));
-        let self_ref_clone = Rc::clone(&self_ref);
-
-        let cb: Rc<dyn Fn()> = Rc::new(move || {
+        let state = Rc::clone(&state);
+        let server_list = server_list.clone();
+        let apply_changes = Rc::clone(&apply_changes);
+        Rc::new(move || {
             // `remove_all` keeps the placeholder (removing every child would drop it).
-            server_list_cb.remove_all();
-            let (hosts_snap, active_snap, sessions_snap) = {
-                let st = state_cb.borrow();
-                let sessions: HashMap<String, (ConnStatus, bool)> = st
-                    .sessions
-                    .iter()
-                    .map(|(k, s)| (k.clone(), (s.status, s.auto_reconnect)))
-                    .collect();
-                (st.hosts.clone(), st.active_target.clone(), sessions)
-            };
-
-            for profile in hosts_snap {
-                let (status, auto_reconnect) = sessions_snap
-                    .get(&profile.ssh_target)
-                    .copied()
+            server_list.remove_all();
+            let st = state.borrow();
+            let sessions = &st.sessions;
+            for profile in sessions.hosts() {
+                let (status, wants_connection) = sessions
+                    .session(&profile.ssh_target)
+                    .map(|s| (s.status, s.wants_connection()))
                     .unwrap_or((ConnStatus::Disconnected, false));
 
                 let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1168,40 +941,14 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                     .focus_on_click(false)
                     .valign(gtk::Align::Center)
                     .css_classes(["flat", "circular"])
-                    .visible(status != ConnStatus::Disconnected || auto_reconnect)
+                    .visible(wants_connection)
                     .build();
                 let dc_target = profile.ssh_target.clone();
-                let state_dc = Rc::clone(&state_cb);
-                let self_ref_dc = Rc::clone(&self_ref_clone);
-                let refresh_dc = Rc::clone(&refresh_status_bar_cb);
-                let grid_dc = Rc::clone(&rebuild_grid_cb);
+                let state_dc = Rc::clone(&state);
+                let apply_dc = Rc::clone(&apply_changes);
                 dc_btn.connect_clicked(move |_| {
-                    {
-                        let mut st = state_dc.borrow_mut();
-                        if let Some(sess) = st.sessions.get_mut(&dc_target) {
-                            if let Some(tx) = sess.ui_tx.take() {
-                                let _ = tx.send(ClientUiEvent::Disconnected);
-                            }
-                            sess.status = ConnStatus::Disconnected;
-                            sess.auto_reconnect = false;
-                            sess.reconnect_at = None;
-                            sess.reconnect_backoff_secs = 2;
-                            sess.error = None;
-                            sess.ctrl_tx = None;
-                            sess.net_rx = None;
-                            sess.connect_rx = None;
-                            sess.apps.clear();
-                            sess.apps_loaded = false;
-                            sess.programs.clear();
-                            sess.rtt_ms = None;
-                            sess.congested = false;
-                        }
-                    }
-                    if let Some(f) = self_ref_dc.borrow().as_ref() {
-                        f();
-                    }
-                    grid_dc();
-                    refresh_dc();
+                    let changes = state_dc.borrow_mut().sessions.disconnect(&dc_target);
+                    apply_dc(changes);
                 });
 
                 row_box.append(&dot);
@@ -1212,54 +959,59 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 row.set_child(Some(&row_box));
                 row.set_widget_name(&profile.ssh_target);
                 row.set_tooltip_text(Some(&profile.ssh_target));
-                server_list_cb.append(&row);
+                server_list.append(&row);
 
-                if active_snap.as_deref() == Some(&profile.ssh_target) {
-                    server_list_cb.select_row(Some(&row));
+                if sessions.active_target() == Some(profile.ssh_target.as_str()) {
+                    server_list.select_row(Some(&row));
                 }
             }
-        });
-
-        *self_ref.borrow_mut() = Some(Rc::clone(&cb));
-
-        server_list.connect_row_activated({
-            let state = Rc::clone(&state);
-            let start_connect = Rc::clone(&start_connect);
-            let rebuild_grid = Rc::clone(&rebuild_grid);
-            let search_entry = search_entry.clone();
-            let refresh_status_bar = Rc::clone(&refresh_status_bar);
-            let split_view = split_view.clone();
-            let cb = Rc::clone(&cb);
-            move |_, row| {
-                let target = row.widget_name().to_string();
-                let profile = state
-                    .borrow()
-                    .hosts
-                    .iter()
-                    .find(|h| h.ssh_target == target)
-                    .cloned();
-                if let Some(p) = profile {
-                    start_connect(p);
-                    cb();
-                    rebuild_grid();
-                    refresh_status_bar();
-                    split_view.set_show_content(true);
-                    search_entry.grab_focus();
-                }
-            }
-        });
-
-        cb
+        })
     };
+
+    server_list.connect_row_activated({
+        let state = Rc::clone(&state);
+        let apply_changes = Rc::clone(&apply_changes);
+        let search_entry = search_entry.clone();
+        let split_view = split_view.clone();
+        move |_, row| {
+            let target = row.widget_name();
+            let changes = state.borrow_mut().sessions.connect(&target);
+            if changes != Changes::NONE {
+                apply_changes(changes);
+                split_view.set_show_content(true);
+                search_entry.grab_focus();
+            }
+        }
+    });
+
+    // Every view now exists; route `Changes` to the refreshers they name.
+    *apply_slot.borrow_mut() = Some({
+        let rebuild_sidebar = Rc::clone(&rebuild_sidebar);
+        let rebuild_grid = Rc::clone(&rebuild_grid);
+        let refresh_net_status = Rc::clone(&refresh_net_status);
+        let refresh_programs_ui = Rc::clone(&refresh_programs_ui);
+        Rc::new(move |changes: Changes| {
+            if changes.hosts {
+                rebuild_sidebar();
+            }
+            if changes.apps {
+                rebuild_grid();
+            }
+            if changes.status {
+                refresh_net_status();
+            }
+            if changes.programs {
+                refresh_programs_ui();
+            }
+        })
+    });
 
     // --- Window actions ---
     let manage_action = gio::SimpleAction::new("manage-connections", None);
     manage_action.connect_activate({
         let window = window.clone();
         let state = Rc::clone(&state);
-        let rebuild_sidebar = Rc::clone(&rebuild_sidebar);
-        let rebuild_grid = Rc::clone(&rebuild_grid);
-        let refresh_status_bar = Rc::clone(&refresh_status_bar);
+        let apply_changes = Rc::clone(&apply_changes);
         move |_, _| {
             open_manage_connections_dialog(ManageCtx {
                 window: window.clone(),
@@ -1272,9 +1024,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                     .build(),
                 saved_rows: Rc::new(RefCell::new(Vec::new())),
                 state: Rc::clone(&state),
-                rebuild_sidebar: Rc::clone(&rebuild_sidebar),
-                rebuild_grid: Rc::clone(&rebuild_grid),
-                refresh_status_bar: Rc::clone(&refresh_status_bar),
+                apply_changes: Rc::clone(&apply_changes),
             });
         }
     });
@@ -1531,29 +1281,19 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     // --- New Terminal split button ---
     let launch_terminal_with = Rc::new({
         let state = Rc::clone(&state);
-        let refresh_status_bar = Rc::clone(&refresh_status_bar);
         let search_entry = search_entry.clone();
         let toasts = toasts.clone();
         move |terminal: Option<&str>| {
-            let sock_path = state
-                .borrow()
-                .active_session()
-                .and_then(|sess| sess.pty_socket.clone());
-            if let Some(sock_path) = sock_path {
-                // Server PtyManager announces this persistent PTY via AppState.
-                if let Err(err) =
-                    spawn_local_terminal_pty_socket_with_terminal(&sock_path, None, None, terminal)
-                {
-                    tracing::warn!(
-                        error = %err,
-                        ?terminal,
-                        "failed to launch local terminal for remote PTY"
-                    );
-                    show_toast(&toasts, &format!("Couldn't open a terminal: {err}"));
-                }
+            // The server announces the new persistent PTY back as a program.
+            if let Err(err) = state.borrow().sessions.open_terminal(terminal) {
+                tracing::warn!(
+                    error = %err,
+                    ?terminal,
+                    "failed to launch local terminal for remote PTY"
+                );
+                show_toast(&toasts, &format!("Couldn't open a terminal: {err}"));
             }
             search_entry.grab_focus();
-            refresh_status_bar();
         }
     });
 
@@ -1722,197 +1462,36 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 return;
             }
             populate_term_menu();
-            let connected = state
-                .borrow()
-                .active_session()
-                .is_some_and(|s| s.status == ConnStatus::Connected);
+            let connected = state.borrow().sessions.is_active_connected();
             if !(connected && try_focus(&search_entry)) {
                 focus_server_list(&server_list);
             }
         }
     });
 
-    // --- 50ms poll: SSH connect results, QUIC LauncherNetEvents, auto-reconnect, PTY exits ---
-    glib::timeout_add_local(Duration::from_millis(50), {
-        let state = Rc::clone(&state);
-        let rebuild_sidebar = Rc::clone(&rebuild_sidebar);
-        let rebuild_grid = Rc::clone(&rebuild_grid);
-        let refresh_net_status = Rc::clone(&refresh_net_status);
-        let refresh_programs_ui = Rc::clone(&refresh_programs_ui);
-        let start_connect_inner = Rc::clone(&start_connect_inner);
-
-        move || {
-            let mut sidebar_dirty = false;
-            let mut grid_dirty = false;
-            let mut net_dirty = false;
-            let mut programs_dirty = false;
-            let mut profiles_to_reconnect: Vec<HostProfile> = Vec::new();
-
-            {
-                let mut st = state.borrow_mut();
-                let active_key = st.active_target.clone();
-                let hosts_copy = st.hosts.clone();
-                let now = Instant::now();
-                for (key, sess) in st.sessions.iter_mut() {
-                    let is_active = active_key.as_deref() == Some(key.as_str());
-                    let schedule_reconnect = |sess: &mut HostSession| {
-                        let delay = sess.reconnect_backoff_secs;
-                        sess.reconnect_at = Some(now + Duration::from_secs(delay));
-                        sess.reconnect_backoff_secs = (delay * 2).min(15);
-                        sess.error = Some(format!("Reconnecting in {delay}s…"));
-                    };
-
-                    if let Some(rx) = sess.connect_rx.take() {
-                        match rx.try_recv() {
-                            Ok(Ok(res)) => {
-                                sess.status = ConnStatus::Connected;
-                                sess.error = None;
-                                sess.auto_reconnect = true;
-                                sess.reconnect_at = None;
-                                sess.reconnect_backoff_secs = 2;
-                                sess.pty_socket = Some(res.pty_socket);
-                                sess.ctrl_tx = Some(res.ctrl_tx);
-                                sess.ui_tx = Some(res.ui_tx);
-                                sess.net_rx = Some(res.net_rx);
-                                sidebar_dirty = true;
-                                if is_active {
-                                    net_dirty = true;
-                                    programs_dirty = true;
-                                }
-                            }
-                            Ok(Err(err)) => {
-                                sess.status = ConnStatus::Disconnected;
-                                if sess.auto_reconnect {
-                                    schedule_reconnect(sess);
-                                } else {
-                                    sess.error = Some(err);
-                                }
-                                sidebar_dirty = true;
-                                net_dirty |= is_active;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                sess.connect_rx = Some(rx);
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                sess.status = ConnStatus::Disconnected;
-                                if sess.auto_reconnect {
-                                    schedule_reconnect(sess);
-                                }
-                                sidebar_dirty = true;
-                                net_dirty |= is_active;
-                            }
-                        }
-                    }
-
-                    let mut disconnected_err: Option<Option<String>> = None;
-                    if let Some(net_rx) = sess.net_rx.as_mut() {
-                        while let Ok(ev) = net_rx.try_recv() {
-                            match ev {
-                                LauncherNetEvent::AppList(apps) => {
-                                    sess.apps = apps;
-                                    sess.apps_loaded = true;
-                                    grid_dirty |= is_active;
-                                }
-                                LauncherNetEvent::AppState {
-                                    launch_id,
-                                    name,
-                                    state: new_state,
-                                } => {
-                                    if matches!(new_state, LaunchState::Exited(_)) {
-                                        sess.programs.retain(|p| p.launch_id != launch_id);
-                                    } else if let Some(p) =
-                                        sess.programs.iter_mut().find(|p| p.launch_id == launch_id)
-                                    {
-                                        p.name = name;
-                                        p.state = new_state;
-                                    } else {
-                                        sess.programs.push(TrackedProgram {
-                                            launch_id,
-                                            name,
-                                            state: new_state,
-                                            term_sent: false,
-                                            pty_child: None,
-                                        });
-                                    }
-                                    programs_dirty |= is_active;
-                                }
-                                LauncherNetEvent::NetStats { rtt_ms, congested } => {
-                                    sess.rtt_ms = Some(rtt_ms);
-                                    sess.congested = congested;
-                                    net_dirty |= is_active;
-                                }
-                                LauncherNetEvent::Disconnected(err) => {
-                                    disconnected_err = Some(err);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(err) = disconnected_err {
-                        sess.status = ConnStatus::Disconnected;
-                        sess.ctrl_tx = None;
-                        sess.rtt_ms = None;
-                        sess.congested = false;
-                        sess.programs.clear();
-                        if sess.auto_reconnect {
-                            schedule_reconnect(sess);
-                        } else {
-                            sess.error = err;
-                        }
-                        sidebar_dirty = true;
-                        if is_active {
-                            net_dirty = true;
-                            programs_dirty = true;
-                        }
-                    }
-
-                    if sess.auto_reconnect
-                        && sess.status == ConnStatus::Disconnected
-                        && sess.connect_rx.is_none()
-                        && sess.reconnect_at.is_some_and(|t| now >= t)
-                    {
-                        sess.reconnect_at = None;
-                        if let Some(profile) =
-                            hosts_copy.iter().find(|h| h.ssh_target == *key).cloned()
-                        {
-                            profiles_to_reconnect.push(profile);
-                        }
-                    }
-
-                    let before = sess.programs.len();
-                    sess.programs.retain_mut(|p| match p.pty_child.as_mut() {
-                        Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
-                        None => true,
-                    });
-                    programs_dirty |= sess.programs.len() != before && is_active;
-                }
-            }
-
-            for profile in profiles_to_reconnect {
-                start_connect_inner(profile, true);
-                sidebar_dirty = true;
-            }
-
-            if sidebar_dirty {
-                rebuild_sidebar();
-            }
-            if grid_dirty {
-                rebuild_grid();
-            }
-            if net_dirty {
-                refresh_net_status();
-            }
-            if programs_dirty {
-                refresh_programs_ui();
-            }
-
-            glib::ControlFlow::Continue
-        }
-    });
+    // --- Session events: applied on the main loop as they arrive (no polling) ---
+    glib::spawn_future_local(pump_session_events(
+        session_events,
+        Rc::clone(&state),
+        apply_changes,
+    ));
 
     rebuild_sidebar();
     refresh_status_bar();
     window.present();
     focus_server_list(&server_list);
+}
+
+/// Feed background session events to the manager and refresh the affected views.
+async fn pump_session_events(
+    mut events: SessionEvents,
+    state: Rc<RefCell<AppUi>>,
+    apply_changes: ApplyChanges,
+) {
+    while let Some(event) = events.recv().await {
+        let changes = state.borrow_mut().sessions.handle_event(event);
+        apply_changes(changes);
+    }
 }
 
 // --- Preferences dialog ---------------------------------------------------------------
@@ -1929,18 +1508,13 @@ fn open_preferences_dialog(window: &adw::ApplicationWindow, state: Rc<RefCell<Ap
         .title("Render Scale Cap")
         .subtitle("Upper limit for HiDPI rendering of remote windows")
         .model(&gtk::StringList::new(&SCALE_CAP_LABELS))
-        .selected(state.borrow().global_max_scale.to_index() as u32)
+        .selected(state.borrow().sessions.global_max_scale().to_index() as u32)
         .build();
     scale_row.connect_selected_notify({
         let state = Rc::clone(&state);
         move |row| {
             let cap = RenderScaleCap::from_index(row.selected() as usize);
-            let mut st = state.borrow_mut();
-            if st.global_max_scale != cap {
-                st.global_max_scale = cap;
-                let _ = save_client_settings(&ClientSettings { max_scale: cap });
-                st.broadcast_max_scale();
-            }
+            state.borrow_mut().sessions.set_global_max_scale(cap);
         }
     });
     display_group.add(&scale_row);
@@ -2089,9 +1663,7 @@ struct ManageCtx {
     saved_group: adw::PreferencesGroup,
     saved_rows: Rc<RefCell<Vec<adw::ExpanderRow>>>,
     state: Rc<RefCell<AppUi>>,
-    rebuild_sidebar: Rc<dyn Fn()>,
-    rebuild_grid: Rc<dyn Fn()>,
-    refresh_status_bar: Rc<dyn Fn()>,
+    apply_changes: ApplyChanges,
 }
 
 fn port_row(port: u16) -> adw::SpinRow {
@@ -2133,7 +1705,7 @@ fn open_manage_connections_dialog(ctx: ManageCtx) {
     let add_target = adw::EntryRow::builder()
         .title("SSH Target (user@host)")
         .build();
-    let add_port = port_row(DEFAULT_PORT);
+    let add_port = port_row(DEFAULT_QUIC_PORT);
     let add_bin = adw::EntryRow::builder()
         .title("Server Binary (optional)")
         .build();
@@ -2170,20 +1742,21 @@ fn open_manage_connections_dialog(ctx: ManageCtx) {
                 audio_enabled: true,
                 max_scale: RenderScaleCap::option_from_index(add_scale.selected() as usize),
             };
-            {
-                let mut st = ctx.state.borrow_mut();
-                st.hosts.retain(|h| h.ssh_target != target);
-                st.hosts.push(profile);
-                let _ = save_hosts(&st.hosts);
-            }
+            let added = ctx.state.borrow_mut().sessions.add_host(profile);
+            let changes = match added {
+                Ok(changes) => changes,
+                Err(err) => {
+                    show_dialog_toast(&ctx.dialog, &err.to_string());
+                    return;
+                }
+            };
             add_label.set_text("");
             add_target.set_text("");
             add_bin.set_text("");
-            add_port.set_value(f64::from(DEFAULT_PORT));
+            add_port.set_value(f64::from(DEFAULT_QUIC_PORT));
             add_scale.set_selected(0);
             populate_saved_connections(&ctx);
-            (ctx.rebuild_sidebar)();
-            (ctx.refresh_status_bar)();
+            (ctx.apply_changes)(changes);
             ctx.dialog.add_toast(
                 adw::Toast::builder()
                     .title(format!("Added “{label}”"))
@@ -2208,7 +1781,7 @@ fn open_manage_connections_dialog(ctx: ManageCtx) {
     ctx.dialog.add(&page);
     ctx.dialog.present(Some(&ctx.window));
 
-    if ctx.state.borrow().hosts.is_empty() {
+    if ctx.state.borrow().sessions.hosts().is_empty() {
         let add_target = add_target.clone();
         glib::idle_add_local_once(move || {
             add_target.grab_focus();
@@ -2220,7 +1793,7 @@ fn populate_saved_connections(ctx: &ManageCtx) {
     for row in ctx.saved_rows.borrow_mut().drain(..) {
         ctx.saved_group.remove(&row);
     }
-    let hosts = ctx.state.borrow().hosts.clone();
+    let hosts = ctx.state.borrow().sessions.hosts().to_vec();
     ctx.saved_group
         .set_description(hosts.is_empty().then_some("No saved connections yet."));
     for profile in &hosts {
@@ -2269,7 +1842,7 @@ fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::Expander
     expander.add_row(&bin_row);
     expander.add_row(&scale_row);
 
-    // The host's key in `AppUi::hosts`/`sessions`; follows SSH target edits.
+    // The host's key in the session manager; follows SSH target edits.
     let current_target = Rc::new(RefCell::new(profile.ssh_target.clone()));
 
     let save: Rc<dyn Fn()> = Rc::new({
@@ -2282,67 +1855,37 @@ fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::Expander
         let scale_row = scale_row.clone();
         let current_target = Rc::clone(&current_target);
         move || {
-            let new_target = target_row.text().trim().to_string();
             let orig_target = current_target.borrow().clone();
-            let target_changed = new_target != orig_target;
-            let duplicate = target_changed
-                && ctx
-                    .state
-                    .borrow()
-                    .hosts
-                    .iter()
-                    .any(|h| h.ssh_target == new_target);
-            if new_target.is_empty() || duplicate {
-                target_row.add_css_class("error");
-                if duplicate {
-                    ctx.dialog.add_toast(
-                        adw::Toast::builder()
-                            .title("Another connection already uses that SSH target")
-                            .use_markup(false)
-                            .build(),
-                    );
-                }
+            let Some(mut profile) = ctx.state.borrow().sessions.host(&orig_target).cloned() else {
                 return;
-            }
-            target_row.remove_css_class("error");
+            };
+            profile.ssh_target = target_row.text().trim().to_string();
+            profile.label = optional_text(&label_row).unwrap_or_else(|| profile.ssh_target.clone());
+            profile.port = port.value() as u16;
+            profile.server_bin = optional_text(&bin_row);
+            profile.max_scale = RenderScaleCap::option_from_index(scale_row.selected() as usize);
+            let (new_label, new_target) = (profile.label.clone(), profile.ssh_target.clone());
 
-            let new_label = optional_text(&label_row).unwrap_or_else(|| new_target.clone());
-            let new_max_scale = RenderScaleCap::option_from_index(scale_row.selected() as usize);
-            {
-                let mut st = ctx.state.borrow_mut();
-                if let Some(h) = st.hosts.iter_mut().find(|h| h.ssh_target == orig_target) {
-                    h.label = new_label.clone();
-                    h.ssh_target = new_target.clone();
-                    h.port = port.value() as u16;
-                    h.server_bin = optional_text(&bin_row);
-                    h.max_scale = new_max_scale;
-                }
-                if target_changed {
-                    if let Some(sess) = st.sessions.remove(&orig_target) {
-                        if let Some(tx) = sess.ui_tx {
-                            let _ = tx.send(ClientUiEvent::Disconnected);
-                        }
+            let updated = ctx
+                .state
+                .borrow_mut()
+                .sessions
+                .update_host(&orig_target, profile);
+            let changes = match updated {
+                Ok(changes) => changes,
+                Err(err) => {
+                    target_row.add_css_class("error");
+                    if err == HostEditError::DuplicateTarget {
+                        show_dialog_toast(&ctx.dialog, &err.to_string());
                     }
-                    if st.active_target.as_deref() == Some(&orig_target) {
-                        st.active_target = Some(new_target.clone());
-                    }
-                } else if let Some(tx) =
-                    st.sessions.get(&orig_target).and_then(|s| s.ui_tx.as_ref())
-                {
-                    let cap = st.effective_max_scale(new_max_scale);
-                    let _ = tx.send(ClientUiEvent::SetMaxScale { cap });
+                    return;
                 }
-                let _ = save_hosts(&st.hosts);
-            }
+            };
+            target_row.remove_css_class("error");
             *current_target.borrow_mut() = new_target.clone();
             expander.set_title(&new_label);
             expander.set_subtitle(&new_target);
-
-            (ctx.rebuild_sidebar)();
-            if target_changed {
-                (ctx.rebuild_grid)();
-            }
-            (ctx.refresh_status_bar)();
+            (ctx.apply_changes)(changes);
         }
     });
     for entry in [&label_row, &target_row, &bin_row] {
@@ -2383,23 +1926,9 @@ fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::Expander
                         return;
                     }
                     let target = current_target.borrow().clone();
-                    {
-                        let mut st = ctx.state.borrow_mut();
-                        st.hosts.retain(|h| h.ssh_target != target);
-                        let _ = save_hosts(&st.hosts);
-                        if let Some(sess) = st.sessions.remove(&target) {
-                            if let Some(tx) = sess.ui_tx {
-                                let _ = tx.send(ClientUiEvent::Disconnected);
-                            }
-                        }
-                        if st.active_target.as_deref() == Some(&target) {
-                            st.active_target = st.hosts.first().map(|h| h.ssh_target.clone());
-                        }
-                    }
+                    let changes = ctx.state.borrow_mut().sessions.remove_host(&target);
                     populate_saved_connections(&ctx);
-                    (ctx.rebuild_sidebar)();
-                    (ctx.rebuild_grid)();
-                    (ctx.refresh_status_bar)();
+                    (ctx.apply_changes)(changes);
                 }
             });
             confirm.present(Some(&ctx.dialog));

@@ -129,40 +129,7 @@ pub fn decode_icon_argb8888(data: &[u8], target_size: u32) -> Option<Vec<u8>> {
     decode_icon_argb8888_impl(data, target_size)
 }
 
-#[cfg(feature = "qt")]
-extern "C" {
-    fn rw_qt_decode_icon_argb8888(
-        data: *const u8,
-        len: usize,
-        target_size: u32,
-        out_buf: *mut u8,
-        out_len: usize,
-    ) -> bool;
-}
-
-#[cfg(feature = "qt")]
-fn decode_icon_argb8888_impl(data: &[u8], target_size: u32) -> Option<Vec<u8>> {
-    let byte_len = (target_size as usize)
-        .checked_mul(target_size as usize)?
-        .checked_mul(4)?;
-    let mut out = vec![0u8; byte_len];
-    let ok = unsafe {
-        rw_qt_decode_icon_argb8888(
-            data.as_ptr(),
-            data.len(),
-            target_size,
-            out.as_mut_ptr(),
-            out.len(),
-        )
-    };
-    if ok {
-        Some(out)
-    } else {
-        None
-    }
-}
-
-#[cfg(all(feature = "gtk4", not(feature = "qt")))]
+#[cfg(feature = "gtk4")]
 fn decode_icon_argb8888_impl(data: &[u8], target_size: u32) -> Option<Vec<u8>> {
     use gtk4::gdk_pixbuf::{prelude::PixbufLoaderExt, InterpType, PixbufLoader};
 
@@ -209,12 +176,12 @@ fn decode_icon_argb8888_impl(data: &[u8], target_size: u32) -> Option<Vec<u8>> {
     rgba_to_centered_argb8888(pixels, w, h, channels, rowstride, target_size as usize)
 }
 
-#[cfg(not(any(feature = "qt", feature = "gtk4")))]
+#[cfg(not(feature = "gtk4"))]
 fn decode_icon_argb8888_impl(_data: &[u8], _target_size: u32) -> Option<Vec<u8>> {
     None
 }
 
-#[cfg(any(all(feature = "gtk4", not(feature = "qt")), test))]
+#[cfg(any(feature = "gtk4", test))]
 fn rgba_to_centered_argb8888(
     src: &[u8],
     w: usize,
@@ -343,7 +310,7 @@ mod tests {
         assert!(rgba_to_centered_argb8888(&[255, 0], 2, 1, 4, 8, 4).is_none());
     }
 
-    #[cfg(any(feature = "qt", feature = "gtk4"))]
+    #[cfg(feature = "gtk4")]
     #[test]
     fn decode_icon_argb8888_decodes_png_and_preserves_aspect_ratio() {
         // Minimal valid 1x1 opaque red (#FF0000) PNG

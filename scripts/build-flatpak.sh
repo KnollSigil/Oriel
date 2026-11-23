@@ -13,7 +13,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-flatpak.sh [OPTIONS]
 
-Build the Oriel (RemoteWayland client, Qt) Flatpak.
+Build the Oriel (RemoteWayland client, GTK4/libadwaita) Flatpak.
 
 Options:
   --arch <x86_64|aarch64>  Target architecture (default: host). Non-host arches
@@ -52,9 +52,9 @@ fi
 
 if [[ "${INSTALL_DEPS}" -eq 1 ]]; then
     flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-    for ref in org.kde.Platform//6.11 org.kde.Sdk//6.11 \
-               org.freedesktop.Sdk.Extension.rust-stable//25.08 \
-               org.freedesktop.Sdk.Extension.llvm21//25.08; do
+    for ref in org.gnome.Platform//51 org.gnome.Sdk//51 \
+               org.freedesktop.Sdk.Extension.rust-stable//26.08 \
+               org.freedesktop.Sdk.Extension.llvm22//26.08; do
         flatpak install --user -y --noninteractive --arch="${ARCH}" flathub "${ref}"
     done
 fi

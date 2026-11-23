@@ -7,10 +7,6 @@ license.workspace = true
 [features]
 default = ["gtk4"]
 gtk4 = ["dep:gtk4", "dep:adw"]
-qt = ["dep:qtbridge", "dep:cc"]
-
-[build-dependencies]
-cc = { version = "1", optional = true }
 
 [dependencies]
 anyhow.workspace = true
@@ -18,7 +14,6 @@ clap.workspace = true
 gtk4 = { version = "0.9", optional = true, features = ["v4_12"] }
 # libadwaita 1.5 is the oldest supported (Ubuntu 24.04).
 adw = { package = "libadwaita", version = "0.7", optional = true, features = ["v1_5"] }
-qtbridge = { version = "0.4", optional = true }
 libc.workspace = true
 lz4_flex.workspace = true
 opus.workspace = true

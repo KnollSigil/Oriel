@@ -1,10 +1,11 @@
 app-id: dev.knoll.Oriel
-runtime: org.kde.Platform
-runtime-version: '6.11'
-sdk: org.kde.Sdk
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-  - org.freedesktop.Sdk.Extension.llvm21
+  # libclang for bindgen (pipewire-sys)
+  - org.freedesktop.Sdk.Extension.llvm22
 command: remotewayland-client
 
 finish-args:
@@ -26,13 +27,11 @@ finish-args:
   - --talk-name=org.freedesktop.Flatpak
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
   env:
     CARGO_HOME: /run/build/remotewayland/cargo
     CARGO_NET_OFFLINE: 'true'
-    # qtbridge / qt-build-utils locate Qt through qmake
-    QMAKE: /usr/bin/qmake
-    LIBCLANG_PATH: /usr/lib/sdk/llvm21/lib
+    LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
   arch:
     aarch64:
       env:
@@ -47,33 +46,15 @@ modules:
       env:
         RUSTFLAGS: ''
         # flatpak-builder sets SOURCE_DATE_EPOCH to the current timestamp on every
-        # run, which invalidates every cc-rs build script (ring, cxx, qtbridge, etc.).
+        # run, which invalidates every cc-rs build script (ring, etc.).
         SOURCE_DATE_EPOCH: '1700000000'
     build-commands:
       - |
         set -e
-        # qt-build-utils probes <QT_HOST_LIBEXECS>/qtpaths first, which does not
-        # exist in the KDE SDK (qtpaths lives in /usr/bin). Under qemu-user a
-        # missing file "executes" with status 127 instead of failing, which makes
-        # the probe wrongly succeed on aarch64. Point libexec queries at a dir
-        # that really contains qtpaths via a small qmake wrapper.
-        mkdir -p /tmp/qt-shim
-        ln -sf "$(/usr/bin/qmake -query QT_HOST_LIBEXECS)"/* /tmp/qt-shim/
-        ln -sf /usr/bin/qtpaths /tmp/qt-shim/qtpaths
-        cat > /tmp/qt-shim/qmake <<'WRAP'
-        #!/bin/sh
-        case "$2" in
-          QT_HOST_LIBEXECS|QT_HOST_LIBEXECS/get) echo /tmp/qt-shim ;;
-          *) exec /usr/bin/qmake "$@" ;;
-        esac
-        WRAP
-        chmod +x /tmp/qt-shim/qmake
-        export QMAKE=/tmp/qt-shim/qmake
         # Normalize vendored crate timestamps so Cargo does not re-run build.rs
         # and recompile C/C++ crates when flatpak-builder re-extracts sources.
         find "${CARGO_HOME}/vendor" -exec touch -h -d '2020-01-01T00:00:00Z' {} +
-        cargo --offline build --release -p remotewayland-client \
-          --no-default-features --features qt
+        cargo --offline build --release -p remotewayland-client
       - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/remotewayland-client"
         /app/bin/remotewayland-client
       - install -Dm644 packaging/flatpak/dev.knoll.Oriel.desktop

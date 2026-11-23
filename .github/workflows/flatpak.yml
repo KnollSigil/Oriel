@@ -33,9 +33,9 @@ jobs:
         run: |
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y --noninteractive flathub \
-            org.kde.Platform//6.11 org.kde.Sdk//6.11 \
-            org.freedesktop.Sdk.Extension.rust-stable//25.08 \
-            org.freedesktop.Sdk.Extension.llvm21//25.08
+            org.gnome.Platform//51 org.gnome.Sdk//51 \
+            org.freedesktop.Sdk.Extension.rust-stable//26.08 \
+            org.freedesktop.Sdk.Extension.llvm22//26.08
       - name: Build
         run: ./scripts/build-flatpak.sh --arch ${{ matrix.arch }}
       - uses: actions/upload-artifact@v7

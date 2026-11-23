@@ -170,8 +170,10 @@ pub async fn connect_and_auth(
 
 /// Events sent from the QUIC client to the launcher UI.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(any(feature = "gtk4", feature = "qt")), allow(dead_code))]
+#[cfg_attr(not(feature = "gtk4"), allow(dead_code))]
 pub enum LauncherNetEvent {
+    /// The QUIC handshake and authentication succeeded. Always the first event.
+    Connected,
     AppList(Vec<RemoteAppEntry>),
     AppState {
         launch_id: u64,
@@ -205,6 +207,13 @@ pub async fn run_client(
         initial_scale,
     )
     .await?;
+    if let Some(tx) = &launcher_tx {
+        let _ = tx.send(LauncherNetEvent::Connected);
+    }
+
+    // Per-stream tasks live in `JoinSet`s owned by their accept loops, so aborting an accept
+    // loop on shutdown also aborts every stream it spawned (the runtime may be shared with
+    // other connections and outlive this one).
 
     // Optional local 0600 Unix socket that tunnels `remotewayland-client pty-attach --socket <path>`
     // directly over multiplexed QUIC bidirectional streams on this authenticated connection.
@@ -218,22 +227,24 @@ pub async fn run_client(
                 info!(path = %sock_path.display(), "local PTY Unix tunnel listening (mode 0600)");
                 let tunnel_conn = conn.clone();
                 Some(tokio::spawn(async move {
+                    let mut streams = tokio::task::JoinSet::new();
                     while let Ok((unix_stream, _)) = listener.accept().await {
+                        while streams.try_join_next().is_some() {}
                         let c = tunnel_conn.clone();
-                        tokio::spawn(async move {
+                        streams.spawn(async move {
                             let Ok((mut quic_send, mut quic_recv)) = c.open_bi().await else {
                                 warn!("failed to open QUIC bidi stream for tunneled PTY");
                                 return;
                             };
                             let (mut unix_read, mut unix_write) = unix_stream.into_split();
-                            let up = tokio::spawn(async move {
+                            let up = async {
                                 let _ = tokio::io::copy(&mut unix_read, &mut quic_send).await;
                                 let _ = quic_send.finish();
-                            });
-                            let down = tokio::spawn(async move {
+                            };
+                            let down = async {
                                 let _ = tokio::io::copy(&mut quic_recv, &mut unix_write).await;
-                            });
-                            let _ = tokio::join!(up, down);
+                            };
+                            tokio::join!(up, down);
                         });
                     }
                 }))
@@ -308,10 +319,12 @@ pub async fn run_client(
     let uni_tx = ui_tx.clone();
     let uni_ack_tx = frame_ack_tx.clone();
     let uni_task = tokio::spawn(async move {
+        let mut streams = tokio::task::JoinSet::new();
         while let Ok(mut recv_uni) = uni_conn.accept_uni().await {
+            while streams.try_join_next().is_some() {}
             let tx = uni_tx.clone();
             let ack_tx = uni_ack_tx.clone();
-            tokio::spawn(async move {
+            streams.spawn(async move {
                 match read_stream_header(&mut recv_uni).await {
                     Ok(StreamHeader::Video { window_id, codec }) => {
                         let mut decoder = Some(WindowVideoDecoder::new(codec));

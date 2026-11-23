@@ -6,7 +6,7 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 
 - **`remotewayland-proto`**: Shared wire protocol, stream framing, and ephemeral TLS/token handshake types.
 - **`remotewayland-server`**: Headless Wayland compositor (`smithay`) with embedded `Xwayland` (`X11Wm`) for remote X11 apps, pure-Rust XOR-delta + LZ4 video encoder, isolated PipeWire/PulseAudio virtual sink/source bridge, and QUIC server.
-- **`remotewayland-client`**: Rootless multi-window & unbounded `xdg_popup` Wayland client (`smithay-client-toolkit`), pure-Rust LZ4 delta decoder, and local PipeWire/PulseAudio bridge.
+- **`remotewayland-client`**: Rootless multi-window & unbounded `xdg_popup` Wayland client (`smithay-client-toolkit`), pure-Rust LZ4 delta decoder, local PipeWire/PulseAudio bridge, and a GTK4/libadwaita launcher. Launcher connection logic lives in the toolkit-independent `session` module; the GTK front-end only renders it.
 
 ## System Dependencies
 
@@ -15,21 +15,16 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-utils xorg-x11-server-Xwayland
 ```
 
-The default client launcher is built with GTK4 and libadwaita (1.5+):
+The client launcher is built with GTK4 and libadwaita (1.5+); build with
+`--no-default-features` for a terminal-only launcher instead:
 ```bash
 sudo dnf install libadwaita-devel
-```
-
-The optional Qt Quick launcher (`--features qt`, Qt 6.10+) uses KDE Kirigami at runtime; it is
-already present on Plasma and in the `org.kde.Platform` Flatpak runtime:
-```bash
-sudo dnf install kf6-kirigami
 ```
 
 ### Ubuntu / Debian
 ```bash
 sudo apt install libwayland-dev libxkbcommon-dev pulseaudio-utils xwayland
-# Default GTK4/libadwaita launcher
+# GTK4/libadwaita launcher
 sudo apt install libgtk-4-dev libadwaita-1-dev
 ```
 
@@ -48,14 +43,21 @@ cargo test -p remotewayland-proto
 Using `podman` (or `docker`) with `qemu-aarch64-static` via [`scripts/build-aarch64.sh`](scripts/build-aarch64.sh):
 
 ```bash
-# Build workspace with GTK4/libadwaita launcher (Ubuntu 24.04 arm64, default)
+# Build workspace with GTK4/libadwaita launcher (default)
 ./scripts/build-aarch64.sh
 
-# Build client with Qt Quick/QML launcher (Fedora 44 arm64 for Qt 6.10+)
-./scripts/build-aarch64.sh --qt --client-only
-
-# Build without GUI launcher (Ubuntu 24.04 arm64)
+# Build client without GUI launcher
 ./scripts/build-aarch64.sh --no-gui --client-only
 ```
 
-Outputs are written to `target/aarch64-unknown-linux-gnu/release/` (Ubuntu 24.04) or `target/aarch64-fedora/aarch64-unknown-linux-gnu/release/` (Fedora 44).
+Builds run in an Ubuntu 24.04 arm64 container; outputs are written to `target/aarch64-unknown-linux-gnu/release/`.
+
+### Flatpak
+
+The client ships as the `dev.knoll.Oriel` Flatpak on the GNOME 51 runtime, via
+[`scripts/build-flatpak.sh`](scripts/build-flatpak.sh):
+
+```bash
+# Install the GNOME runtime/SDK and Rust/LLVM extensions once, then build and install
+./scripts/build-flatpak.sh --install-deps --install
+```

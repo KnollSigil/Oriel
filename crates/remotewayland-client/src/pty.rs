@@ -489,6 +489,7 @@ enum InitialTabMode {
 /// under `$XDG_RUNTIME_DIR/remotewayland/` so clicking Konsole's **New Tab** button
 /// (`Ctrl+Shift+T` / `+`) opens another remote PTY on the same host by default without
 /// modifying the user's `~/.config/konsolerc` or `~/.local/share/konsole/`.
+#[cfg(not(feature = "gtk4"))]
 pub fn spawn_local_terminal_pty_socket(
     socket_path: &Path,
     pty_id: Option<u64>,
@@ -896,7 +897,7 @@ fn terminal_candidates_with(terminal_env: Option<&str>) -> Vec<String> {
     candidates
 }
 
-#[cfg(any(feature = "gtk4", feature = "qt", test))]
+#[cfg(any(feature = "gtk4", test))]
 fn terminal_candidates() -> Vec<String> {
     let env_term = std::env::var("TERMINAL").ok();
     terminal_candidates_with(env_term.as_deref())
@@ -1010,7 +1011,7 @@ fn client_attach_prefix(flatpak_id: Option<&str>) -> Result<Vec<String>> {
 }
 
 /// Return installed local terminal emulators in priority order (index 0 is the default).
-#[cfg(any(feature = "gtk4", feature = "qt", test))]
+#[cfg(any(feature = "gtk4", test))]
 pub fn available_local_terminals() -> Vec<String> {
     let candidates = terminal_candidates();
     if flatpak_app_id().is_some() {
@@ -1366,7 +1367,7 @@ mod tests {
         let sample = "\
 [Application]
 name=dev.knoll.Oriel
-runtime=runtime/org.kde.Platform/x86_64/6.11
+runtime=runtime/org.gnome.Platform/x86_64/51
 
 [Instance]
 name=other

@@ -4,7 +4,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 GUI="gtk4"
-DISTRO=""
 TARGET_SCOPE="workspace"
 PROFILE="release"
 REBUILD_IMAGE=0
@@ -13,13 +12,11 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-aarch64.sh [OPTIONS]
 
-Build RemoteWayland for aarch64-unknown-linux-gnu inside an arm64 container.
+Build RemoteWayland for aarch64-unknown-linux-gnu inside an arm64 Ubuntu 24.04 container.
 
 Options:
-  --gtk4             Build client with GTK4 launcher (default, uses Ubuntu 24.04)
-  --qt               Build client with Qt Quick/QML launcher (uses Fedora 44 for Qt 6.10+)
+  --gtk4             Build client with GTK4/libadwaita launcher (default)
   --no-gui           Build client without GUI launcher (--no-default-features)
-  --distro <name>    Container base: 'ubuntu' (24.04) or 'fedora' (44)
   --client-only      Build only remotewayland-client
   --server-only      Build only remotewayland-server
   --debug            Build debug profile instead of release
@@ -31,9 +28,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gtk4) GUI="gtk4"; shift ;;
-        --qt) GUI="qt"; shift ;;
         --no-gui) GUI="none"; shift ;;
-        --distro) DISTRO="$2"; shift 2 ;;
         --client-only) TARGET_SCOPE="client"; shift ;;
         --server-only) TARGET_SCOPE="server"; shift ;;
         --debug) PROFILE="debug"; shift ;;
@@ -43,30 +38,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "${DISTRO}" ]]; then
-    if [[ "${GUI}" == "qt" ]]; then
-        DISTRO="fedora"
-    else
-        DISTRO="ubuntu"
-    fi
-fi
-
-case "${DISTRO}" in
-    ubuntu)
-        IMAGE_NAME="localhost/remotewayland-aarch64-builder:latest"
-        CONTAINERFILE="${REPO_ROOT}/scripts/Containerfile.aarch64"
-        TARGET_DIR="${REPO_ROOT}/target"
-        ;;
-    fedora)
-        IMAGE_NAME="localhost/remotewayland-aarch64-fedora-builder:latest"
-        CONTAINERFILE="${REPO_ROOT}/scripts/Containerfile.aarch64-fedora"
-        TARGET_DIR="${REPO_ROOT}/target/aarch64-fedora"
-        ;;
-    *)
-        echo "Unknown distro: ${DISTRO} (expected 'ubuntu' or 'fedora')" >&2
-        exit 1
-        ;;
-esac
+IMAGE_NAME="localhost/remotewayland-aarch64-builder:latest"
+CONTAINERFILE="${REPO_ROOT}/scripts/Containerfile.aarch64"
+TARGET_DIR="${REPO_ROOT}/target"
 
 if command -v podman >/dev/null 2>&1; then
     RUNTIME=(podman --cgroup-manager=cgroupfs)
@@ -90,7 +64,6 @@ fi
 CLIENT_FEAT_FLAGS=()
 case "${GUI}" in
     gtk4) CLIENT_FEAT_FLAGS=() ;;
-    qt) CLIENT_FEAT_FLAGS=(--no-default-features --features qt) ;;
     none) CLIENT_FEAT_FLAGS=(--no-default-features) ;;
 esac
 
@@ -111,15 +84,15 @@ run_cargo() {
 }
 
 if [[ "${TARGET_SCOPE}" == "workspace" && "${GUI}" == "gtk4" ]]; then
-    echo "==> Building workspace (gtk4, ${DISTRO}, ${PROFILE}) for aarch64-unknown-linux-gnu..."
+    echo "==> Building workspace (gtk4, ${PROFILE}) for aarch64-unknown-linux-gnu..."
     run_cargo build "${PROFILE_FLAG[@]}" --workspace --target aarch64-unknown-linux-gnu
 else
     if [[ "${TARGET_SCOPE}" != "server" ]]; then
-        echo "==> Building remotewayland-client (gui=${GUI}, ${DISTRO}, ${PROFILE}) for aarch64-unknown-linux-gnu..."
+        echo "==> Building remotewayland-client (gui=${GUI}, ${PROFILE}) for aarch64-unknown-linux-gnu..."
         run_cargo build "${PROFILE_FLAG[@]}" -p remotewayland-client "${CLIENT_FEAT_FLAGS[@]}" --target aarch64-unknown-linux-gnu
     fi
     if [[ "${TARGET_SCOPE}" != "client" ]]; then
-        echo "==> Building remotewayland-server (${DISTRO}, ${PROFILE}) for aarch64-unknown-linux-gnu..."
+        echo "==> Building remotewayland-server (${PROFILE}) for aarch64-unknown-linux-gnu..."
         run_cargo build "${PROFILE_FLAG[@]}" -p remotewayland-server --target aarch64-unknown-linux-gnu
     fi
 fi

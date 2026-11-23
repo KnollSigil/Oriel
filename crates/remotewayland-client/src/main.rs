@@ -4,7 +4,7 @@
 //! renders rootless remote windows & native `xdg_popup`s via `smithay-client-toolkit`,
 //! bridges local PipeWire audio, and supports remote PTYs + GTK4/libadwaita launcher.
 
-#[cfg(all(feature = "gtk4", not(feature = "qt")))]
+#[cfg(feature = "gtk4")]
 mod adw_launcher;
 mod audio;
 mod hosts;
@@ -12,11 +12,11 @@ mod icon;
 mod launcher;
 mod media;
 mod pty;
-#[cfg(feature = "qt")]
-mod qt_launcher;
 mod quic;
-#[cfg(any(feature = "gtk4", feature = "qt", test))]
+#[cfg(any(feature = "gtk4", test))]
 mod search;
+#[cfg(any(feature = "gtk4", test))]
+mod session;
 mod window;
 
 use std::net::SocketAddr;

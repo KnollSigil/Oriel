@@ -1,27 +1,24 @@
-//! RemoteWayland launcher UI (native Qt Quick/QML when `feature = "qt"` is enabled,
-//! native GTK4/libadwaita when `feature = "gtk4"` is enabled without `qt`,
-//! with an interactive terminal fallback otherwise).
+//! RemoteWayland launcher UI: native GTK4/libadwaita with `feature = "gtk4"`, an
+//! interactive terminal fallback otherwise.
+//!
+//! GUI front-ends render state from [`crate::session::SessionManager`], which holds all
+//! toolkit-independent connection logic.
 
 use anyhow::Result;
 
 use crate::hosts::RenderScaleCap;
 
-#[cfg(feature = "qt")]
-pub fn run_launcher(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
-    crate::qt_launcher::run(cli_max_scale)
-}
-
-#[cfg(all(feature = "gtk4", not(feature = "qt")))]
+#[cfg(feature = "gtk4")]
 pub fn run_launcher(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
     crate::adw_launcher::run(cli_max_scale)
 }
 
-#[cfg(all(not(feature = "gtk4"), not(feature = "qt")))]
+#[cfg(not(feature = "gtk4"))]
 pub fn run_launcher(cli_max_scale: Option<RenderScaleCap>) -> Result<()> {
     cli_ui::run(cli_max_scale)
 }
 
-#[cfg(all(not(feature = "gtk4"), not(feature = "qt")))]
+#[cfg(not(feature = "gtk4"))]
 mod cli_ui {
     use std::io::{self, BufRead, Write};
 
