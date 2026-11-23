@@ -2,8 +2,10 @@
 //!
 //! Connects to a RemoteWayland server over QUIC (directly or SSH-bootstrapped),
 //! renders rootless remote windows & native `xdg_popup`s via `smithay-client-toolkit`,
-//! bridges local PipeWire audio, and supports remote PTYs + GTK4 launcher.
+//! bridges local PipeWire audio, and supports remote PTYs + GTK4/libadwaita launcher.
 
+#[cfg(all(feature = "gtk4", not(feature = "qt")))]
+mod adw_launcher;
 mod audio;
 mod hosts;
 mod icon;

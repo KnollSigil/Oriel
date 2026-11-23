@@ -15,6 +15,11 @@ Rootless, low-latency remote GUI Linux application streamer with video and bidir
 sudo dnf install wayland-devel libxkbcommon-devel pulseaudio-utils xorg-x11-server-Xwayland
 ```
 
+The default client launcher is built with GTK4 and libadwaita (1.5+):
+```bash
+sudo dnf install libadwaita-devel
+```
+
 The optional Qt Quick launcher (`--features qt`, Qt 6.10+) uses KDE Kirigami at runtime; it is
 already present on Plasma and in the `org.kde.Platform` Flatpak runtime:
 ```bash
@@ -24,6 +29,8 @@ sudo dnf install kf6-kirigami
 ### Ubuntu / Debian
 ```bash
 sudo apt install libwayland-dev libxkbcommon-dev pulseaudio-utils xwayland
+# Default GTK4/libadwaita launcher
+sudo apt install libgtk-4-dev libadwaita-1-dev
 ```
 
 ## Building
@@ -41,7 +48,7 @@ cargo test -p remotewayland-proto
 Using `podman` (or `docker`) with `qemu-aarch64-static` via [`scripts/build-aarch64.sh`](scripts/build-aarch64.sh):
 
 ```bash
-# Build workspace with GTK4 launcher (Ubuntu 24.04 arm64, default)
+# Build workspace with GTK4/libadwaita launcher (Ubuntu 24.04 arm64, default)
 ./scripts/build-aarch64.sh
 
 # Build client with Qt Quick/QML launcher (Fedora 44 arm64 for Qt 6.10+)
