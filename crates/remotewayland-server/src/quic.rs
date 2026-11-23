@@ -174,7 +174,10 @@ pub fn bind_endpoint(server_config: ServerConfig, listen: ListenSpec) -> Result<
     if range.start() == range.end() {
         anyhow::bail!("UDP port {range} on {} is already in use", listen.ip)
     }
-    anyhow::bail!("every UDP port in {range} on {} is already in use", listen.ip)
+    anyhow::bail!(
+        "every UDP port in {range} on {} is already in use",
+        listen.ip
+    )
 }
 
 /// How long a newly authenticated display client waits for the client it replaces to tear
@@ -1534,7 +1537,11 @@ async fn run_window_video_pipeline(
 
         // 5. Write encoded frame to the per-window QUIC stream and adapt DCT quality dynamically.
         let Ok(payload_len) = u32::try_from(frame.data.len()) else {
-            warn!(window_id, bytes = frame.data.len(), "encoded video frame exceeds u32::MAX; dropping");
+            warn!(
+                window_id,
+                bytes = frame.data.len(),
+                "encoded video frame exceeds u32::MAX; dropping"
+            );
             continue;
         };
         if frame.data.len() > MAX_VIDEO_FRAME_BYTES {
@@ -1626,8 +1633,14 @@ mod tests {
         let map = Mutex::new(HashMap::new());
         {
             let mut guard = map.lock().unwrap();
-            guard.insert("valid".to_string(), Instant::now() + Duration::from_secs(60));
-            guard.insert("expired".to_string(), Instant::now() - Duration::from_secs(1));
+            guard.insert(
+                "valid".to_string(),
+                Instant::now() + Duration::from_secs(60),
+            );
+            guard.insert(
+                "expired".to_string(),
+                Instant::now() - Duration::from_secs(1),
+            );
         }
 
         // First use of valid token succeeds; second use fails (single-use).
@@ -1688,8 +1701,19 @@ mod tests {
             assert_eq!(parsed.to_string(), display, "{input}");
             assert_eq!(display.parse::<ListenSpec>().unwrap(), spec, "{display}");
         }
-        for bad in ["", "7443", "host:7443", "0.0.0.0:", "0.0.0.0:9-1", "[::1", "[::1]7443"] {
-            assert!(bad.parse::<ListenSpec>().is_err(), "{bad:?} should not parse");
+        for bad in [
+            "",
+            "7443",
+            "host:7443",
+            "0.0.0.0:",
+            "0.0.0.0:9-1",
+            "[::1",
+            "[::1]7443",
+        ] {
+            assert!(
+                bad.parse::<ListenSpec>().is_err(),
+                "{bad:?} should not parse"
+            );
         }
     }
 

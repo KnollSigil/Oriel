@@ -860,7 +860,11 @@ pub struct SmartTileGpuEngine {
     tile_batch_bgl: wgpu::BindGroupLayout,
     tile_batch_pipeline: wgpu::ComputePipeline,
     /// Last timing breakdown `(upload_time, gpu_dispatch_and_readback_time, cpu_rle_and_scatter_time)`.
-    pub last_timing: Mutex<(std::time::Duration, std::time::Duration, std::time::Duration)>,
+    pub last_timing: Mutex<(
+        std::time::Duration,
+        std::time::Duration,
+        std::time::Duration,
+    )>,
     buffers: Mutex<GpuScratchBuffers>,
 }
 
@@ -1207,7 +1211,9 @@ impl SmartTileGpuEngine {
         width: u32,
         height: u32,
     ) -> Option<Vec<u32>> {
-        let byte_len = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        let byte_len = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
         if ref_bgra.len() != byte_len || cur_bgra.len() != byte_len || byte_len == 0 {
             return None;
         }
@@ -1280,7 +1286,8 @@ impl SmartTileGpuEngine {
         let flags_storage = sc.flags_storage.as_ref()?;
         let flags_staging = sc.flags_staging.as_ref()?;
 
-        self.queue.write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
+        self.queue
+            .write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
         self.queue.write_buffer(ref_buf, 0, ref_bgra);
         self.queue.write_buffer(cur_buf, 0, cur_bgra);
 
@@ -1425,7 +1432,8 @@ impl SmartTileGpuEngine {
         let q_staging = sc.dct_q_staging.as_ref().unwrap();
         let idct_staging = sc.dct_idct_staging.as_ref().unwrap();
 
-        self.queue.write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
+        self.queue
+            .write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
         self.queue
             .write_buffer(in_buf, 0, bytemuck::cast_slice(in_blocks));
 
@@ -1504,7 +1512,11 @@ impl SmartTileGpuEngine {
     /// Execute batched 2D 8x8 inverse IDCT on the GPU for client decoding.
     /// Each block in `dequant_blocks` has 64 dequantized `i32` coefficients (`[-32768, 32768]`).
     /// 100% bit-exact with `idct_8x8`.
-    pub fn batch_idct(&self, dequant_blocks: &[[i32; 64]], out_idct_blocks: &mut [[i32; 64]]) -> bool {
+    pub fn batch_idct(
+        &self,
+        dequant_blocks: &[[i32; 64]],
+        out_idct_blocks: &mut [[i32; 64]],
+    ) -> bool {
         let num_blocks = dequant_blocks.len();
         if num_blocks == 0 || num_blocks > 65535 || out_idct_blocks.len() != num_blocks {
             return false;
@@ -1529,7 +1541,8 @@ impl SmartTileGpuEngine {
         let idct_buf = sc.dct_idct_buf.as_ref().unwrap();
         let idct_staging = sc.dct_idct_staging.as_ref().unwrap();
 
-        self.queue.write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
+        self.queue
+            .write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
         self.queue
             .write_buffer(in_buf, 0, bytemuck::cast_slice(dequant_blocks));
 
@@ -1615,7 +1628,9 @@ impl SmartTileGpuEngine {
         if num_tiles == 0 || num_tiles > 65535 {
             return None;
         }
-        let frame_bytes = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        let frame_bytes = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
         let pred_bgra = prev_ref_full.unwrap_or(&*ref_bgra);
         if cur_bgra.len() != frame_bytes || pred_bgra.len() != frame_bytes {
             return None;
@@ -1744,7 +1759,8 @@ impl SmartTileGpuEngine {
         let recon_bytes = (num_tiles * 4096 * 4) as u64;
 
         let t_up0 = std::time::Instant::now();
-        self.queue.write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
+        self.queue
+            .write_buffer(u_buf, 0, bytemuck::bytes_of(&uniform));
         self.queue.write_buffer(cur_buf, 0, cur_bgra);
         let any_inter = descs.iter().any(|d| d.use_inter != 0);
         if any_inter {

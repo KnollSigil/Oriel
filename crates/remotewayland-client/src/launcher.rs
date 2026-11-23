@@ -90,7 +90,9 @@ mod cli_ui {
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         let (net_tx, mut net_rx) = mpsc::unbounded_channel::<LauncherNetEvent>();
 
-        let effective_max_scale = cli_max_scale.or(target.max_scale).unwrap_or(global_max_scale);
+        let effective_max_scale = cli_max_scale
+            .or(target.max_scale)
+            .unwrap_or(global_max_scale);
         let ui_tx_net = ui_tx.clone();
         let pty_sock_net = pty_sock.clone();
         std::thread::Builder::new()
@@ -125,9 +127,7 @@ mod cli_ui {
             .spawn({
                 let ctrl_tx = ctrl_tx.clone();
                 move || {
-                    if let Err(err) =
-                        window::run_event_loop(ui_rx, ctrl_tx, effective_max_scale)
-                    {
+                    if let Err(err) = window::run_event_loop(ui_rx, ctrl_tx, effective_max_scale) {
                         tracing::error!(error = %err, "Wayland UI loop exited");
                     }
                 }

@@ -123,7 +123,12 @@ pub async fn connect_and_auth(
     role: ClientRole,
     enable_audio_bridge: bool,
     initial_scale: f64,
-) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream, VideoCodec)> {
+) -> Result<(
+    quinn::Connection,
+    quinn::SendStream,
+    quinn::RecvStream,
+    VideoCodec,
+)> {
     let verifier = Arc::new(PinnedCertVerifier::new(fingerprint_sha256));
     let mut rustls_config = rustls::ClientConfig::builder()
         .dangerous()
@@ -448,9 +453,9 @@ pub async fn run_client(
     let sync_mic = |wanted: bool,
                     cfg: &crate::audio::MicConfig,
                     active_mic: &mut Option<(
-                        crate::audio::MicCaptureHandle,
-                        tokio::task::JoinHandle<()>,
-                    )>| {
+        crate::audio::MicCaptureHandle,
+        tokio::task::JoinHandle<()>,
+    )>| {
         let should_run = enable_audio_bridge && wanted && !cfg.muted;
         if !should_run {
             if let Some((handle, task)) = active_mic.take() {
@@ -520,167 +525,157 @@ pub async fn run_client(
     });
 
     let loop_res: Result<()> = async {
-    loop {
-        let msg = tokio::select! {
-            _ = &mut ctrl_closed_rx => break,
-            res = ctrl_in_rx.recv() => match res {
-                Some(Ok(m)) => m,
-                Some(Err(err)) => return Err(err),
-                None => break,
-            },
-            res = mic_cfg_rx.changed() => {
-                if res.is_err() {
+        loop {
+            let msg = tokio::select! {
+                _ = &mut ctrl_closed_rx => break,
+                res = ctrl_in_rx.recv() => match res {
+                    Some(Ok(m)) => m,
+                    Some(Err(err)) => return Err(err),
+                    None => break,
+                },
+                res = mic_cfg_rx.changed() => {
+                    if res.is_err() {
+                        continue;
+                    }
+                    let cfg = mic_cfg_rx.borrow().clone();
+                    if let Some((handle, task)) = active_mic.take() {
+                        task.abort();
+                        drop(handle);
+                    }
+                    sync_mic(server_mic_wanted, &cfg, &mut active_mic);
                     continue;
                 }
-                let cfg = mic_cfg_rx.borrow().clone();
-                if let Some((handle, task)) = active_mic.take() {
-                    task.abort();
-                    drop(handle);
-                }
-                sync_mic(server_mic_wanted, &cfg, &mut active_mic);
-                continue;
-            }
-        };
-        match msg {
-            ControlMessage::WindowCreated {
-                window_id,
-                title,
-                app_id,
-                width,
-                height,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::WindowCreated {
+            };
+            match msg {
+                ControlMessage::WindowCreated {
                     window_id,
                     title,
                     app_id,
                     width,
                     height,
-                });
-            }
-            ControlMessage::PopupCreated {
-                window_id,
-                parent_id,
-                x,
-                y,
-                width,
-                height,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::PopupCreated {
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::WindowCreated {
+                        window_id,
+                        title,
+                        app_id,
+                        width,
+                        height,
+                    });
+                }
+                ControlMessage::PopupCreated {
                     window_id,
                     parent_id,
                     x,
                     y,
                     width,
                     height,
-                });
-            }
-            ControlMessage::PopupRepositioned {
-                window_id,
-                x,
-                y,
-                width,
-                height,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::PopupRepositioned {
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::PopupCreated {
+                        window_id,
+                        parent_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                    });
+                }
+                ControlMessage::PopupRepositioned {
                     window_id,
                     x,
                     y,
                     width,
                     height,
-                });
-            }
-            ControlMessage::PopupFrame {
-                window_id,
-                width,
-                height,
-                logical_width,
-                logical_height,
-                is_keyframe,
-                bgra,
-            } => {
-                let decoder = popup_decoders
-                    .entry(window_id)
-                    .or_insert_with(|| WindowVideoDecoder::new(selected_codec));
-                match decoder.decode(width, height, is_keyframe, &bgra) {
-                    Ok(frame) => {
-                        let _ = ui_tx.send(ClientUiEvent::PopupFrame {
-                            window_id,
-                            width: frame.width,
-                            height: frame.height,
-                            logical_width,
-                            logical_height,
-                            bgra: frame.bgra,
-                            damage: frame.damage,
-                        });
-                    }
-                    Err(err) => warn!(window_id, error = %err, "popup decode error"),
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::PopupRepositioned {
+                        window_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                    });
                 }
-            }
-            ControlMessage::StartMove { window_id } => {
-                let _ = ui_tx.send(ClientUiEvent::StartMove { window_id });
-            }
-            ControlMessage::StartResize { window_id, edge } => {
-                let _ = ui_tx.send(ClientUiEvent::StartResize { window_id, edge });
-            }
-            ControlMessage::SetMaximized {
-                window_id,
-                maximized,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::SetMaximized {
+                ControlMessage::PopupFrame {
+                    window_id,
+                    width,
+                    height,
+                    logical_width,
+                    logical_height,
+                    is_keyframe,
+                    bgra,
+                } => {
+                    let decoder = popup_decoders
+                        .entry(window_id)
+                        .or_insert_with(|| WindowVideoDecoder::new(selected_codec));
+                    match decoder.decode(width, height, is_keyframe, &bgra) {
+                        Ok(frame) => {
+                            let _ = ui_tx.send(ClientUiEvent::PopupFrame {
+                                window_id,
+                                width: frame.width,
+                                height: frame.height,
+                                logical_width,
+                                logical_height,
+                                bgra: frame.bgra,
+                                damage: frame.damage,
+                            });
+                        }
+                        Err(err) => warn!(window_id, error = %err, "popup decode error"),
+                    }
+                }
+                ControlMessage::StartMove { window_id } => {
+                    let _ = ui_tx.send(ClientUiEvent::StartMove { window_id });
+                }
+                ControlMessage::StartResize { window_id, edge } => {
+                    let _ = ui_tx.send(ClientUiEvent::StartResize { window_id, edge });
+                }
+                ControlMessage::SetMaximized {
                     window_id,
                     maximized,
-                });
-            }
-            ControlMessage::SetMinimized { window_id } => {
-                let _ = ui_tx.send(ClientUiEvent::SetMinimized { window_id });
-            }
-            ControlMessage::SetFullscreen {
-                window_id,
-                fullscreen,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::SetFullscreen {
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::SetMaximized {
+                        window_id,
+                        maximized,
+                    });
+                }
+                ControlMessage::SetMinimized { window_id } => {
+                    let _ = ui_tx.send(ClientUiEvent::SetMinimized { window_id });
+                }
+                ControlMessage::SetFullscreen {
                     window_id,
                     fullscreen,
-                });
-            }
-            ControlMessage::ShowWindowMenu { window_id, x, y } => {
-                let _ = ui_tx.send(ClientUiEvent::ShowWindowMenu { window_id, x, y });
-            }
-            ControlMessage::SetDecorationMode {
-                window_id,
-                server_side,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::SetDecorationMode {
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::SetFullscreen {
+                        window_id,
+                        fullscreen,
+                    });
+                }
+                ControlMessage::ShowWindowMenu { window_id, x, y } => {
+                    let _ = ui_tx.send(ClientUiEvent::ShowWindowMenu { window_id, x, y });
+                }
+                ControlMessage::SetDecorationMode {
                     window_id,
                     server_side,
-                });
-            }
-            ControlMessage::WindowClosed { window_id } => {
-                popup_decoders.remove(&window_id);
-                let _ = ui_tx.send(ClientUiEvent::WindowClosed { window_id });
-            }
-            ControlMessage::CursorUpdate {
-                window_id,
-                visible,
-                shape_name,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::CursorUpdate {
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::SetDecorationMode {
+                        window_id,
+                        server_side,
+                    });
+                }
+                ControlMessage::WindowClosed { window_id } => {
+                    popup_decoders.remove(&window_id);
+                    let _ = ui_tx.send(ClientUiEvent::WindowClosed { window_id });
+                }
+                ControlMessage::CursorUpdate {
                     window_id,
                     visible,
                     shape_name,
-                });
-            }
-            ControlMessage::CursorBitmap {
-                window_id,
-                width,
-                height,
-                logical_width,
-                logical_height,
-                hotspot_x,
-                hotspot_y,
-                bgra,
-            } => {
-                let _ = ui_tx.send(ClientUiEvent::CursorBitmap {
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::CursorUpdate {
+                        window_id,
+                        visible,
+                        shape_name,
+                    });
+                }
+                ControlMessage::CursorBitmap {
                     window_id,
                     width,
                     height,
@@ -689,70 +684,80 @@ pub async fn run_client(
                     hotspot_x,
                     hotspot_y,
                     bgra,
-                });
-            }
-            ControlMessage::ClipboardText { text } => {
-                let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
-            }
-            ControlMessage::PrimarySelectionText { text } => {
-                let _ = ui_tx.send(ClientUiEvent::PrimarySelectionText { text });
-            }
-            ControlMessage::SetMicActive { active } => {
-                server_mic_wanted = active;
-                let cfg = mic_cfg_rx.borrow().clone();
-                sync_mic(server_mic_wanted, &cfg, &mut active_mic);
-            }
-            ControlMessage::AppList { apps } => {
-                if let Some(tx) = &launcher_tx {
-                    let icon_entries: Vec<crate::icon::AppIconEntry> = apps
-                        .iter()
-                        .filter(|a| !a.icon_data.is_empty())
-                        .map(|a| crate::icon::AppIconEntry {
-                            id: a.id.clone(),
-                            name: a.name.clone(),
-                            exec: a.exec.clone(),
-                            icon_data: a.icon_data.clone(),
-                        })
-                        .collect();
-                    let _ = ui_tx.send(ClientUiEvent::AppIconsUpdated {
-                        entries: icon_entries,
-                    });
-                    let _ = tx.send(LauncherNetEvent::AppList(apps));
-                } else {
-                    let icon_entries: Vec<crate::icon::AppIconEntry> = apps
-                        .into_iter()
-                        .filter(|a| !a.icon_data.is_empty())
-                        .map(|a| crate::icon::AppIconEntry {
-                            id: a.id,
-                            name: a.name,
-                            exec: a.exec,
-                            icon_data: a.icon_data,
-                        })
-                        .collect();
-                    let _ = ui_tx.send(ClientUiEvent::AppIconsUpdated {
-                        entries: icon_entries,
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::CursorBitmap {
+                        window_id,
+                        width,
+                        height,
+                        logical_width,
+                        logical_height,
+                        hotspot_x,
+                        hotspot_y,
+                        bgra,
                     });
                 }
-            }
-            ControlMessage::AppState {
-                launch_id,
-                name,
-                state,
-            } => {
-                if let Some(tx) = &launcher_tx {
-                    let _ = tx.send(LauncherNetEvent::AppState {
-                        launch_id,
-                        name,
-                        state,
-                    });
+                ControlMessage::ClipboardText { text } => {
+                    let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
                 }
-            }
-            other => {
-                info!(?other, "received control event from server");
+                ControlMessage::PrimarySelectionText { text } => {
+                    let _ = ui_tx.send(ClientUiEvent::PrimarySelectionText { text });
+                }
+                ControlMessage::SetMicActive { active } => {
+                    server_mic_wanted = active;
+                    let cfg = mic_cfg_rx.borrow().clone();
+                    sync_mic(server_mic_wanted, &cfg, &mut active_mic);
+                }
+                ControlMessage::AppList { apps } => {
+                    if let Some(tx) = &launcher_tx {
+                        let icon_entries: Vec<crate::icon::AppIconEntry> = apps
+                            .iter()
+                            .filter(|a| !a.icon_data.is_empty())
+                            .map(|a| crate::icon::AppIconEntry {
+                                id: a.id.clone(),
+                                name: a.name.clone(),
+                                exec: a.exec.clone(),
+                                icon_data: a.icon_data.clone(),
+                            })
+                            .collect();
+                        let _ = ui_tx.send(ClientUiEvent::AppIconsUpdated {
+                            entries: icon_entries,
+                        });
+                        let _ = tx.send(LauncherNetEvent::AppList(apps));
+                    } else {
+                        let icon_entries: Vec<crate::icon::AppIconEntry> = apps
+                            .into_iter()
+                            .filter(|a| !a.icon_data.is_empty())
+                            .map(|a| crate::icon::AppIconEntry {
+                                id: a.id,
+                                name: a.name,
+                                exec: a.exec,
+                                icon_data: a.icon_data,
+                            })
+                            .collect();
+                        let _ = ui_tx.send(ClientUiEvent::AppIconsUpdated {
+                            entries: icon_entries,
+                        });
+                    }
+                }
+                ControlMessage::AppState {
+                    launch_id,
+                    name,
+                    state,
+                } => {
+                    if let Some(tx) = &launcher_tx {
+                        let _ = tx.send(LauncherNetEvent::AppState {
+                            launch_id,
+                            name,
+                            state,
+                        });
+                    }
+                }
+                other => {
+                    info!(?other, "received control event from server");
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
     }
     .await;
 

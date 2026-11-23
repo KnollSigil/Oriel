@@ -143,7 +143,9 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
         .ok_or_else(|| "XDG_RUNTIME_DIR is not set for isolated PipeWire session".to_string())?;
     let pulse_dir = runtime_dir.join("pulse");
     let wp_config_home = runtime_dir.join("wp-config");
-    let wp_conf_d = wp_config_home.join("wireplumber").join("wireplumber.conf.d");
+    let wp_conf_d = wp_config_home
+        .join("wireplumber")
+        .join("wireplumber.conf.d");
     let wp_state_home = runtime_dir.join("wp-state");
 
     crate::session::create_private_dir(&pulse_dir)
@@ -170,7 +172,9 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while !pw_socket.exists() {
         if let Ok(Some(status)) = pw_child.try_wait() {
-            return Err(format!("isolated pipewire exited prematurely with {status}"));
+            return Err(format!(
+                "isolated pipewire exited prematurely with {status}"
+            ));
         }
         if Instant::now() >= deadline {
             let _ = pw_child.kill();
@@ -190,7 +194,8 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
     //    by WirePlumber's fallback `auto_null` sink or torn down across client
     //    reconnects).
     let (dev_quit_tx, dev_quit_rx) = pw::channel::channel();
-    let (dev_ready_tx, dev_ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+    let (dev_ready_tx, dev_ready_rx) =
+        std::sync::mpsc::channel::<std::result::Result<(), String>>();
     if let Err(err) = std::thread::Builder::new()
         .name("pw-server-devices".to_string())
         .spawn(move || {
@@ -219,7 +224,9 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            return Err(format!("pw-server-devices thread exited before initializing: {err}"));
+            return Err(format!(
+                "pw-server-devices thread exited before initializing: {err}"
+            ));
         }
     }
 
@@ -266,7 +273,9 @@ fn init_isolated_pipewire() -> std::result::Result<IsolatedPwEnv, String> {
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            return Err(format!("isolated audio daemon exited prematurely with {status}"));
+            return Err(format!(
+                "isolated audio daemon exited prematurely with {status}"
+            ));
         }
     }
 
@@ -397,10 +406,7 @@ fn run_virtual_devices_loop(
                 let target_bytes = (FRAME_SAMPLES * stride).min(slice.len());
                 let mut guard = rb.lock().ok();
                 for byte in &mut slice[..target_bytes] {
-                    *byte = guard
-                        .as_mut()
-                        .and_then(|q| q.pop_front())
-                        .unwrap_or(0);
+                    *byte = guard.as_mut().and_then(|q| q.pop_front()).unwrap_or(0);
                 }
                 target_bytes
             } else {
@@ -548,9 +554,7 @@ fn try_link_app(core: &pw::core::CoreRc, app_node_id: u32, entry: &mut AppCaptur
     if entry.out_ports.is_empty() || entry.cap_in_ports.is_empty() {
         return;
     }
-    let cap_node_id = entry
-        .cap_node_id
-        .unwrap_or_else(|| entry.stream.node_id());
+    let cap_node_id = entry.cap_node_id.unwrap_or_else(|| entry.stream.node_id());
     if cap_node_id == u32::MAX {
         return;
     }
@@ -704,7 +708,11 @@ fn run_per_app_playback_loop(
                         .get("application.icon-name")
                         .filter(|s| !s.is_empty())
                         .or_else(|| props.get("media.icon-name").filter(|s| !s.is_empty()))
-                        .or_else(|| props.get("application.process.binary").filter(|s| !s.is_empty()))
+                        .or_else(|| {
+                            props
+                                .get("application.process.binary")
+                                .filter(|s| !s.is_empty())
+                        })
                         .unwrap_or("")
                         .to_string();
                     let media_role = props
@@ -771,8 +779,7 @@ fn run_per_app_playback_loop(
                             };
                             let slice = &bytes[..valid_bytes.min(bytes.len())];
                             for chunk in slice.chunks_exact(2) {
-                                st.pcm_accum
-                                    .push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                                st.pcm_accum.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                             }
 
                             let frame_total_samples = FRAME_SAMPLES * SINK_CHANNELS as usize;
@@ -959,10 +966,7 @@ mod tests {
 
     #[test]
     fn isolated_pipewire_captures_per_app_playback() {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-audio-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rw-audio-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         crate::session::create_private_dir(&dir).unwrap();
         std::env::set_var("XDG_RUNTIME_DIR", &dir);
@@ -1148,7 +1152,8 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(150));
 
-        let mut bridge2 = start_per_app_playback_capture().expect("reconnect start_per_app_playback_capture");
+        let mut bridge2 =
+            start_per_app_playback_capture().expect("reconnect start_per_app_playback_capture");
         rt.block_on(async {
             let mut ev = tokio::time::timeout(Duration::from_secs(3), bridge2.streams.recv())
                 .await

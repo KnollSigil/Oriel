@@ -306,10 +306,22 @@ mod tests {
         assert_eq!(RenderScaleCap::Scale150.apply(2.0), 1.5);
         assert_eq!(RenderScaleCap::Scale100.apply(2.0), 1.0);
 
-        assert_eq!(RenderScaleCap::parse_cli("uncapped").unwrap(), RenderScaleCap::Uncapped);
-        assert_eq!(RenderScaleCap::parse_cli("2.0x").unwrap(), RenderScaleCap::Scale200);
-        assert_eq!(RenderScaleCap::parse_cli("1.5").unwrap(), RenderScaleCap::Scale150);
-        assert_eq!(RenderScaleCap::parse_cli("100%").unwrap(), RenderScaleCap::Scale100);
+        assert_eq!(
+            RenderScaleCap::parse_cli("uncapped").unwrap(),
+            RenderScaleCap::Uncapped
+        );
+        assert_eq!(
+            RenderScaleCap::parse_cli("2.0x").unwrap(),
+            RenderScaleCap::Scale200
+        );
+        assert_eq!(
+            RenderScaleCap::parse_cli("1.5").unwrap(),
+            RenderScaleCap::Scale150
+        );
+        assert_eq!(
+            RenderScaleCap::parse_cli("100%").unwrap(),
+            RenderScaleCap::Scale100
+        );
         assert!(RenderScaleCap::parse_cli("3.5").is_err());
 
         for cap in RenderScaleCap::ALL {

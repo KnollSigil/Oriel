@@ -8,9 +8,7 @@
 
 #![allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
 
-use super::{
-    dct_1d, idct_1d, rgb_to_ycbcr, ycbcr_to_rgb, C1, C2, C3, C4, C5, C6, C7,
-};
+use super::{dct_1d, idct_1d, rgb_to_ycbcr, ycbcr_to_rgb, C1, C2, C3, C4, C5, C6, C7};
 
 // ---------------------------------------------------------------------------
 // Scalar reference implementations (exposed for fallback & bit-exactness tests)
@@ -273,21 +271,29 @@ pub fn ycbcr420_half_to_bgra_tile_scalar(
     for py in 0..(th as usize) {
         let row_base = (y0 as usize + py) * stride + (x0 as usize) * 4;
         let hy0 = py >> 1;
-        let hy1 = if (py & 1) == 0 { hy0 } else { (hy0 + 1).min(31) };
+        let hy1 = if (py & 1) == 0 {
+            hy0
+        } else {
+            (hy0 + 1).min(31)
+        };
         let r0 = hy0 * 32;
         let r1 = hy1 * 32;
         let cy = hy0 >> 1;
         for px in 0..(tw as usize) {
             let hx0 = px >> 1;
-            let hx1 = if (px & 1) == 0 { hx0 } else { (hx0 + 1).min(31) };
-            let y = (y_plane[r0 + hx0] + y_plane[r0 + hx1] + y_plane[r1 + hx0] + y_plane[r1 + hx1] + 2)
-                >> 2;
+            let hx1 = if (px & 1) == 0 {
+                hx0
+            } else {
+                (hx0 + 1).min(31)
+            };
+            let y =
+                (y_plane[r0 + hx0] + y_plane[r0 + hx1] + y_plane[r1 + hx0] + y_plane[r1 + hx1] + 2)
+                    >> 2;
             let c_idx = cy * 16 + (hx0 >> 1);
             let (mut r, mut g, mut b) = ycbcr_to_rgb(y, cb_plane[c_idx], cr_plane[c_idx]);
             let a = match a_plane {
                 Some(ap) => {
-                    let av_i =
-                        (ap[r0 + hx0] + ap[r0 + hx1] + ap[r1 + hx0] + ap[r1 + hx1] + 2) >> 2;
+                    let av_i = (ap[r0 + hx0] + ap[r0 + hx1] + ap[r1 + hx0] + ap[r1 + hx1] + 2) >> 2;
                     let av = av_i.clamp(0, 255) as u8;
                     r = r.min(av);
                     g = g.min(av);
@@ -349,14 +355,7 @@ pub fn tile_equals_shifted_scalar(
     true
 }
 
-pub fn tile_is_opaque_scalar(
-    bgra: &[u8],
-    fb_w: u32,
-    x0: u32,
-    y0: u32,
-    tw: u32,
-    th: u32,
-) -> bool {
+pub fn tile_is_opaque_scalar(bgra: &[u8], fb_w: u32, x0: u32, y0: u32, tw: u32, th: u32) -> bool {
     let stride = fb_w as usize * 4;
     for py in 0..(th as usize) {
         let row_base = (y0 as usize + py) * stride + (x0 as usize) * 4;
@@ -656,12 +655,20 @@ pub mod avx2 {
         let mut r7 = _mm256_loadu_si256(p.add(56) as *const __m256i);
 
         // Transpose rows -> columns so 8-lane vertical butterfly computes all 8 1D row DCTs at once.
-        transpose_8x8_epi32(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
-        dct_1d_8cols(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 11);
+        transpose_8x8_epi32(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7,
+        );
+        dct_1d_8cols(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 11,
+        );
 
         // Transpose back so columns of the intermediate matrix become vertical lanes, then run column DCTs.
-        transpose_8x8_epi32(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
-        dct_1d_8cols(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17);
+        transpose_8x8_epi32(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7,
+        );
+        dct_1d_8cols(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17,
+        );
 
         let mut out = [0i32; 64];
         let op = out.as_mut_ptr();
@@ -689,12 +696,20 @@ pub mod avx2 {
         let mut r7 = _mm256_loadu_si256(p.add(56) as *const __m256i);
 
         // 1. 1D IDCT along columns (shift = 11)
-        idct_1d_8cols(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 11);
+        idct_1d_8cols(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 11,
+        );
 
         // 2. Transpose -> 1D IDCT along rows (shift = 17) -> Transpose back to row-major
-        transpose_8x8_epi32(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
-        idct_1d_8cols(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17);
-        transpose_8x8_epi32(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7);
+        transpose_8x8_epi32(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7,
+        );
+        idct_1d_8cols(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17,
+        );
+        transpose_8x8_epi32(
+            &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7,
+        );
 
         let mut out = [0i32; 64];
         let op = out.as_mut_ptr();
@@ -711,11 +726,7 @@ pub mod avx2 {
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn rgb_to_ycbcr_8px(
-        b: __m256i,
-        g: __m256i,
-        r: __m256i,
-    ) -> (__m256i, __m256i, __m256i) {
+    unsafe fn rgb_to_ycbcr_8px(b: __m256i, g: __m256i, r: __m256i) -> (__m256i, __m256i, __m256i) {
         let zero = _mm256_setzero_si256();
         let max255 = _mm256_set1_epi32(255);
         let c128 = _mm256_set1_epi32(128);
@@ -812,9 +823,11 @@ pub mod avx2 {
 
                 // Load 16 horizontal samples as two 8-lane vectors and sum adjacent pairs via hadd + permute.
                 let cb_0a = _mm256_loadu_si256(cb_full.as_ptr().add(src_off0) as *const __m256i);
-                let cb_0b = _mm256_loadu_si256(cb_full.as_ptr().add(src_off0 + 8) as *const __m256i);
+                let cb_0b =
+                    _mm256_loadu_si256(cb_full.as_ptr().add(src_off0 + 8) as *const __m256i);
                 let cb_1a = _mm256_loadu_si256(cb_full.as_ptr().add(src_off1) as *const __m256i);
-                let cb_1b = _mm256_loadu_si256(cb_full.as_ptr().add(src_off1 + 8) as *const __m256i);
+                let cb_1b =
+                    _mm256_loadu_si256(cb_full.as_ptr().add(src_off1 + 8) as *const __m256i);
                 let cb_v0 = _mm256_add_epi32(cb_0a, cb_1a);
                 let cb_v1 = _mm256_add_epi32(cb_0b, cb_1b);
                 let cb_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cb_v0, cb_v1), 0xD8);
@@ -825,9 +838,11 @@ pub mod avx2 {
                 );
 
                 let cr_0a = _mm256_loadu_si256(cr_full.as_ptr().add(src_off0) as *const __m256i);
-                let cr_0b = _mm256_loadu_si256(cr_full.as_ptr().add(src_off0 + 8) as *const __m256i);
+                let cr_0b =
+                    _mm256_loadu_si256(cr_full.as_ptr().add(src_off0 + 8) as *const __m256i);
                 let cr_1a = _mm256_loadu_si256(cr_full.as_ptr().add(src_off1) as *const __m256i);
-                let cr_1b = _mm256_loadu_si256(cr_full.as_ptr().add(src_off1 + 8) as *const __m256i);
+                let cr_1b =
+                    _mm256_loadu_si256(cr_full.as_ptr().add(src_off1 + 8) as *const __m256i);
                 let cr_v0 = _mm256_add_epi32(cr_0a, cr_1a);
                 let cr_v1 = _mm256_add_epi32(cr_0b, cr_1b);
                 let cr_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cr_v0, cr_v1), 0xD8);
@@ -872,7 +887,9 @@ pub mod avx2 {
         let dup_idx = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
 
         for py in 0..(th as usize) {
-            let dst_row = bgra.as_mut_ptr().add((y0 as usize + py) * stride + (x0 as usize) * 4);
+            let dst_row = bgra
+                .as_mut_ptr()
+                .add((y0 as usize + py) * stride + (x0 as usize) * 4);
             let y_row = y_plane.as_ptr().add(py * 64);
             let c_row = (py >> 1) * 32;
             for chunk in 0..8usize {
@@ -880,8 +897,10 @@ pub mod avx2 {
                 let y = _mm256_loadu_si256(y_row.add(px) as *const __m256i);
 
                 // Load 4 chroma samples and duplicate each horizontally -> [c0, c0, c1, c1, c2, c2, c3, c3]
-                let cb4 = _mm_loadu_si128(cb_plane.as_ptr().add(c_row + (px >> 1)) as *const __m128i);
-                let cr4 = _mm_loadu_si128(cr_plane.as_ptr().add(c_row + (px >> 1)) as *const __m128i);
+                let cb4 =
+                    _mm_loadu_si128(cb_plane.as_ptr().add(c_row + (px >> 1)) as *const __m128i);
+                let cr4 =
+                    _mm_loadu_si128(cr_plane.as_ptr().add(c_row + (px >> 1)) as *const __m128i);
                 let cb = _mm256_permutevar8x32_epi32(_mm256_castsi128_si256(cb4), dup_idx);
                 let cr = _mm256_permutevar8x32_epi32(_mm256_castsi128_si256(cr4), dup_idx);
 
@@ -896,7 +915,10 @@ pub mod avx2 {
                     y,
                     _mm256_srai_epi32(
                         _mm256_add_epi32(
-                            _mm256_add_epi32(_mm256_mullo_epi32(c88, c), _mm256_mullo_epi32(c183, d)),
+                            _mm256_add_epi32(
+                                _mm256_mullo_epi32(c88, c),
+                                _mm256_mullo_epi32(c183, d),
+                            ),
                             c128,
                         ),
                         8,
@@ -1020,9 +1042,11 @@ pub mod avx2 {
                 let src_off1 = r1 + cx * 2;
 
                 let cb_0a = _mm256_loadu_si256(cb_half.as_ptr().add(src_off0) as *const __m256i);
-                let cb_0b = _mm256_loadu_si256(cb_half.as_ptr().add(src_off0 + 8) as *const __m256i);
+                let cb_0b =
+                    _mm256_loadu_si256(cb_half.as_ptr().add(src_off0 + 8) as *const __m256i);
                 let cb_1a = _mm256_loadu_si256(cb_half.as_ptr().add(src_off1) as *const __m256i);
-                let cb_1b = _mm256_loadu_si256(cb_half.as_ptr().add(src_off1 + 8) as *const __m256i);
+                let cb_1b =
+                    _mm256_loadu_si256(cb_half.as_ptr().add(src_off1 + 8) as *const __m256i);
                 let cb_v0 = _mm256_add_epi32(cb_0a, cb_1a);
                 let cb_v1 = _mm256_add_epi32(cb_0b, cb_1b);
                 let cb_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cb_v0, cb_v1), 0xD8);
@@ -1033,9 +1057,11 @@ pub mod avx2 {
                 );
 
                 let cr_0a = _mm256_loadu_si256(cr_half.as_ptr().add(src_off0) as *const __m256i);
-                let cr_0b = _mm256_loadu_si256(cr_half.as_ptr().add(src_off0 + 8) as *const __m256i);
+                let cr_0b =
+                    _mm256_loadu_si256(cr_half.as_ptr().add(src_off0 + 8) as *const __m256i);
                 let cr_1a = _mm256_loadu_si256(cr_half.as_ptr().add(src_off1) as *const __m256i);
-                let cr_1b = _mm256_loadu_si256(cr_half.as_ptr().add(src_off1 + 8) as *const __m256i);
+                let cr_1b =
+                    _mm256_loadu_si256(cr_half.as_ptr().add(src_off1 + 8) as *const __m256i);
                 let cr_v0 = _mm256_add_epi32(cr_0a, cr_1a);
                 let cr_v1 = _mm256_add_epi32(cr_0b, cr_1b);
                 let cr_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cr_v0, cr_v1), 0xD8);
@@ -1092,9 +1118,15 @@ pub mod avx2 {
         let perm_chroma = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
 
         for py in 0..(th as usize) {
-            let dst_row = bgra.as_mut_ptr().add((y0 as usize + py) * stride + (x0 as usize) * 4);
+            let dst_row = bgra
+                .as_mut_ptr()
+                .add((y0 as usize + py) * stride + (x0 as usize) * 4);
             let hy0 = py >> 1;
-            let hy1 = if (py & 1) == 0 { hy0 } else { (hy0 + 1).min(31) };
+            let hy1 = if (py & 1) == 0 {
+                hy0
+            } else {
+                (hy0 + 1).min(31)
+            };
             let r0 = hy0 * 32;
             let r1 = hy1 * 32;
             let c_row = (hy0 >> 1) * 16;
@@ -1140,7 +1172,10 @@ pub mod avx2 {
                     y,
                     _mm256_srai_epi32(
                         _mm256_add_epi32(
-                            _mm256_add_epi32(_mm256_mullo_epi32(c88, c), _mm256_mullo_epi32(c183, d)),
+                            _mm256_add_epi32(
+                                _mm256_mullo_epi32(c88, c),
+                                _mm256_mullo_epi32(c183, d),
+                            ),
                             c128,
                         ),
                         8,
@@ -1518,7 +1553,9 @@ pub mod neon {
             let mut h3 = vld1q_s32(input.as_ptr().add((r_base + 3) * 8 + 4));
             transpose_4x4_s32(&mut l0, &mut l1, &mut l2, &mut l3);
             transpose_4x4_s32(&mut h0, &mut h1, &mut h2, &mut h3);
-            dct_1d_4cols(&mut l0, &mut l1, &mut l2, &mut l3, &mut h0, &mut h1, &mut h2, &mut h3, 11);
+            dct_1d_4cols(
+                &mut l0, &mut l1, &mut l2, &mut l3, &mut h0, &mut h1, &mut h2, &mut h3, 11,
+            );
             transpose_4x4_s32(&mut l0, &mut l1, &mut l2, &mut l3);
             transpose_4x4_s32(&mut h0, &mut h1, &mut h2, &mut h3);
             vst1q_s32(tmp.as_mut_ptr().add(r_base * 8), l0);
@@ -1542,7 +1579,9 @@ pub mod neon {
             let mut r5 = vld1q_s32(tmp.as_ptr().add(40 + c_off));
             let mut r6 = vld1q_s32(tmp.as_ptr().add(48 + c_off));
             let mut r7 = vld1q_s32(tmp.as_ptr().add(56 + c_off));
-            dct_1d_4cols(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17);
+            dct_1d_4cols(
+                &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17,
+            );
             vst1q_s32(out.as_mut_ptr().add(c_off), r0);
             vst1q_s32(out.as_mut_ptr().add(8 + c_off), r1);
             vst1q_s32(out.as_mut_ptr().add(16 + c_off), r2);
@@ -1567,7 +1606,9 @@ pub mod neon {
             let mut r5 = vld1q_s32(coeffs.as_ptr().add(40 + c_off));
             let mut r6 = vld1q_s32(coeffs.as_ptr().add(48 + c_off));
             let mut r7 = vld1q_s32(coeffs.as_ptr().add(56 + c_off));
-            idct_1d_4cols(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 11);
+            idct_1d_4cols(
+                &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 11,
+            );
             vst1q_s32(tmp.as_mut_ptr().add(c_off), r0);
             vst1q_s32(tmp.as_mut_ptr().add(8 + c_off), r1);
             vst1q_s32(tmp.as_mut_ptr().add(16 + c_off), r2);
@@ -1591,7 +1632,9 @@ pub mod neon {
             let mut r7 = vld1q_s32(tmp.as_ptr().add((r_base + 3) * 8 + 4));
             transpose_4x4_s32(&mut r0, &mut r1, &mut r2, &mut r3);
             transpose_4x4_s32(&mut r4, &mut r5, &mut r6, &mut r7);
-            idct_1d_4cols(&mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17);
+            idct_1d_4cols(
+                &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, 17,
+            );
             transpose_4x4_s32(&mut r0, &mut r1, &mut r2, &mut r3);
             transpose_4x4_s32(&mut r4, &mut r5, &mut r6, &mut r7);
             vst1q_s32(out.as_mut_ptr().add(r_base * 8), r0);
@@ -1626,13 +1669,19 @@ pub mod neon {
             vaddq_s32(vmulq_n_s32(r, -43), vmulq_n_s32(g, -85)),
             vaddq_s32(vshlq_n_s32(b, 7), c128),
         );
-        let cb = vminq_s32(vmaxq_s32(vaddq_s32(vshrq_n_s32(cb_num, 8), c128), zero), max255);
+        let cb = vminq_s32(
+            vmaxq_s32(vaddq_s32(vshrq_n_s32(cb_num, 8), c128), zero),
+            max255,
+        );
 
         let cr_num = vaddq_s32(
             vaddq_s32(vshlq_n_s32(r, 7), vmulq_n_s32(g, -107)),
             vaddq_s32(vmulq_n_s32(b, -21), c128),
         );
-        let cr = vminq_s32(vmaxq_s32(vaddq_s32(vshrq_n_s32(cr_num, 8), c128), zero), max255);
+        let cr = vminq_s32(
+            vmaxq_s32(vaddq_s32(vshrq_n_s32(cr_num, 8), c128), zero),
+            max255,
+        );
 
         (y, cb, cr)
     }
@@ -1735,7 +1784,9 @@ pub mod neon {
         let alpha_opaque = vdupq_n_u32(0xFF00_0000);
 
         for py in 0..(th as usize) {
-            let dst_row = bgra.as_mut_ptr().add((y0 as usize + py) * stride + (x0 as usize) * 4);
+            let dst_row = bgra
+                .as_mut_ptr()
+                .add((y0 as usize + py) * stride + (x0 as usize) * 4);
             let y_row = y_plane.as_ptr().add(py * 64);
             let c_row = (py >> 1) * 32;
             for chunk in 0..16usize {
@@ -1933,4 +1984,3 @@ pub mod neon {
         }
     }
 }
-

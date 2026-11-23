@@ -202,10 +202,20 @@ mod tests {
     #[test]
     fn tiers_rank_prefix_word_substring_generic_keyword_fuzzy_exec() {
         let apps = vec![
-            entry("Firefox", Some("Web Browser"), &["internet", "www"], "firefox"),
+            entry(
+                "Firefox",
+                Some("Web Browser"),
+                &["internet", "www"],
+                "firefox",
+            ),
             entry("Konsole", Some("Terminal"), &["shell", "cli"], "konsole"),
             entry("Visual Studio Code", Some("Text Editor"), &["ide"], "code"),
-            entry("Firewall", Some("Firewall Settings"), &[], "firewall-config"),
+            entry(
+                "Firewall",
+                Some("Firewall Settings"),
+                &[],
+                "firewall-config",
+            ),
             entry(
                 "Discord",
                 Some("Messenger"),
@@ -230,7 +240,12 @@ mod tests {
 
     #[test]
     fn fuzzy_subsequence_requires_word_start_and_min_length() {
-        let apps = vec![entry("LibreOffice Writer", Some("Word Processor"), &[], "lowriter")];
+        let apps = vec![entry(
+            "LibreOffice Writer",
+            Some("Word Processor"),
+            &[],
+            "lowriter",
+        )];
         assert!(rank(&apps, "fire").is_empty());
         assert!(rank(&apps, "z").is_empty());
     }
@@ -262,7 +277,10 @@ mod tests {
 
     #[test]
     fn exec_key_strips_env_and_flatpak_wrappers() {
-        assert_eq!(exec_key("env FOO=1 /usr/bin/firefox --new-window"), "firefox");
+        assert_eq!(
+            exec_key("env FOO=1 /usr/bin/firefox --new-window"),
+            "firefox"
+        );
         assert_eq!(
             exec_key("/usr/bin/env FOO=1 BAR=2 /usr/bin/firefox --new-window"),
             "firefox"

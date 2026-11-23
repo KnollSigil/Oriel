@@ -643,10 +643,7 @@ fn escape_kconfig_value(val: &str) -> String {
     out
 }
 
-fn format_konsole_command_with_prefix(
-    cmd_prefix: &[String],
-    socket_path: &Path,
-) -> Result<String> {
+fn format_konsole_command_with_prefix(cmd_prefix: &[String], socket_path: &Path) -> Result<String> {
     if cmd_prefix.is_empty() {
         bail!("Konsole command prefix cannot be empty");
     }
@@ -731,10 +728,7 @@ fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = path.with_file_name(format!(".{name}.{pid}.{seq}.tmp"));
 
     let mut file = OpenOptions::new()
@@ -751,9 +745,8 @@ fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     drop(file);
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(err).with_context(|| {
-            format!("failed to rename {} -> {}", tmp.display(), path.display())
-        });
+        return Err(err)
+            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()));
     }
     Ok(())
 }
@@ -835,7 +828,11 @@ fn prepare_konsole_remote_profile_with_env(
         konsolerc_contents.as_bytes(),
     )?;
 
-    let config_dirs = join_xdg_dirs(orig_config_home.as_deref(), existing_config_dirs, "/etc/xdg");
+    let config_dirs = join_xdg_dirs(
+        orig_config_home.as_deref(),
+        existing_config_dirs,
+        "/etc/xdg",
+    );
     let data_dirs = join_xdg_dirs(
         orig_data_home.as_deref(),
         existing_data_dirs,
@@ -1091,7 +1088,8 @@ fn spawn_local_terminal_with_args(
                                 "XDG_CONFIG_HOME".to_string(),
                                 overlay.config_home.to_string_lossy().into_owned(),
                             ));
-                            env_overrides.push(("XDG_CONFIG_DIRS".to_string(), overlay.config_dirs));
+                            env_overrides
+                                .push(("XDG_CONFIG_DIRS".to_string(), overlay.config_dirs));
                             env_overrides.push((
                                 "XDG_DATA_HOME".to_string(),
                                 overlay.data_home.to_string_lossy().into_owned(),
@@ -1205,7 +1203,9 @@ mod tests {
             "'~user/bin/rw' pty-attach --socket '/tmp/#test.sock'"
         );
         // Control characters (newlines) must be rejected.
-        assert!(format_konsole_command(Path::new("/bin/rw\nevil"), Path::new("/tmp/a.sock")).is_err());
+        assert!(
+            format_konsole_command(Path::new("/bin/rw\nevil"), Path::new("/tmp/a.sock")).is_err()
+        );
     }
 
     #[test]
@@ -1224,7 +1224,9 @@ mod tests {
             Some("MyCustom.profile")
         );
         assert_eq!(
-            parse_konsole_default_profile("[Desktop Entry]\nDefaultProfile=RemoteWayland.profile\n"),
+            parse_konsole_default_profile(
+                "[Desktop Entry]\nDefaultProfile=RemoteWayland.profile\n"
+            ),
             None
         );
         assert_eq!(
@@ -1297,11 +1299,18 @@ mod tests {
         let konsolerc = fs::read_to_string(&konsolerc_path).unwrap();
         assert!(konsolerc.contains("DefaultProfile=RemoteWayland.profile"));
         assert_eq!(
-            fs::symlink_metadata(&konsolerc_path).unwrap().permissions().mode() & 0o777,
+            fs::symlink_metadata(&konsolerc_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
 
-        let profile_path = overlay.data_home.join("konsole").join("RemoteWayland.profile");
+        let profile_path = overlay
+            .data_home
+            .join("konsole")
+            .join("RemoteWayland.profile");
         let profile = fs::read_to_string(&profile_path).unwrap();
         assert!(profile.contains("Name=RemoteWayland"));
         assert!(profile.contains("Parent=UserTheme.profile"));
@@ -1310,11 +1319,19 @@ mod tests {
             sock.display()
         )));
         assert_eq!(
-            fs::symlink_metadata(&profile_path).unwrap().permissions().mode() & 0o777,
+            fs::symlink_metadata(&profile_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         assert_eq!(
-            fs::symlink_metadata(&overlay.config_home).unwrap().permissions().mode() & 0o777,
+            fs::symlink_metadata(&overlay.config_home)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o700
         );
 
@@ -1326,7 +1343,9 @@ mod tests {
         let list = terminal_candidates_with(Some("  /usr/bin/konsole  "));
         assert_eq!(list[0], "/usr/bin/konsole");
         assert_eq!(
-            list.iter().filter(|c| terminal_basename(c) == "konsole").count(),
+            list.iter()
+                .filter(|c| terminal_basename(c) == "konsole")
+                .count(),
             1
         );
 
@@ -1358,12 +1377,15 @@ mod tests {
         fs::set_permissions(&exec, Permissions::from_mode(0o755)).unwrap();
 
         let path_env = OsString::from(&dir);
-        assert!(!executable_exists_in_path("not-exec", Some(path_env.as_os_str())));
-        assert!(executable_exists_in_path("is-exec", Some(path_env.as_os_str())));
         assert!(!executable_exists_in_path(
-            non_exec.to_str().unwrap(),
-            None
+            "not-exec",
+            Some(path_env.as_os_str())
         ));
+        assert!(executable_exists_in_path(
+            "is-exec",
+            Some(path_env.as_os_str())
+        ));
+        assert!(!executable_exists_in_path(non_exec.to_str().unwrap(), None));
         assert!(executable_exists_in_path(exec.to_str().unwrap(), None));
 
         let _ = fs::remove_dir_all(&dir);
@@ -1455,7 +1477,10 @@ name=other
         );
 
         let profile = fs::read_to_string(
-            overlay.data_home.join("konsole").join("RemoteWayland.profile"),
+            overlay
+                .data_home
+                .join("konsole")
+                .join("RemoteWayland.profile"),
         )
         .unwrap();
         assert!(profile.contains(&format!(

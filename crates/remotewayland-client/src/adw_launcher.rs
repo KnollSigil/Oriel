@@ -773,7 +773,10 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 let state_c = Rc::clone(&state);
                 // Restyle in place rather than rebuilding the list, so focus stays put.
                 kill_btn.connect_clicked(move |btn| {
-                    let sent = state_c.borrow_mut().sessions.terminate(&target_c, launch_id);
+                    let sent = state_c
+                        .borrow_mut()
+                        .sessions
+                        .terminate(&target_c, launch_id);
                     if sent {
                         btn.set_label("Kill");
                         btn.set_tooltip_text(Some("Force kill"));

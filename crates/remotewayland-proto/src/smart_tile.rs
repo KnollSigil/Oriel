@@ -108,13 +108,14 @@ pub fn validate_frame_dims(width: u32, height: u32) -> Result<usize> {
 /// Decompress a size-prepended LZ4 payload while enforcing `max_uncompressed` BEFORE allocating.
 pub fn decompress_lz4_bounded(payload: &[u8], max_uncompressed: usize) -> Result<Vec<u8>> {
     if payload.len() < 4 {
-        bail!("LZ4 payload too short for size prefix: {} bytes", payload.len());
+        bail!(
+            "LZ4 payload too short for size prefix: {} bytes",
+            payload.len()
+        );
     }
     let declared = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     if declared > max_uncompressed {
-        bail!(
-            "LZ4 declared uncompressed size {declared} exceeds limit {max_uncompressed}"
-        );
+        bail!("LZ4 declared uncompressed size {declared} exceeds limit {max_uncompressed}");
     }
     lz4_flex::decompress(&payload[4..], declared)
         .context("failed to decompress bounded LZ4 payload")
@@ -907,7 +908,13 @@ fn decode_plane(
 // Sub-region vertical & horizontal scroll detection
 // ---------------------------------------------------------------------------
 
-fn hash_row_strip(bgra: &[u8], width: usize, y: usize, x_start: usize, x_end: usize) -> (u64, bool) {
+fn hash_row_strip(
+    bgra: &[u8],
+    width: usize,
+    y: usize,
+    x_start: usize,
+    x_end: usize,
+) -> (u64, bool) {
     let stride = width * 4;
     let base = y * stride;
     let step = ((x_end - x_start) / 96).max(1);
@@ -934,7 +941,13 @@ fn hash_row_strip(bgra: &[u8], width: usize, y: usize, x_start: usize, x_end: us
     (h, uniform)
 }
 
-fn hash_col_strip(bgra: &[u8], width: usize, x: usize, y_start: usize, y_end: usize) -> (u64, bool) {
+fn hash_col_strip(
+    bgra: &[u8],
+    width: usize,
+    x: usize,
+    y_start: usize,
+    y_end: usize,
+) -> (u64, bool) {
     let stride = width * 4;
     let step = ((y_end - y_start) / 96).max(1);
     let mut h: u64 = 0xcbf29ce484222325;
@@ -961,7 +974,12 @@ fn hash_col_strip(bgra: &[u8], width: usize, x: usize, y_start: usize, y_end: us
 }
 
 /// Detect a dominant vertical or horizontal scroll sub-rectangle between `prev` and `cur`.
-pub fn detect_scroll_copy_rect(prev: &[u8], cur: &[u8], width: u32, height: u32) -> Option<CopyRectOp> {
+pub fn detect_scroll_copy_rect(
+    prev: &[u8],
+    cur: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<CopyRectOp> {
     let w = width as usize;
     let h = height as usize;
     if w < 192 || h < 192 || prev.len() != cur.len() {
@@ -975,11 +993,7 @@ pub fn detect_scroll_copy_rect(prev: &[u8], cur: &[u8], width: u32, height: u32)
 
 fn detect_vertical_scroll(prev: &[u8], cur: &[u8], w: usize, h: usize) -> Option<CopyRectOp> {
     // 1. Fast exact-hash 3-band probe (handles both small and huge page-down scrolls).
-    let bands = [
-        (w / 4, (w * 3) / 4),
-        (w / 6, w / 2),
-        (w / 2, (w * 5) / 6),
-    ];
+    let bands = [(w / 4, (w * 3) / 4), (w / 6, w / 2), (w / 2, (w * 5) / 6)];
     for (x_start, x_end) in bands {
         if x_end <= x_start + 32 {
             continue;
@@ -1651,8 +1665,8 @@ impl SmartTileEncoder {
                 let tw = (width - x0).min(TILE_SIZE);
                 let tidx = ty * cols + tx;
 
-                let dirty = is_keyframe
-                    || !tile_equals(&self.ref_bgra, bgra, width, x0, y0, tw, th);
+                let dirty =
+                    is_keyframe || !tile_equals(&self.ref_bgra, bgra, width, x0, y0, tw, th);
                 if dirty {
                     let tr = &mut self.tiles[tidx];
                     if is_keyframe {
@@ -1718,7 +1732,8 @@ impl SmartTileEncoder {
         let massive_motion = !is_keyframe && dirty_tiles.len() >= (total_tiles / 6).max(12);
         let enable_local_mv = !is_keyframe && frame_mv.is_none() && massive_motion;
         let is_hidpi = width >= 1600 || height >= 1000;
-        let full_screen_video = !is_keyframe && frame_mv.is_none() && dirty_tiles.len() * 2 >= total_tiles;
+        let full_screen_video =
+            !is_keyframe && frame_mv.is_none() && dirty_tiles.len() * 2 >= total_tiles;
 
         let quality = quality.clamp(20, 95);
         // Congestion-driven half-res (with hysteresis): keep uncongested scrolling at crisp full-res,
@@ -1822,95 +1837,96 @@ impl SmartTileEncoder {
                 None
             };
             if num_workers > 1 {
-            // Partition dirty tiles by horizontal tile-row bands so each worker owns
-            // a disjoint mutable slice of `self.ref_bgra` and `self.tiles` with zero locks.
-            let rows_per_band = rows.div_ceil(num_workers);
-            let stride = width as usize * 4;
-            let mut band_tiles: Vec<Vec<(usize, usize, u32, u32, u32, u32, usize)>> =
-                vec![Vec::new(); num_workers];
-            for item in dirty_tiles {
-                let band = (item.1 / rows_per_band).min(num_workers - 1);
-                band_tiles[band].push(item);
-            }
-
-            let mut ref_rem = self.ref_bgra.as_mut_slice();
-            let mut tile_rem = self.tiles.as_mut_slice();
-            let mut band_slices = Vec::with_capacity(num_workers);
-            let mut start_row = 0usize;
-            for band_idx in 0..num_workers {
-                if start_row >= rows {
-                    break;
+                // Partition dirty tiles by horizontal tile-row bands so each worker owns
+                // a disjoint mutable slice of `self.ref_bgra` and `self.tiles` with zero locks.
+                let rows_per_band = rows.div_ceil(num_workers);
+                let stride = width as usize * 4;
+                let mut band_tiles: Vec<Vec<(usize, usize, u32, u32, u32, u32, usize)>> =
+                    vec![Vec::new(); num_workers];
+                for item in dirty_tiles {
+                    let band = (item.1 / rows_per_band).min(num_workers - 1);
+                    band_tiles[band].push(item);
                 }
-                let end_row = ((band_idx + 1) * rows_per_band).min(rows);
-                let y_offset = ((start_row as u32) * TILE_SIZE).min(height);
-                let y_end = ((end_row as u32) * TILE_SIZE).min(height);
-                let px_rows = (y_end - y_offset) as usize;
-                let byte_len = px_rows * stride;
-                let (ref_chunk, next_ref) = ref_rem.split_at_mut(byte_len);
-                ref_rem = next_ref;
 
-                let tile_len = (end_row - start_row) * cols;
-                let (tile_chunk, next_tiles) = tile_rem.split_at_mut(tile_len);
-                tile_rem = next_tiles;
+                let mut ref_rem = self.ref_bgra.as_mut_slice();
+                let mut tile_rem = self.tiles.as_mut_slice();
+                let mut band_slices = Vec::with_capacity(num_workers);
+                let mut start_row = 0usize;
+                for band_idx in 0..num_workers {
+                    if start_row >= rows {
+                        break;
+                    }
+                    let end_row = ((band_idx + 1) * rows_per_band).min(rows);
+                    let y_offset = ((start_row as u32) * TILE_SIZE).min(height);
+                    let y_end = ((end_row as u32) * TILE_SIZE).min(height);
+                    let px_rows = (y_end - y_offset) as usize;
+                    let byte_len = px_rows * stride;
+                    let (ref_chunk, next_ref) = ref_rem.split_at_mut(byte_len);
+                    ref_rem = next_ref;
 
-                let cur_start_byte = (y_offset as usize) * stride;
-                let cur_chunk = &bgra[cur_start_byte..cur_start_byte + byte_len];
-                band_slices.push((
-                    ref_chunk,
-                    cur_chunk,
-                    tile_chunk,
-                    y_offset,
-                    start_row * cols,
-                    std::mem::take(&mut band_tiles[band_idx]),
-                ));
-                start_row = end_row;
-            }
+                    let tile_len = (end_row - start_row) * cols;
+                    let (tile_chunk, next_tiles) = tile_rem.split_at_mut(tile_len);
+                    tile_rem = next_tiles;
 
-            let mut band_outputs: Vec<(Vec<u8>, bool, bool)> = Vec::with_capacity(num_workers);
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(num_workers);
-                for (ref_chunk, cur_chunk, tile_chunk, y_offset, tidx_offset, items) in band_slices
-                {
-                    handles.push(s.spawn(move || {
-                        let mut out = Vec::with_capacity(items.len() * 512);
-                        let mut local_lossy = false;
-                        let mut local_mv_used = false;
-                        encode_tile_batch(
-                            ref_chunk,
-                            prev_ref_slice,
-                            cur_chunk,
-                            tile_chunk,
-                            width,
-                            height,
-                            y_offset,
-                            tidx_offset,
-                            &items,
-                            is_keyframe,
-                            massive_motion,
-                            prefer_half_res,
-                            prefer_quarter_res,
-                            frame_mv,
-                            &luma_q,
-                            &chroma_q,
-                            &mut out,
-                            &mut local_lossy,
-                            &mut local_mv_used,
-                        );
-                        (out, local_lossy, local_mv_used)
-                    }));
+                    let cur_start_byte = (y_offset as usize) * stride;
+                    let cur_chunk = &bgra[cur_start_byte..cur_start_byte + byte_len];
+                    band_slices.push((
+                        ref_chunk,
+                        cur_chunk,
+                        tile_chunk,
+                        y_offset,
+                        start_row * cols,
+                        std::mem::take(&mut band_tiles[band_idx]),
+                    ));
+                    start_row = end_row;
                 }
-                for h in handles {
-                    band_outputs.push(h.join().expect("SmartTile worker panicked"));
-                }
-            });
 
-            let mut any_lossy = false;
-            let mut any_local_mv = false;
-            for (chunk_out, lossy, lmv) in band_outputs {
-                self.scratch_packet.extend_from_slice(&chunk_out);
-                any_lossy |= lossy;
-                any_local_mv |= lmv;
-            }
+                let mut band_outputs: Vec<(Vec<u8>, bool, bool)> = Vec::with_capacity(num_workers);
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(num_workers);
+                    for (ref_chunk, cur_chunk, tile_chunk, y_offset, tidx_offset, items) in
+                        band_slices
+                    {
+                        handles.push(s.spawn(move || {
+                            let mut out = Vec::with_capacity(items.len() * 512);
+                            let mut local_lossy = false;
+                            let mut local_mv_used = false;
+                            encode_tile_batch(
+                                ref_chunk,
+                                prev_ref_slice,
+                                cur_chunk,
+                                tile_chunk,
+                                width,
+                                height,
+                                y_offset,
+                                tidx_offset,
+                                &items,
+                                is_keyframe,
+                                massive_motion,
+                                prefer_half_res,
+                                prefer_quarter_res,
+                                frame_mv,
+                                &luma_q,
+                                &chroma_q,
+                                &mut out,
+                                &mut local_lossy,
+                                &mut local_mv_used,
+                            );
+                            (out, local_lossy, local_mv_used)
+                        }));
+                    }
+                    for h in handles {
+                        band_outputs.push(h.join().expect("SmartTile worker panicked"));
+                    }
+                });
+
+                let mut any_lossy = false;
+                let mut any_local_mv = false;
+                for (chunk_out, lossy, lmv) in band_outputs {
+                    self.scratch_packet.extend_from_slice(&chunk_out);
+                    any_lossy |= lossy;
+                    any_local_mv |= lmv;
+                }
                 (any_lossy, any_local_mv)
             } else {
                 let mut any_lossy = false;
@@ -1987,7 +2003,8 @@ impl SmartTileEncoder {
         let mut refresh_count = 0usize;
         let mut next_check_raw_len = byte_budget;
         let mut ready_payload: Option<Vec<u8>> = None;
-        let mut residual_samples = Vec::with_capacity((TILE_SIZE as usize) * (TILE_SIZE as usize) * 4);
+        let mut residual_samples =
+            Vec::with_capacity((TILE_SIZE as usize) * (TILE_SIZE as usize) * 4);
 
         'outer: for ty in 0..rows {
             let y0 = (ty as u32) * TILE_SIZE;
@@ -1999,8 +2016,10 @@ impl SmartTileEncoder {
                 }
                 let x0 = (tx as u32) * TILE_SIZE;
                 let tw = (self.width - x0).min(TILE_SIZE);
-                self.scratch_packet.extend_from_slice(&(tx as u16).to_le_bytes());
-                self.scratch_packet.extend_from_slice(&(ty as u16).to_le_bytes());
+                self.scratch_packet
+                    .extend_from_slice(&(tx as u16).to_le_bytes());
+                self.scratch_packet
+                    .extend_from_slice(&(ty as u16).to_le_bytes());
                 write_lossless_refinement_tile(
                     &mut self.ref_bgra,
                     &self.source_bgra,
@@ -2201,123 +2220,102 @@ fn encode_tiles_with_gpu(
         None
     };
 
-    let prepare_descs = |ref_slice: &[u8], descs: &mut [gpu::GpuTileDesc]| -> Vec<(u8, Option<(i8, i8)>)> {
-        let eval_mv_range = |slice: &mut [gpu::GpuTileDesc]| {
-            let mut last_mv: (i8, i8) = (0, 0);
-            let mut cur_b = usize::MAX;
-            for desc in slice.iter_mut() {
-                let ty = (desc.y0 / TILE_SIZE) as usize;
-                let b = ty / rows_per_band;
-                if b != cur_b {
-                    cur_b = b;
-                    last_mv = (0, 0);
-                }
-                if let (true, Some((dx, dy))) = (has_prev_ref, frame_mv) {
-                    let sx = desc.x0 as i32 - dx as i32;
-                    let sy = desc.y0 as i32 - dy as i32;
-                    if sx >= 0
-                        && sy >= 0
-                        && (sx as u32) + desc.tw <= fb_w
-                        && (sy as u32) + desc.th <= fb_h
-                    {
-                        let mv_sad = tile_bgra_sad(
-                            ref_slice,
-                            cur_bgra,
-                            fb_w,
-                            sx as u32,
-                            sy as u32,
-                            desc.x0,
-                            desc.y0,
-                            desc.tw,
-                            desc.th,
-                        );
-                        let zero_sad = tile_bgra_sad(
-                            ref_slice,
-                            cur_bgra,
-                            fb_w,
-                            desc.x0,
-                            desc.y0,
-                            desc.x0,
-                            desc.y0,
-                            desc.tw,
-                            desc.th,
-                        );
-                        if mv_sad < zero_sad {
-                            desc.pred_x = sx as u32;
-                            desc.pred_y = sy as u32;
-                            desc.has_alpha = MODE_FLAG_MV as u32;
+    let prepare_descs =
+        |ref_slice: &[u8], descs: &mut [gpu::GpuTileDesc]| -> Vec<(u8, Option<(i8, i8)>)> {
+            let eval_mv_range = |slice: &mut [gpu::GpuTileDesc]| {
+                let mut last_mv: (i8, i8) = (0, 0);
+                let mut cur_b = usize::MAX;
+                for desc in slice.iter_mut() {
+                    let ty = (desc.y0 / TILE_SIZE) as usize;
+                    let b = ty / rows_per_band;
+                    if b != cur_b {
+                        cur_b = b;
+                        last_mv = (0, 0);
+                    }
+                    if let (true, Some((dx, dy))) = (has_prev_ref, frame_mv) {
+                        let sx = desc.x0 as i32 - dx as i32;
+                        let sy = desc.y0 as i32 - dy as i32;
+                        if sx >= 0
+                            && sy >= 0
+                            && (sx as u32) + desc.tw <= fb_w
+                            && (sy as u32) + desc.th <= fb_h
+                        {
+                            let mv_sad = tile_bgra_sad(
+                                ref_slice, cur_bgra, fb_w, sx as u32, sy as u32, desc.x0, desc.y0,
+                                desc.tw, desc.th,
+                            );
+                            let zero_sad = tile_bgra_sad(
+                                ref_slice, cur_bgra, fb_w, desc.x0, desc.y0, desc.x0, desc.y0,
+                                desc.tw, desc.th,
+                            );
+                            if mv_sad < zero_sad {
+                                desc.pred_x = sx as u32;
+                                desc.pred_y = sy as u32;
+                                desc.has_alpha = MODE_FLAG_MV as u32;
+                            }
+                        }
+                    } else if has_prev_ref {
+                        if let Some((ldx, ldy, sx, sy)) = search_local_mv_2d(
+                            ref_slice, cur_bgra, fb_w, fb_h, desc.x0, desc.y0, desc.y0, desc.tw,
+                            desc.th, last_mv,
+                        ) {
+                            last_mv = (ldx, ldy);
+                            desc.pred_x = sx;
+                            desc.pred_y = sy;
+                            desc.has_alpha = (MODE_FLAG_LOCAL_MV as u32)
+                                | ((ldx as u8 as u32) << 8)
+                                | ((ldy as u8 as u32) << 16);
                         }
                     }
-                } else if has_prev_ref {
-                    if let Some((ldx, ldy, sx, sy)) = search_local_mv_2d(
-                        ref_slice,
-                        cur_bgra,
-                        fb_w,
-                        fb_h,
-                        desc.x0,
-                        desc.y0,
-                        desc.y0,
-                        desc.tw,
-                        desc.th,
-                        last_mv,
-                    ) {
-                        last_mv = (ldx, ldy);
-                        desc.pred_x = sx;
-                        desc.pred_y = sy;
-                        desc.has_alpha = (MODE_FLAG_LOCAL_MV as u32)
-                            | ((ldx as u8 as u32) << 8)
-                            | ((ldy as u8 as u32) << 16);
-                    }
                 }
-            }
-        };
-
-        if rows_per_band < usize::MAX && descs.len() >= 48 {
-            // Split `descs` at exact band boundaries so each worker computes identical `last_local_mv` chains.
-            let mut band_splits = Vec::with_capacity(4);
-            let mut rem = &mut descs[..];
-            let mut next_band = 1usize;
-            while !rem.is_empty() && next_band < 4 {
-                let split_pos = rem
-                    .iter()
-                    .position(|d| ((d.y0 / TILE_SIZE) as usize) >= next_band * rows_per_band);
-                if let Some(pos) = split_pos {
-                    let (head, tail) = rem.split_at_mut(pos);
-                    if !head.is_empty() {
-                        band_splits.push(head);
-                    }
-                    rem = tail;
-                }
-                next_band += 1;
-            }
-            if !rem.is_empty() {
-                band_splits.push(rem);
-            }
-            std::thread::scope(|s| {
-                for chunk in band_splits {
-                    s.spawn(move || eval_mv_range(chunk));
-                }
-            });
-        } else {
-            eval_mv_range(descs);
-        }
-
-        let mut mv_info = Vec::with_capacity(descs.len());
-        for d in descs.iter_mut() {
-            let packed = d.has_alpha;
-            d.has_alpha = 0;
-            let flag = (packed & 0xFF) as u8;
-            let lmv = if flag == MODE_FLAG_LOCAL_MV {
-                let ldx = ((packed >> 8) & 0xFF) as u8 as i8;
-                let ldy = ((packed >> 16) & 0xFF) as u8 as i8;
-                Some((ldx, ldy))
-            } else {
-                None
             };
-            mv_info.push((flag, lmv));
-        }
-        mv_info
-    };
+
+            if rows_per_band < usize::MAX && descs.len() >= 48 {
+                // Split `descs` at exact band boundaries so each worker computes identical `last_local_mv` chains.
+                let mut band_splits = Vec::with_capacity(4);
+                let mut rem = &mut descs[..];
+                let mut next_band = 1usize;
+                while !rem.is_empty() && next_band < 4 {
+                    let split_pos = rem
+                        .iter()
+                        .position(|d| ((d.y0 / TILE_SIZE) as usize) >= next_band * rows_per_band);
+                    if let Some(pos) = split_pos {
+                        let (head, tail) = rem.split_at_mut(pos);
+                        if !head.is_empty() {
+                            band_splits.push(head);
+                        }
+                        rem = tail;
+                    }
+                    next_band += 1;
+                }
+                if !rem.is_empty() {
+                    band_splits.push(rem);
+                }
+                std::thread::scope(|s| {
+                    for chunk in band_splits {
+                        s.spawn(move || eval_mv_range(chunk));
+                    }
+                });
+            } else {
+                eval_mv_range(descs);
+            }
+
+            let mut mv_info = Vec::with_capacity(descs.len());
+            for d in descs.iter_mut() {
+                let packed = d.has_alpha;
+                d.has_alpha = 0;
+                let flag = (packed & 0xFF) as u8;
+                let lmv = if flag == MODE_FLAG_LOCAL_MV {
+                    let ldx = ((packed >> 8) & 0xFF) as u8 as i8;
+                    let ldy = ((packed >> 16) & 0xFF) as u8 as i8;
+                    Some((ldx, ldy))
+                } else {
+                    None
+                };
+                mv_info.push((flag, lmv));
+            }
+            mv_info
+        };
 
     let stride = fb_w as usize * 4;
     let total_rows = fb_h.div_ceil(TILE_SIZE) as usize;
@@ -2696,47 +2694,42 @@ fn encode_tile_batch(
         // Pick the best temporal predictor:
         // 1. Frame scroll MV `(sx, sy)` if a scroll was detected, else
         // 2. Lightweight per-tile 2D diamond search `(local_dx, local_dy)` for panning video / moving objects.
-        let (pred_buf, pred_x, pred_y, mv_flag, local_mv): (
-            &[u8],
-            u32,
-            u32,
-            u8,
-            Option<(i8, i8)>,
-        ) = if wants_lossy {
-            if let (Some(prev_full), Some((sx, sy))) = (prev_ref_full, mv_src) {
-                let mv_sad =
-                    tile_bgra_sad(prev_full, cur_bgra, fb_w, sx, sy, x0, local_y0, tw, th);
-                let zero_sad =
-                    tile_bgra_sad(ref_bgra, cur_bgra, fb_w, x0, local_y0, x0, local_y0, tw, th);
-                if mv_sad < zero_sad {
-                    (prev_full, sx, sy, MODE_FLAG_MV, None)
-                } else {
-                    (ref_bgra, x0, local_y0, 0, None)
-                }
-            } else if let Some(prev_full) = prev_ref_full {
-                if let Some((ldx, ldy, sx, sy)) = search_local_mv_2d(
-                    prev_full,
-                    cur_bgra,
-                    fb_w,
-                    fb_h,
-                    x0,
-                    y0,
-                    local_y0,
-                    tw,
-                    th,
-                    last_local_mv,
-                ) {
-                    last_local_mv = (ldx, ldy);
-                    (prev_full, sx, sy, MODE_FLAG_LOCAL_MV, Some((ldx, ldy)))
+        let (pred_buf, pred_x, pred_y, mv_flag, local_mv): (&[u8], u32, u32, u8, Option<(i8, i8)>) =
+            if wants_lossy {
+                if let (Some(prev_full), Some((sx, sy))) = (prev_ref_full, mv_src) {
+                    let mv_sad =
+                        tile_bgra_sad(prev_full, cur_bgra, fb_w, sx, sy, x0, local_y0, tw, th);
+                    let zero_sad =
+                        tile_bgra_sad(ref_bgra, cur_bgra, fb_w, x0, local_y0, x0, local_y0, tw, th);
+                    if mv_sad < zero_sad {
+                        (prev_full, sx, sy, MODE_FLAG_MV, None)
+                    } else {
+                        (ref_bgra, x0, local_y0, 0, None)
+                    }
+                } else if let Some(prev_full) = prev_ref_full {
+                    if let Some((ldx, ldy, sx, sy)) = search_local_mv_2d(
+                        prev_full,
+                        cur_bgra,
+                        fb_w,
+                        fb_h,
+                        x0,
+                        y0,
+                        local_y0,
+                        tw,
+                        th,
+                        last_local_mv,
+                    ) {
+                        last_local_mv = (ldx, ldy);
+                        (prev_full, sx, sy, MODE_FLAG_LOCAL_MV, Some((ldx, ldy)))
+                    } else {
+                        (ref_bgra, x0, local_y0, 0, None)
+                    }
                 } else {
                     (ref_bgra, x0, local_y0, 0, None)
                 }
             } else {
                 (ref_bgra, x0, local_y0, 0, None)
-            }
-        } else {
-            (ref_bgra, x0, local_y0, 0, None)
-        };
+            };
 
         if wants_lossy && prefer_quarter_res {
             *used_lossy = true;
@@ -3379,15 +3372,7 @@ fn search_local_mv_2d(
             return None;
         }
         let sad = tile_bgra_sad_fast(
-            prev_full,
-            cur_band,
-            fb_w,
-            sx as u32,
-            sy as u32,
-            x0,
-            local_y0,
-            tw,
-            th,
+            prev_full, cur_band, fb_w, sx as u32, sy as u32, x0, local_y0, tw, th,
         );
         Some((sad, sx as u32, sy as u32))
     };
@@ -4115,28 +4100,57 @@ impl SmartTileDecoder {
                 }
                 MODE_LOSSLESS_RESIDUAL if !use_mv && !use_local_mv => {
                     decode_lossless_residual_tile(
-                        &raw,
-                        &mut pos,
-                        has_alpha,
-                        bgra_mut,
-                        width,
-                        x0,
-                        y0,
-                        tw,
-                        th,
+                        &raw, &mut pos, has_alpha, bgra_mut, width, x0, y0, tw, th,
                     )?;
                 }
                 MODE_DCT_INTRA if !use_mv && !use_local_mv => {
-                    let sc = dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
+                    let sc =
+                        dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
                     let luma_bx = (tw as usize).div_ceil(8);
                     let luma_by = (th as usize).div_ceil(8);
                     let chroma_bx = ((tw as usize).div_ceil(2)).div_ceil(8);
                     let chroma_by = ((th as usize).div_ceil(2)).div_ceil(8);
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_y, 64, luma_bx, luma_by, &luma_q)?;
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_cb, 32, chroma_bx, chroma_by, &chroma_q)?;
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_cr, 32, chroma_bx, chroma_by, &chroma_q)?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_y,
+                        64,
+                        luma_bx,
+                        luma_by,
+                        &luma_q,
+                    )?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_cb,
+                        32,
+                        chroma_bx,
+                        chroma_by,
+                        &chroma_q,
+                    )?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_cr,
+                        32,
+                        chroma_bx,
+                        chroma_by,
+                        &chroma_q,
+                    )?;
                     if has_alpha {
-                        decode_plane(&raw, &mut pos, None, &mut sc.recon_a, 64, luma_bx, luma_by, &luma_q)?;
+                        decode_plane(
+                            &raw,
+                            &mut pos,
+                            None,
+                            &mut sc.recon_a,
+                            64,
+                            luma_bx,
+                            luma_by,
+                            &luma_q,
+                        )?;
                     }
                     ycbcr420_to_bgra_tile(
                         &sc.recon_y,
@@ -4152,7 +4166,8 @@ impl SmartTileDecoder {
                     );
                 }
                 MODE_DCT_INTER => {
-                    let sc = dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
+                    let sc =
+                        dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
                     let luma_bx = (tw as usize).div_ceil(8);
                     let luma_by = (th as usize).div_ceil(8);
                     let chroma_bx = ((tw as usize).div_ceil(2)).div_ceil(8);
@@ -4236,18 +4251,55 @@ impl SmartTileDecoder {
                     );
                 }
                 MODE_DCT_HALF_INTRA if !use_mv && !use_local_mv => {
-                    let sc = dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
+                    let sc =
+                        dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
                     let hw = (tw as usize).div_ceil(2);
                     let hh = (th as usize).div_ceil(2);
                     let luma_bx = hw.div_ceil(8);
                     let luma_by = hh.div_ceil(8);
                     let chroma_bx = hw.div_ceil(2).div_ceil(8);
                     let chroma_by = hh.div_ceil(2).div_ceil(8);
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_hy, 32, luma_bx, luma_by, &luma_q)?;
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_hcb, 16, chroma_bx, chroma_by, &chroma_q)?;
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_hcr, 16, chroma_bx, chroma_by, &chroma_q)?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_hy,
+                        32,
+                        luma_bx,
+                        luma_by,
+                        &luma_q,
+                    )?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_hcb,
+                        16,
+                        chroma_bx,
+                        chroma_by,
+                        &chroma_q,
+                    )?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_hcr,
+                        16,
+                        chroma_bx,
+                        chroma_by,
+                        &chroma_q,
+                    )?;
                     if has_alpha {
-                        decode_plane(&raw, &mut pos, None, &mut sc.recon_ha, 32, luma_bx, luma_by, &luma_q)?;
+                        decode_plane(
+                            &raw,
+                            &mut pos,
+                            None,
+                            &mut sc.recon_ha,
+                            32,
+                            luma_bx,
+                            luma_by,
+                            &luma_q,
+                        )?;
                     }
                     ycbcr420_half_to_bgra_tile(
                         &sc.recon_hy,
@@ -4263,7 +4315,8 @@ impl SmartTileDecoder {
                     );
                 }
                 MODE_DCT_HALF_INTER => {
-                    let sc = dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
+                    let sc =
+                        dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
                     let hw = (tw as usize).div_ceil(2);
                     let hh = (th as usize).div_ceil(2);
                     let luma_bx = hw.div_ceil(8);
@@ -4349,18 +4402,55 @@ impl SmartTileDecoder {
                     );
                 }
                 MODE_DCT_QUARTER_INTRA if !use_mv && !use_local_mv => {
-                    let sc = dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
+                    let sc =
+                        dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
                     let qw = (tw as usize).div_ceil(4);
                     let qh = (th as usize).div_ceil(4);
                     let luma_bx = qw.div_ceil(8);
                     let luma_by = qh.div_ceil(8);
                     let chroma_bx = qw.div_ceil(2).div_ceil(8);
                     let chroma_by = qh.div_ceil(2).div_ceil(8);
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_qy, 16, luma_bx, luma_by, &luma_q)?;
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_qcb, 8, chroma_bx, chroma_by, &chroma_q)?;
-                    decode_plane(&raw, &mut pos, None, &mut sc.recon_qcr, 8, chroma_bx, chroma_by, &chroma_q)?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_qy,
+                        16,
+                        luma_bx,
+                        luma_by,
+                        &luma_q,
+                    )?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_qcb,
+                        8,
+                        chroma_bx,
+                        chroma_by,
+                        &chroma_q,
+                    )?;
+                    decode_plane(
+                        &raw,
+                        &mut pos,
+                        None,
+                        &mut sc.recon_qcr,
+                        8,
+                        chroma_bx,
+                        chroma_by,
+                        &chroma_q,
+                    )?;
                     if has_alpha {
-                        decode_plane(&raw, &mut pos, None, &mut sc.recon_qa, 16, luma_bx, luma_by, &luma_q)?;
+                        decode_plane(
+                            &raw,
+                            &mut pos,
+                            None,
+                            &mut sc.recon_qa,
+                            16,
+                            luma_bx,
+                            luma_by,
+                            &luma_q,
+                        )?;
                     }
                     ycbcr420_quarter_to_bgra_tile(
                         &sc.recon_qy,
@@ -4376,7 +4466,8 @@ impl SmartTileDecoder {
                     );
                 }
                 MODE_DCT_QUARTER_INTER => {
-                    let sc = dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
+                    let sc =
+                        dct_scratch.get_or_insert_with(|| Box::new(DctDecodeScratch::default()));
                     let qw = (tw as usize).div_ceil(4);
                     let qh = (th as usize).div_ceil(4);
                     let luma_bx = qw.div_ceil(8);
@@ -4404,7 +4495,15 @@ impl SmartTileDecoder {
                         &mut sc.ref_qcr,
                     );
                     if has_alpha {
-                        bgra_tile_to_alpha_quarter(pred_buf, width, px0, py0, tw, th, &mut sc.ref_qa);
+                        bgra_tile_to_alpha_quarter(
+                            pred_buf,
+                            width,
+                            px0,
+                            py0,
+                            tw,
+                            th,
+                            &mut sc.ref_qa,
+                        );
                     }
                     decode_plane(
                         &raw,
@@ -4540,7 +4639,8 @@ mod tests {
             }
         }
 
-        let op = detect_scroll_copy_rect(&frame1, &frame2, w, h).expect("should detect vertical scroll");
+        let op =
+            detect_scroll_copy_rect(&frame1, &frame2, w, h).expect("should detect vertical scroll");
         assert_eq!(op.src_y as i32 - op.dst_y as i32, dy as i32);
         assert!(op.dst_x >= 96);
         assert!(op.dst_y >= 48);
@@ -4601,7 +4701,10 @@ mod tests {
         let f1 = make_frame(1);
         let p1 = enc.encode(w, h, &f1, 75);
         let d1 = dec.decode(w, h, &p1.payload).unwrap();
-        assert_eq!(d1, enc.ref_bgra, "encoder and decoder reference must match bit-for-bit");
+        assert_eq!(
+            d1, enc.ref_bgra,
+            "encoder and decoder reference must match bit-for-bit"
+        );
 
         let f2 = make_frame(2);
         let p2 = enc.encode(w, h, &f2, 75);
@@ -4625,7 +4728,10 @@ mod tests {
             let _ = dec.decode(w, h, &refresh.payload).unwrap();
             refresh_chunks += 1;
         }
-        assert!(refresh_chunks >= 1, "should emit at least one refresh chunk");
+        assert!(
+            refresh_chunks >= 1,
+            "should emit at least one refresh chunk"
+        );
         assert!(!enc.has_pending_lossless_refresh());
         assert_eq!(*dec.bgra, f2);
     }
@@ -4689,8 +4795,8 @@ mod tests {
             assert!(saw_lossy, "expected lossy alpha DCT for {w}x{h} q={q}");
 
             // Idle lossless refinement restores 100% bit-exact RGBA pixels.
-            while let Some(chunk) = enc
-                .encode_lossless_refresh(DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES)
+            while let Some(chunk) =
+                enc.encode_lossless_refresh(DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES)
             {
                 let _ = dec.decode(w, h, &chunk.payload).unwrap();
             }
@@ -4738,14 +4844,20 @@ mod tests {
         let p1 = enc.encode(w, h, &f1, 75);
         assert!(p1.used_lossy);
         let d1 = dec.decode(w, h, &p1.payload).unwrap();
-        assert_eq!(d1, enc.ref_bgra, "half-res DCT reference must match bit-for-bit");
+        assert_eq!(
+            d1, enc.ref_bgra,
+            "half-res DCT reference must match bit-for-bit"
+        );
 
         // Second motion frame exercises half-res P-tiles.
         let f2 = make_frame(24);
         let p2 = enc.encode(w, h, &f2, 75);
         assert!(p2.used_lossy);
         let d2 = dec.decode(w, h, &p2.payload).unwrap();
-        assert_eq!(d2, enc.ref_bgra, "half-res P-tile reference must stay bit-exact");
+        assert_eq!(
+            d2, enc.ref_bgra,
+            "half-res P-tile reference must stay bit-exact"
+        );
 
         // Progressive chunked refinement should take multiple small chunks and end 100% lossless.
         let mut chunks = 0usize;
@@ -4756,7 +4868,10 @@ mod tests {
             let _ = dec.decode(w, h, &chunk.payload).unwrap();
             chunks += 1;
         }
-        assert!(chunks >= 2, "expected multiple progressive chunks, got {chunks}");
+        assert!(
+            chunks >= 2,
+            "expected multiple progressive chunks, got {chunks}"
+        );
         assert_eq!(*dec.bgra, f2);
     }
 
@@ -4801,14 +4916,20 @@ mod tests {
             p1_half.payload.len()
         );
         let d1 = dec.decode(w, h, &p1.payload).unwrap();
-        assert_eq!(d1, enc.ref_bgra, "quarter-res I-tile reference must match bit-for-bit");
+        assert_eq!(
+            d1, enc.ref_bgra,
+            "quarter-res I-tile reference must match bit-for-bit"
+        );
 
         // Second congested frame exercises quarter-res P-tiles.
         let f2 = make_frame(2);
         let p2 = enc.encode(w, h, &f2, 26);
         assert!(p2.used_lossy);
         let d2 = dec.decode(w, h, &p2.payload).unwrap();
-        assert_eq!(d2, enc.ref_bgra, "quarter-res P-tile reference must stay bit-exact");
+        assert_eq!(
+            d2, enc.ref_bgra,
+            "quarter-res P-tile reference must stay bit-exact"
+        );
 
         // Idle lossless refinement restores 100% exact pixels.
         while let Some(chunk) =
@@ -4831,7 +4952,9 @@ mod tests {
             let mut s = seed_init;
             let mut buf = vec![0u8; (w * h * 4) as usize];
             for px in buf.chunks_exact_mut(4) {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 px[0] = (s >> 16) as u8;
                 px[1] = (s >> 24) as u8;
                 px[2] = (s >> 32) as u8;
@@ -4905,9 +5028,8 @@ mod tests {
                     let idx = ((y * w + x) * 4) as usize;
                     buf[idx] = ((x as i32 + phase as i32 * 5 + jitter).clamp(0, 255)) as u8;
                     buf[idx + 1] = ((y as i32 + phase as i32 * 3 + jitter).clamp(0, 255)) as u8;
-                    buf[idx + 2] =
-                        (((x as i32 + y as i32) / 2 + phase as i32 * 2 + jitter).clamp(0, 255))
-                            as u8;
+                    buf[idx + 2] = (((x as i32 + y as i32) / 2 + phase as i32 * 2 + jitter)
+                        .clamp(0, 255)) as u8;
                     buf[idx + 3] = 255;
                 }
             }
@@ -4936,7 +5058,10 @@ mod tests {
             total_refresh_bytes += chunk.payload.len();
             let _ = dec.decode(w, h, &chunk.payload).unwrap();
         }
-        assert_eq!(*dec.bgra, f2, "lossless residual refinement must be 100% bit-exact");
+        assert_eq!(
+            *dec.bgra, f2,
+            "lossless residual refinement must be 100% bit-exact"
+        );
         assert!(
             total_refresh_bytes < (raw_lz4_len * 3) / 4,
             "expected Golomb-Rice lossless residual ({total_refresh_bytes} B) to significantly beat raw LZ4 ({raw_lz4_len} B)"
@@ -4967,11 +5092,10 @@ mod tests {
                         let hi = (sy >> 8).wrapping_mul(19);
                         let v = ((sy.wrapping_mul(37) ^ x.wrapping_mul(17) ^ hi) & 0xFF) as i32;
                         buf[idx] = (v + jitter).clamp(0, 255) as u8;
-                        buf[idx + 1] =
-                            (((v + ((sy.wrapping_mul(3) + hi) as i32 & 0xFF)) & 0xFF) + jitter)
-                                .clamp(0, 255) as u8;
-                        buf[idx + 2] =
-                            (((v * 3 + hi as i32) & 0xFF) + jitter).clamp(0, 255) as u8;
+                        buf[idx + 1] = (((v + ((sy.wrapping_mul(3) + hi) as i32 & 0xFF)) & 0xFF)
+                            + jitter)
+                            .clamp(0, 255) as u8;
+                        buf[idx + 2] = (((v * 3 + hi as i32) & 0xFF) + jitter).clamp(0, 255) as u8;
                         buf[idx + 3] = 255;
                     }
                 }
@@ -5009,7 +5133,10 @@ mod tests {
         let p2 = enc.encode(w, h, &f2, 76);
         assert!(p2.had_copy_rect, "should detect smooth-scroll MV");
         let d2 = dec.decode(w, h, &p2.payload).unwrap();
-        assert_eq!(d2, enc.ref_bgra, "MV-Inter DCT reference must stay bit-exact");
+        assert_eq!(
+            d2, enc.ref_bgra,
+            "MV-Inter DCT reference must stay bit-exact"
+        );
 
         // Idle lossless refinement restores 100% exact pixels.
         while let Some(chunk) =
@@ -5056,7 +5183,10 @@ mod tests {
 
         let f1 = make_pan_frame(1);
         let p1 = enc.encode(w, h, &f1, 60);
-        assert!(!p1.had_copy_rect, "diagonal pan should not trigger 1D scroll MV");
+        assert!(
+            !p1.had_copy_rect,
+            "diagonal pan should not trigger 1D scroll MV"
+        );
         assert!(p1.used_lossy);
         let raw1 = lz4_flex::decompress_size_prepended(&p1.payload).unwrap();
         assert_ne!(
@@ -5065,13 +5195,19 @@ mod tests {
             "expected diagonal pan to use per-tile 2D local MVs (FLAG_PREV_REF)"
         );
         let d1 = dec.decode(w, h, &p1.payload).unwrap();
-        assert_eq!(d1, enc.ref_bgra, "2D local MV reference must match bit-for-bit");
+        assert_eq!(
+            d1, enc.ref_bgra,
+            "2D local MV reference must match bit-for-bit"
+        );
 
         let f2 = make_pan_frame(2);
         let p2 = enc.encode(w, h, &f2, 50);
         assert!(p2.used_lossy);
         let d2 = dec.decode(w, h, &p2.payload).unwrap();
-        assert_eq!(d2, enc.ref_bgra, "consecutive 2D local MV frame must stay bit-exact");
+        assert_eq!(
+            d2, enc.ref_bgra,
+            "consecutive 2D local MV frame must stay bit-exact"
+        );
 
         while let Some(chunk) =
             enc.encode_lossless_refresh(DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES)
@@ -5200,8 +5336,11 @@ mod tests {
             *b = (next_u32() & 0xFF) as u8;
         }
 
-        for &(x0, y0, tw, th) in &[(0u32, 0u32, 64u32, 64u32), (12, 8, 64, 53), (64, 64, 45, 37)]
-        {
+        for &(x0, y0, tw, th) in &[
+            (0u32, 0u32, 64u32, 64u32),
+            (12, 8, 64, 53),
+            (64, 64, 45, 37),
+        ] {
             // Full-res forward
             let mut y_simd = [0i32; 64 * 64];
             let mut cb_simd = [0i32; 32 * 32];
@@ -5434,7 +5573,9 @@ mod tests {
         let c_iters = 400usize;
         let tc0 = Instant::now();
         for _ in 0..c_iters {
-            bgra_tile_to_ycbcr420(&src_bgra, fb_w, 0, 0, 64, 64, &mut y_p, &mut cb_p, &mut cr_p);
+            bgra_tile_to_ycbcr420(
+                &src_bgra, fb_w, 0, 0, 64, 64, &mut y_p, &mut cb_p, &mut cr_p,
+            );
             ycbcr420_to_bgra_tile(&y_p, &cb_p, &cr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64);
         }
         let dc_simd = tc0.elapsed();
@@ -5445,7 +5586,16 @@ mod tests {
                 &src_bgra, fb_w, 0, 0, 64, 64, &mut y_p, &mut cb_p, &mut cr_p,
             );
             simd::ycbcr420_to_bgra_tile_scalar(
-                &y_p, &cb_p, &cr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64,
+                &y_p,
+                &cb_p,
+                &cr_p,
+                None,
+                &mut out_fb,
+                fb_w,
+                0,
+                0,
+                64,
+                64,
             );
         }
         let dc_scalar = tc1.elapsed();
@@ -5465,15 +5615,41 @@ mod tests {
         let mut hcr_p = [0i32; 16 * 16];
         let th0 = Instant::now();
         for _ in 0..c_iters {
-            bgra_tile_to_ycbcr420_half(&src_bgra, fb_w, 0, 0, 64, 64, &mut hy_p, &mut hcb_p, &mut hcr_p);
-            ycbcr420_half_to_bgra_tile(&hy_p, &hcb_p, &hcr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64);
+            bgra_tile_to_ycbcr420_half(
+                &src_bgra, fb_w, 0, 0, 64, 64, &mut hy_p, &mut hcb_p, &mut hcr_p,
+            );
+            ycbcr420_half_to_bgra_tile(
+                &hy_p,
+                &hcb_p,
+                &hcr_p,
+                None,
+                &mut out_fb,
+                fb_w,
+                0,
+                0,
+                64,
+                64,
+            );
         }
         let dh_simd = th0.elapsed();
 
         let th1 = Instant::now();
         for _ in 0..c_iters {
-            simd::bgra_tile_to_ycbcr420_half_scalar(&src_bgra, fb_w, 0, 0, 64, 64, &mut hy_p, &mut hcb_p, &mut hcr_p);
-            simd::ycbcr420_half_to_bgra_tile_scalar(&hy_p, &hcb_p, &hcr_p, None, &mut out_fb, fb_w, 0, 0, 64, 64);
+            simd::bgra_tile_to_ycbcr420_half_scalar(
+                &src_bgra, fb_w, 0, 0, 64, 64, &mut hy_p, &mut hcb_p, &mut hcr_p,
+            );
+            simd::ycbcr420_half_to_bgra_tile_scalar(
+                &hy_p,
+                &hcb_p,
+                &hcr_p,
+                None,
+                &mut out_fb,
+                fb_w,
+                0,
+                0,
+                64,
+                64,
+            );
         }
         let dh_scalar = th1.elapsed();
 
@@ -5483,13 +5659,16 @@ mod tests {
         let top0 = Instant::now();
         let mut op_acc = 0usize;
         for _ in 0..op_iters {
-            op_acc += std::hint::black_box(tile_is_opaque(&opaque_buf, fb_w, 0, 0, 64, 64)) as usize;
+            op_acc +=
+                std::hint::black_box(tile_is_opaque(&opaque_buf, fb_w, 0, 0, 64, 64)) as usize;
         }
         let dop_simd = top0.elapsed();
 
         let top1 = Instant::now();
         for _ in 0..op_iters {
-            op_acc += std::hint::black_box(simd::tile_is_opaque_scalar(&opaque_buf, fb_w, 0, 0, 64, 64)) as usize;
+            op_acc +=
+                std::hint::black_box(simd::tile_is_opaque_scalar(&opaque_buf, fb_w, 0, 0, 64, 64))
+                    as usize;
         }
         let dop_scalar = top1.elapsed();
         assert_eq!(op_acc, op_iters * 2);
@@ -5499,14 +5678,30 @@ mod tests {
         let tid0 = Instant::now();
         let mut id_acc_s = 0usize;
         for _ in 0..id_iters {
-            id_acc_s += std::hint::black_box(count_identical_pixels(&src_bgra, &other_bgra, fb_w, 0, 0, 64, 64));
+            id_acc_s += std::hint::black_box(count_identical_pixels(
+                &src_bgra,
+                &other_bgra,
+                fb_w,
+                0,
+                0,
+                64,
+                64,
+            ));
         }
         let did_simd = tid0.elapsed();
 
         let tid1 = Instant::now();
         let mut id_acc_r = 0usize;
         for _ in 0..id_iters {
-            id_acc_r += std::hint::black_box(simd::count_identical_pixels_scalar(&src_bgra, &other_bgra, fb_w, 0, 0, 64, 64));
+            id_acc_r += std::hint::black_box(simd::count_identical_pixels_scalar(
+                &src_bgra,
+                &other_bgra,
+                fb_w,
+                0,
+                0,
+                64,
+                64,
+            ));
         }
         let did_scalar = tid1.elapsed();
         assert_eq!(id_acc_s, id_acc_r);
@@ -5520,16 +5715,30 @@ mod tests {
         let tx0 = Instant::now();
         for _ in 0..xor_iters {
             xor_out.clear();
-            xor_encode_row(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_cur), &mut xor_out);
-            xor_decode_row(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_out));
+            xor_encode_row(
+                std::hint::black_box(&mut xor_ref),
+                std::hint::black_box(&xor_cur),
+                &mut xor_out,
+            );
+            xor_decode_row(
+                std::hint::black_box(&mut xor_ref),
+                std::hint::black_box(&xor_out),
+            );
         }
         let dx_simd = tx0.elapsed();
 
         let tx1 = Instant::now();
         for _ in 0..xor_iters {
             xor_out.clear();
-            simd::xor_encode_row_scalar(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_cur), &mut xor_out);
-            simd::xor_decode_row_scalar(std::hint::black_box(&mut xor_ref), std::hint::black_box(&xor_out));
+            simd::xor_encode_row_scalar(
+                std::hint::black_box(&mut xor_ref),
+                std::hint::black_box(&xor_cur),
+                &mut xor_out,
+            );
+            simd::xor_decode_row_scalar(
+                std::hint::black_box(&mut xor_ref),
+                std::hint::black_box(&xor_out),
+            );
         }
         let dx_scalar = tx1.elapsed();
 
@@ -5538,10 +5747,18 @@ mod tests {
              tile_is_opaque (10k tiles): {:?} vs {:?} ({:.2}x)\n\
              count_identical_pixels (5k tiles): {:?} vs {:?} ({:.2}x)\n\
              1080p XOR encode+decode (100 frames): {:?} vs {:?} ({:.2}x)",
-            dh_simd, dh_scalar, dh_scalar.as_secs_f64() / dh_simd.as_secs_f64().max(1e-9),
-            dop_simd, dop_scalar, dop_scalar.as_secs_f64() / dop_simd.as_secs_f64().max(1e-9),
-            did_simd, did_scalar, did_scalar.as_secs_f64() / did_simd.as_secs_f64().max(1e-9),
-            dx_simd, dx_scalar, dx_scalar.as_secs_f64() / dx_simd.as_secs_f64().max(1e-9),
+            dh_simd,
+            dh_scalar,
+            dh_scalar.as_secs_f64() / dh_simd.as_secs_f64().max(1e-9),
+            dop_simd,
+            dop_scalar,
+            dop_scalar.as_secs_f64() / dop_simd.as_secs_f64().max(1e-9),
+            did_simd,
+            did_scalar,
+            did_scalar.as_secs_f64() / did_simd.as_secs_f64().max(1e-9),
+            dx_simd,
+            dx_scalar,
+            dx_scalar.as_secs_f64() / dx_simd.as_secs_f64().max(1e-9),
         );
 
         // End-to-end 1080p (1920x1080) SmartTileEncoder & SmartTileDecoder benchmark:
@@ -5567,44 +5784,54 @@ mod tests {
             })
             .collect();
 
-        let run_e2e = |force_scalar: bool, disable_gpu: bool, quality: u8| -> (Duration, Duration, Vec<u8>) {
-            FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
-            FORCE_DISABLE_GPU.store(disable_gpu, Ordering::Relaxed);
-            let mut enc = SmartTileEncoder::new();
-            let mut dec = SmartTileDecoder::new();
-            // Prime with keyframe + first motion frame
-            let p0 = enc.encode(w, h, &frames[0], quality);
-            let _ = dec.decode(w, h, &p0.payload).unwrap();
-            let p1 = enc.encode(w, h, &frames[1], quality);
-            let _ = dec.decode(w, h, &p1.payload).unwrap();
+        let run_e2e =
+            |force_scalar: bool, disable_gpu: bool, quality: u8| -> (Duration, Duration, Vec<u8>) {
+                FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
+                FORCE_DISABLE_GPU.store(disable_gpu, Ordering::Relaxed);
+                let mut enc = SmartTileEncoder::new();
+                let mut dec = SmartTileDecoder::new();
+                // Prime with keyframe + first motion frame
+                let p0 = enc.encode(w, h, &frames[0], quality);
+                let _ = dec.decode(w, h, &p0.payload).unwrap();
+                let p1 = enc.encode(w, h, &frames[1], quality);
+                let _ = dec.decode(w, h, &p1.payload).unwrap();
 
-            let mut enc_time = Duration::ZERO;
-            let mut dec_time = Duration::ZERO;
-            let mut last_dec = Vec::new();
-            for f in &frames[2..6] {
-                let t_e = Instant::now();
-                let pkt = enc.encode(w, h, f, quality);
-                enc_time += t_e.elapsed();
+                let mut enc_time = Duration::ZERO;
+                let mut dec_time = Duration::ZERO;
+                let mut last_dec = Vec::new();
+                for f in &frames[2..6] {
+                    let t_e = Instant::now();
+                    let pkt = enc.encode(w, h, f, quality);
+                    enc_time += t_e.elapsed();
 
-                let t_d = Instant::now();
-                let (buf, _) = dec.decode_with_damage(w, h, &pkt.payload).unwrap();
-                dec_time += t_d.elapsed();
-                last_dec = (*buf).clone();
-            }
-            FORCE_SCALAR.store(false, Ordering::Relaxed);
-            FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
-            (enc_time / 4, dec_time / 4, last_dec)
-        };
+                    let t_d = Instant::now();
+                    let (buf, _) = dec.decode_with_damage(w, h, &pkt.payload).unwrap();
+                    dec_time += t_d.elapsed();
+                    last_dec = (*buf).clone();
+                }
+                FORCE_SCALAR.store(false, Ordering::Relaxed);
+                FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
+                (enc_time / 4, dec_time / 4, last_dec)
+            };
 
         let (e_full_gpu, _d_full_gpu, out_full_gpu) = run_e2e(false, false, 75);
         let (e_full_simd, d_full_simd, out_full_simd) = run_e2e(false, true, 75);
         let (e_full_scal, d_full_scal, out_full_scal) = run_e2e(true, true, 75);
-        assert_eq!(out_full_simd, out_full_scal, "end-to-end 1080p full-res SIMD vs Scalar must be bit-identical");
-        assert_eq!(out_full_gpu, out_full_simd, "end-to-end 1080p full-res GPU vs SIMD must be bit-identical");
+        assert_eq!(
+            out_full_simd, out_full_scal,
+            "end-to-end 1080p full-res SIMD vs Scalar must be bit-identical"
+        );
+        assert_eq!(
+            out_full_gpu, out_full_simd,
+            "end-to-end 1080p full-res GPU vs SIMD must be bit-identical"
+        );
 
         let (e_half_simd, d_half_simd, out_half_simd) = run_e2e(false, true, 50);
         let (e_half_scal, d_half_scal, out_half_scal) = run_e2e(true, true, 50);
-        assert_eq!(out_half_simd, out_half_scal, "end-to-end 1080p half-res must be bit-identical");
+        assert_eq!(
+            out_half_simd, out_half_scal,
+            "end-to-end 1080p half-res must be bit-identical"
+        );
 
         if let Some(eng) = gpu::global_gpu_engine() {
             if let Ok(lt) = eng.last_timing.lock() {
@@ -5669,14 +5896,23 @@ mod tests {
                 cpu_deq[k] = (qv * quant[k]).clamp(-32_768, 32_768);
             }
             let cpu_idct = simd::idct_8x8_scalar(&cpu_deq);
-            assert_eq!(gpu_q[i], cpu_q, "GPU vs CPU quantized DCT block mismatch at {i}");
-            assert_eq!(gpu_idct[i], cpu_idct, "GPU vs CPU IDCT block mismatch at {i}");
+            assert_eq!(
+                gpu_q[i], cpu_q,
+                "GPU vs CPU quantized DCT block mismatch at {i}"
+            );
+            assert_eq!(
+                gpu_idct[i], cpu_idct,
+                "GPU vs CPU IDCT block mismatch at {i}"
+            );
             dequant_blocks[i] = cpu_deq;
         }
 
         let mut gpu_idct_only = vec![[0i32; 64]; num_blocks];
         assert!(engine.batch_idct(&dequant_blocks, &mut gpu_idct_only));
-        assert_eq!(gpu_idct_only, gpu_idct, "GPU batch_idct_only must match batch_dct_quant_idct");
+        assert_eq!(
+            gpu_idct_only, gpu_idct,
+            "GPU batch_idct_only must match batch_dct_quant_idct"
+        );
 
         // 2. Verify `scan_dirty_and_opaque_tiles` on a 300x200 frame (5x4 = 20 tiles, including partial edge tiles).
         let w = 300u32;
@@ -5706,7 +5942,10 @@ mod tests {
                 let gpu_dirty = (flags[tidx] & 1) != 0;
                 let gpu_opaque = (flags[tidx] & 2) != 0;
                 assert_eq!(gpu_dirty, cpu_dirty, "dirty mismatch at tile ({tx}, {ty})");
-                assert_eq!(gpu_opaque, cpu_opaque, "opaque mismatch at tile ({tx}, {ty})");
+                assert_eq!(
+                    gpu_opaque, cpu_opaque,
+                    "opaque mismatch at tile ({tx}, {ty})"
+                );
             }
         }
 

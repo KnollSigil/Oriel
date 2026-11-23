@@ -95,29 +95,40 @@ pub fn match_app_icon<'a>(app_id: &str, catalog: &'a [AppIconEntry]) -> Option<&
 
     // Tier 2: reverse-DNS last-segment match (e.g. `dolphin` <-> `org.kde.dolphin.desktop`
     // or `org.mozilla.firefox` <-> `firefox.desktop`)
-    if let Some(entry) = catalog.iter().filter(|e| !e.icon_data.is_empty()).find(|e| {
-        let eid = normalize_desktop_id(&e.id);
-        let eseg = last_rdns_segment(&eid);
-        eseg == target || eid == target_seg || eseg == target_seg
-    }) {
+    if let Some(entry) = catalog
+        .iter()
+        .filter(|e| !e.icon_data.is_empty())
+        .find(|e| {
+            let eid = normalize_desktop_id(&e.id);
+            let eseg = last_rdns_segment(&eid);
+            eseg == target || eid == target_seg || eseg == target_seg
+        })
+    {
         return Some(entry);
     }
 
     // Tier 3: exec binary basename match (e.g. `code` <-> `/usr/share/code/code`)
-    if let Some(entry) = catalog.iter().filter(|e| !e.icon_data.is_empty()).find(|e| {
-        exec_basename(&e.exec).is_some_and(|bin| {
-            let bseg = last_rdns_segment(&bin);
-            bin == target || bin == target_seg || bseg == target_seg
+    if let Some(entry) = catalog
+        .iter()
+        .filter(|e| !e.icon_data.is_empty())
+        .find(|e| {
+            exec_basename(&e.exec).is_some_and(|bin| {
+                let bseg = last_rdns_segment(&bin);
+                bin == target || bin == target_seg || bseg == target_seg
+            })
         })
-    }) {
+    {
         return Some(entry);
     }
 
     // Tier 4: exact display name match (case-insensitive)
-    catalog.iter().filter(|e| !e.icon_data.is_empty()).find(|e| {
-        let name = e.name.trim().to_lowercase();
-        !name.is_empty() && (name == target || name == target_seg)
-    })
+    catalog
+        .iter()
+        .filter(|e| !e.icon_data.is_empty())
+        .find(|e| {
+            let name = e.name.trim().to_lowercase();
+            !name.is_empty() && (name == target || name == target_seg)
+        })
 }
 
 /// Decode raw PNG or SVG icon bytes into a square `target_size x target_size`
@@ -242,7 +253,11 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             exec: exec.to_string(),
-            icon_data: if has_icon { b"icon".to_vec() } else { Vec::new() },
+            icon_data: if has_icon {
+                b"icon".to_vec()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -250,10 +265,30 @@ mod tests {
     fn match_app_icon_handles_exact_rdns_exec_and_name() {
         let catalog = vec![
             entry("org.kde.dolphin.desktop", "Dolphin", "dolphin", true),
-            entry("firefox.desktop", "Firefox", "/usr/lib/firefox/firefox", true),
-            entry("code.desktop", "Visual Studio Code", "env FOO=1 \"/usr/share/code/code\" %F", true),
-            entry("fp-app.desktop", "Flatpak App", "flatpak run --branch=stable org.example.Tool", true),
-            entry("custom.desktop", "MyCustomViewer", "/opt/launcher/run-it", true),
+            entry(
+                "firefox.desktop",
+                "Firefox",
+                "/usr/lib/firefox/firefox",
+                true,
+            ),
+            entry(
+                "code.desktop",
+                "Visual Studio Code",
+                "env FOO=1 \"/usr/share/code/code\" %F",
+                true,
+            ),
+            entry(
+                "fp-app.desktop",
+                "Flatpak App",
+                "flatpak run --branch=stable org.example.Tool",
+                true,
+            ),
+            entry(
+                "custom.desktop",
+                "MyCustomViewer",
+                "/opt/launcher/run-it",
+                true,
+            ),
             entry("empty.desktop", "Empty", "empty", false),
         ];
 
@@ -281,8 +316,14 @@ mod tests {
             match_app_icon("mycustomviewer", &catalog).map(|e| e.id.as_str()),
             Some("custom.desktop")
         );
-        assert_eq!(match_app_icon("empty", &catalog).map(|e| e.id.as_str()), None);
-        assert_eq!(match_app_icon("unknown-app", &catalog).map(|e| e.id.as_str()), None);
+        assert_eq!(
+            match_app_icon("empty", &catalog).map(|e| e.id.as_str()),
+            None
+        );
+        assert_eq!(
+            match_app_icon("unknown-app", &catalog).map(|e| e.id.as_str()),
+            None
+        );
     }
 
     #[test]
@@ -340,7 +381,10 @@ mod tests {
         ];
         let wide = decode_icon_argb8888(RED_2X1_PNG, 16).expect("2x1 PNG decode failed");
         let top_pad = u32::from_ne_bytes(wide[0..4].try_into().unwrap());
-        assert_eq!(top_pad, 0, "non-square icon should have transparent top padding");
+        assert_eq!(
+            top_pad, 0,
+            "non-square icon should have transparent top padding"
+        );
         let mid_px =
             u32::from_ne_bytes(wide[(8 * 16 + 8) * 4..(8 * 16 + 9) * 4].try_into().unwrap());
         assert_eq!(mid_px, 0xFFFF_0000);

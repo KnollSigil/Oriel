@@ -222,7 +222,10 @@ pub struct UiSender {
 }
 
 impl UiSender {
-    pub fn send(&self, event: ClientUiEvent) -> Result<(), std::sync::mpsc::SendError<ClientUiEvent>> {
+    pub fn send(
+        &self,
+        event: ClientUiEvent,
+    ) -> Result<(), std::sync::mpsc::SendError<ClientUiEvent>> {
         self.tx.send(event)
     }
 
@@ -240,7 +243,11 @@ impl UiSender {
             let mut map = self.latest_frames.lock().unwrap();
             let prev = map.remove(&window_id);
             if let Some(old) = &prev {
-                if old.width != width || old.height != height || old.damage.is_empty() || damage.is_empty() {
+                if old.width != width
+                    || old.height != height
+                    || old.damage.is_empty()
+                    || damage.is_empty()
+                {
                     damage.clear(); // full-frame damage
                 } else if damage.len() + old.damage.len() <= 32 {
                     damage.extend_from_slice(&old.damage);
@@ -459,12 +466,10 @@ impl ClientApp {
                     }
                 }
                 let stride = (w * 4) as i32;
-                if let Ok((buffer, canvas)) = self.pool.create_buffer(
-                    w as i32,
-                    h as i32,
-                    stride,
-                    wl_shm::Format::Argb8888,
-                ) {
+                if let Ok((buffer, canvas)) =
+                    self.pool
+                        .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+                {
                     canvas[..byte_len].copy_from_slice(&bgra[..byte_len]);
                     if let Some(vp) = &self.custom_cursor_viewport {
                         surf.set_buffer_scale(1);
@@ -930,7 +935,9 @@ impl ClientApp {
                 shape_name,
             } => {
                 if window_id == self.pointer_window_id || window_id == self.focused_window_id {
-                    let icon = shape_name.parse::<CursorIcon>().unwrap_or(CursorIcon::Default);
+                    let icon = shape_name
+                        .parse::<CursorIcon>()
+                        .unwrap_or(CursorIcon::Default);
                     self.last_cursor = if visible {
                         ActiveCursor::Named(icon)
                     } else {
@@ -1113,12 +1120,7 @@ impl ClientApp {
     }
 }
 
-fn border_resize_edge(
-    x: f64,
-    y: f64,
-    width: u32,
-    height: u32,
-) -> Option<(ResizeEdge, CursorIcon)> {
+fn border_resize_edge(x: f64, y: f64, width: u32, height: u32) -> Option<(ResizeEdge, CursorIcon)> {
     const BORDER: f64 = 5.0;
     let w = width as f64;
     let h = height as f64;
@@ -1531,7 +1533,9 @@ impl KeyboardHandler for ClientApp {
             .get(&surface.id().protocol_id())
             .copied()
             .unwrap_or(self.focused_window_id);
-        let _ = self.ctrl_tx.send(ControlMessage::KeyboardLeave { window_id });
+        let _ = self
+            .ctrl_tx
+            .send(ControlMessage::KeyboardLeave { window_id });
     }
 
     fn press_key(
@@ -1712,9 +1716,9 @@ impl PointerHandler for ClientApp {
                         vertical.discrete as f64 * 15.0
                     };
                     if dx != 0.0 || dy != 0.0 {
-                        let _ = self
-                            .ctrl_tx
-                            .send(ControlMessage::PointerAxis { window_id, dx, dy });
+                        let _ =
+                            self.ctrl_tx
+                                .send(ControlMessage::PointerAxis { window_id, dx, dy });
                     }
                 }
                 PointerEventKind::Leave { .. } => {
@@ -2135,7 +2139,8 @@ pub fn run_event_loop(
         rx: ui_rx,
         latest_frames,
     } = ui_rx;
-    let conn = Connection::connect_to_env().context("failed to connect to local Wayland display")?;
+    let conn =
+        Connection::connect_to_env().context("failed to connect to local Wayland display")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("failed to initialize Wayland registry queue")?;
     let qh = event_queue.handle();
@@ -2238,7 +2243,12 @@ mod tests {
         // Only the newest frame should be stored in the 1-slot mailbox.
         let latest = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
         assert_eq!(
-            (latest.width, latest.height, latest.logical_width, latest.logical_height),
+            (
+                latest.width,
+                latest.height,
+                latest.logical_width,
+                latest.logical_height
+            ),
             (8, 8, 4, 4)
         );
         assert_eq!(latest.bgra[0], 3);
@@ -2249,7 +2259,12 @@ mod tests {
         tx.push_frame(7, 2, 2, 1, 1, Arc::new(vec![9; 16]), vec![(0, 0, 2, 2)]);
         let next = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
         assert_eq!(
-            (next.width, next.height, next.logical_width, next.logical_height),
+            (
+                next.width,
+                next.height,
+                next.logical_width,
+                next.logical_height
+            ),
             (2, 2, 1, 1)
         );
         assert_eq!(next.bgra[0], 9);

@@ -97,11 +97,7 @@ fn xdg_icon_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn parse_desktop_file(
-    path: &Path,
-    id: &str,
-    icon_dirs: &[PathBuf],
-) -> Option<RemoteAppEntry> {
+fn parse_desktop_file(path: &Path, id: &str, icon_dirs: &[PathBuf]) -> Option<RemoteAppEntry> {
     let content = fs::read_to_string(path).ok()?;
     parse_desktop_content(&content, id, icon_dirs)
 }
@@ -114,11 +110,7 @@ fn parse_semicolon_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_desktop_content(
-    content: &str,
-    id: &str,
-    icon_dirs: &[PathBuf],
-) -> Option<RemoteAppEntry> {
+fn parse_desktop_content(content: &str, id: &str, icon_dirs: &[PathBuf]) -> Option<RemoteAppEntry> {
     let mut in_desktop_entry = false;
     let mut fields: HashMap<String, String> = HashMap::new();
 
@@ -200,7 +192,18 @@ fn strip_exec_field_codes(raw: &str) -> String {
     for tok in raw.split_whitespace() {
         if matches!(
             tok,
-            "%f" | "%F" | "%u" | "%U" | "%d" | "%D" | "%n" | "%N" | "%i" | "%c" | "%k" | "%v" | "%m"
+            "%f" | "%F"
+                | "%u"
+                | "%U"
+                | "%d"
+                | "%D"
+                | "%n"
+                | "%N"
+                | "%i"
+                | "%c"
+                | "%k"
+                | "%v"
+                | "%m"
         ) {
             continue;
         }

@@ -618,7 +618,10 @@ impl AppState {
         if new_output_scale != self.output_scale {
             self.output_scale = new_output_scale;
             self.apply_virtual_output_mode();
-            debug!(output_scale = new_output_scale, "updated virtual output integer scale");
+            debug!(
+                output_scale = new_output_scale,
+                "updated virtual output integer scale"
+            );
         }
 
         // Global XWayland HiDPI scaling: keep Smithay XWayland client_scale and Xft.dpi in sync.
@@ -637,7 +640,10 @@ impl AppState {
             }
         }
         let dpi = (96.0 * scale).round() as u32;
-        debug!(scale, dpi, "applying global XWayland HiDPI scale and Xft.dpi");
+        debug!(
+            scale,
+            dpi, "applying global XWayland HiDPI scale and Xft.dpi"
+        );
         std::thread::spawn(move || {
             apply_xft_dpi(dpi);
         });
@@ -676,10 +682,8 @@ impl AppState {
                 .map(|attrs| (attrs.hotspot.x, attrs.hotspot.y))
                 .unwrap_or((0, 0))
         });
-        if self
-            .last_cursor_bitmap
-            .as_ref()
-            .is_some_and(|(lw, lh, llogw, llogh, lhx, lhy, lbgra)| {
+        if self.last_cursor_bitmap.as_ref().is_some_and(
+            |(lw, lh, llogw, llogh, lhx, lhy, lbgra)| {
                 *lw == *w
                     && *lh == *h
                     && *llogw == logical_w
@@ -687,8 +691,8 @@ impl AppState {
                     && *lhx == hotspot_x
                     && *lhy == hotspot_y
                     && lbgra == bgra.as_ref()
-            })
-        {
+            },
+        ) {
             return;
         }
         let bgra_cloned = (**bgra).clone();
@@ -821,7 +825,13 @@ impl AppState {
                         toplevel_surface = Some(toplevel.wl_surface().clone());
                         debug!(
                             window_id,
-                            width, height, scale, maximized, fullscreen, activated, tiled,
+                            width,
+                            height,
+                            scale,
+                            maximized,
+                            fullscreen,
+                            activated,
+                            tiled,
                             "ConfigureWindow -> remote toplevel"
                         );
                         toplevel.with_pending_state(|state| {
@@ -865,10 +875,8 @@ impl AppState {
                     let min_h = geo.loc.y + geo.size.h + 64;
                     xwin.geo = geo;
                     let surf = xwin.surface.clone();
-                    let has_child_popup = self
-                        .x11_popups
-                        .values()
-                        .any(|p| p.parent_id == window_id);
+                    let has_child_popup =
+                        self.x11_popups.values().any(|p| p.parent_id == window_id);
                     let _ = surf.set_maximized(maximized);
                     let _ = surf.set_fullscreen(fullscreen);
                     if activated || !has_child_popup {
@@ -912,7 +920,11 @@ impl AppState {
             CompositorCommand::SetDisplayScale { scale_factor } => {
                 let scale = sanitize_scale(scale_factor);
                 if (self.display_scale - scale).abs() > 0.005 {
-                    debug!(old = self.display_scale, new = scale, "updating session display scale");
+                    debug!(
+                        old = self.display_scale,
+                        new = scale,
+                        "updating session display scale"
+                    );
                     self.display_scale = scale;
                     self.update_output_and_xwayland_scale();
                 }
@@ -936,9 +948,9 @@ impl AppState {
                 if let Some(pointer) = self.seat.get_pointer() {
                     let focus_and_loc = if let Some(tw) = self.windows.get(&window_id) {
                         let (gx, gy) = tw.geo_offset;
-                        tw.window.toplevel().and_then(|t| {
-                            self.hit_test_tree(t.wl_surface(), (-gx, -gy), x, y)
-                        })
+                        tw.window
+                            .toplevel()
+                            .and_then(|t| self.hit_test_tree(t.wl_surface(), (-gx, -gy), x, y))
                     } else if let Some(tp) = self.popup_windows.get(&window_id) {
                         let (gx, gy) = tp.geo_offset;
                         self.hit_test_tree(tp.surface.wl_surface(), (-gx, -gy), x, y)
@@ -1004,10 +1016,8 @@ impl AppState {
                         } else if let Some(xw) = self.x11_windows.get(&window_id) {
                             self.last_focused_x11_window_id = Some(window_id);
                             let x11_surf = xw.surface.clone();
-                            let has_child_popup = self
-                                .x11_popups
-                                .values()
-                                .any(|p| p.parent_id == window_id);
+                            let has_child_popup =
+                                self.x11_popups.values().any(|p| p.parent_id == window_id);
                             let target = KeyboardFocusTarget::X11(x11_surf.clone());
                             if keyboard.current_focus().as_ref() != Some(&target) {
                                 keyboard.set_focus(self, Some(target), serial);
@@ -1046,11 +1056,7 @@ impl AppState {
                     pointer.frame(self);
                 }
             }
-            CompositorCommand::PointerAxis {
-                window_id,
-                dx,
-                dy,
-            } => {
+            CompositorCommand::PointerAxis { window_id, dx, dy } => {
                 self.focused_window_id = window_id;
                 if let Some(pointer) = self.seat.get_pointer() {
                     let is_wheel = dx.abs() >= 10.0 || dy.abs() >= 10.0;
@@ -1269,7 +1275,9 @@ impl AppState {
                 // snapshot is taken, so the requesting connection can tell which streamed
                 // events are older than the snapshot.
                 let events = self.snapshot_events();
-                let _ = self.event_tx.send(CompositorEvent::SnapshotTaken { sync_id });
+                let _ = self
+                    .event_tx
+                    .send(CompositorEvent::SnapshotTaken { sync_id });
                 let _ = reply.send(events);
             }
             CompositorCommand::ReleaseInput => {
@@ -1478,18 +1486,15 @@ impl AppState {
             }
             _ => (0, 0, root_log_w, root_log_h),
         };
-        let (win_phys_w, win_phys_h) = if crop_x == 0
-            && crop_y == 0
-            && win_log_w == root_log_w
-            && win_log_h == root_log_h
-        {
-            (surf_w, surf_h)
-        } else {
-            (
-                ((win_log_w as f64 * root_sx).round() as u32).max(1),
-                ((win_log_h as f64 * root_sy).round() as u32).max(1),
-            )
-        };
+        let (win_phys_w, win_phys_h) =
+            if crop_x == 0 && crop_y == 0 && win_log_w == root_log_w && win_log_h == root_log_h {
+                (surf_w, surf_h)
+            } else {
+                (
+                    ((win_log_w as f64 * root_sx).round() as u32).max(1),
+                    ((win_log_h as f64 * root_sy).round() as u32).max(1),
+                )
+            };
 
         let mut sub_info = Vec::new();
         let mut has_subsurfaces = false;
@@ -1529,17 +1534,14 @@ impl AppState {
         } else if !has_subsurfaces {
             // Fast row-by-row memcpy crop without per-pixel alpha blending.
             let root_buf = &self.surface_buffers.get(&root_id).unwrap().2;
-            let crop_px_x = ((crop_x as f64 * root_sx).round().max(0.0) as usize)
-                .min(surf_w as usize);
-            let crop_px_y = ((crop_y as f64 * root_sy).round().max(0.0) as usize)
-                .min(surf_h as usize);
+            let crop_px_x =
+                ((crop_x as f64 * root_sx).round().max(0.0) as usize).min(surf_w as usize);
+            let crop_px_y =
+                ((crop_y as f64 * root_sy).round().max(0.0) as usize).min(surf_h as usize);
             let src_stride = surf_w as usize * 4;
             let dst_stride = win_phys_w as usize * 4;
-            let copy_w = (win_phys_w as usize)
-                .min((surf_w as usize).saturating_sub(crop_px_x))
-                * 4;
-            let copy_h = (win_phys_h as usize)
-                .min((surf_h as usize).saturating_sub(crop_px_y));
+            let copy_w = (win_phys_w as usize).min((surf_w as usize).saturating_sub(crop_px_x)) * 4;
+            let copy_h = (win_phys_h as usize).min((surf_h as usize).saturating_sub(crop_px_y));
             let mut out = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
             for y in 0..copy_h {
                 let s_off = (crop_px_y + y) * src_stride + crop_px_x * 4;
@@ -1575,27 +1577,12 @@ impl AppState {
                         };
                         if dst_w == *sw && dst_h == *sh {
                             blit_rgba_over(
-                                &mut buf,
-                                win_phys_w,
-                                win_phys_h,
-                                srgba,
-                                *sw,
-                                *sh,
-                                dst_x,
-                                dst_y,
+                                &mut buf, win_phys_w, win_phys_h, srgba, *sw, *sh, dst_x, dst_y,
                             );
                         } else {
                             blit_rgba_over_scaled(
-                                &mut buf,
-                                win_phys_w,
-                                win_phys_h,
-                                srgba,
-                                *sw,
-                                *sh,
-                                dst_x,
-                                dst_y,
-                                dst_w,
-                                dst_h,
+                                &mut buf, win_phys_w, win_phys_h, srgba, *sw, *sh, dst_x, dst_y,
+                                dst_w, dst_h,
                             );
                         }
                     }
@@ -1743,18 +1730,15 @@ impl AppState {
             }
             _ => (0, 0, root_log_w, root_log_h),
         };
-        let (pop_phys_w, pop_phys_h) = if crop_x == 0
-            && crop_y == 0
-            && pop_log_w == root_log_w
-            && pop_log_h == root_log_h
-        {
-            (surf_w, surf_h)
-        } else {
-            (
-                ((pop_log_w as f64 * root_sx).round() as u32).max(1),
-                ((pop_log_h as f64 * root_sy).round() as u32).max(1),
-            )
-        };
+        let (pop_phys_w, pop_phys_h) =
+            if crop_x == 0 && crop_y == 0 && pop_log_w == root_log_w && pop_log_h == root_log_h {
+                (surf_w, surf_h)
+            } else {
+                (
+                    ((pop_log_w as f64 * root_sx).round() as u32).max(1),
+                    ((pop_log_h as f64 * root_sy).round() as u32).max(1),
+                )
+            };
 
         let mut bgra = vec![0u8; (pop_phys_w * pop_phys_h * 4) as usize];
         with_surface_tree_downward(
@@ -1782,27 +1766,12 @@ impl AppState {
                     };
                     if dst_w == *sw && dst_h == *sh {
                         blit_rgba_over(
-                            &mut bgra,
-                            pop_phys_w,
-                            pop_phys_h,
-                            sbgra,
-                            *sw,
-                            *sh,
-                            dst_x,
-                            dst_y,
+                            &mut bgra, pop_phys_w, pop_phys_h, sbgra, *sw, *sh, dst_x, dst_y,
                         );
                     } else {
                         blit_rgba_over_scaled(
-                            &mut bgra,
-                            pop_phys_w,
-                            pop_phys_h,
-                            sbgra,
-                            *sw,
-                            *sh,
-                            dst_x,
-                            dst_y,
-                            dst_w,
-                            dst_h,
+                            &mut bgra, pop_phys_w, pop_phys_h, sbgra, *sw, *sh, dst_x, dst_y,
+                            dst_w, dst_h,
                         );
                     }
                 }
@@ -1876,10 +1845,7 @@ impl CompositorHandler for AppState {
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
 
-        let is_cursor_surface = self
-            .cursor_surface
-            .as_ref()
-            .is_some_and(|cs| cs == surface);
+        let is_cursor_surface = self.cursor_surface.as_ref().is_some_and(|cs| cs == surface);
 
         let mut cur = surface.clone();
         let window_id_opt = loop {
@@ -1930,7 +1896,8 @@ impl CompositorHandler for AppState {
 
             if let Ok((w, h, bgra)) = extracted {
                 if w > 0 && h > 0 {
-                    self.surface_buffers.insert(surface.id(), (w, h, Arc::new(bgra)));
+                    self.surface_buffers
+                        .insert(surface.id(), (w, h, Arc::new(bgra)));
                 }
             }
             buffer.release();
@@ -2304,7 +2271,10 @@ impl SeatHandler for AppState {
 const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn text_selection_mimes() -> Vec<String> {
-    SUPPORTED_TEXT_MIMES.iter().map(|s| (*s).to_string()).collect()
+    SUPPORTED_TEXT_MIMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 fn pick_preferred_text_mime(mime_types: &[String]) -> Option<String> {
@@ -2537,8 +2507,9 @@ impl AppState {
             logical_height: log_h,
             bgra: Arc::clone(bgra_ref),
         };
-        let frame_unchanged =
-            xwin.announced && !title_or_app_changed && xwin.latest_bgra.as_ref() == Some(&new_frame);
+        let frame_unchanged = xwin.announced
+            && !title_or_app_changed
+            && xwin.latest_bgra.as_ref() == Some(&new_frame);
         if frame_unchanged {
             return;
         }
@@ -3191,9 +3162,7 @@ impl XwmHandler for AppState {
 
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
         if let Some(&window_id) = self.x11_id_by_win.get(&window.window_id()) {
-            let _ = self
-                .event_tx
-                .send(CompositorEvent::StartMove { window_id });
+            let _ = self.event_tx.send(CompositorEvent::StartMove { window_id });
         }
     }
 
@@ -3249,22 +3218,12 @@ impl XwmHandler for AppState {
         }
     }
 
-    fn new_selection(
-        &mut self,
-        _xwm: XwmId,
-        selection: SelectionTarget,
-        mime_types: Vec<String>,
-    ) {
+    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
         match selection {
             SelectionTarget::Clipboard => {
                 self.clipboard_owner = SelectionOwner::X11Client;
                 self.clipboard_text = None;
-                set_data_device_selection(
-                    &self.display_handle,
-                    &self.seat,
-                    mime_types.clone(),
-                    (),
-                );
+                set_data_device_selection(&self.display_handle, &self.seat, mime_types.clone(), ());
             }
             SelectionTarget::Primary => {
                 self.primary_owner = SelectionOwner::X11Client;
@@ -3570,8 +3529,7 @@ fn run_compositor_loop(
     let mut event_loop: EventLoop<AppState> =
         EventLoop::try_new().context("failed to create calloop EventLoop")?;
     let loop_handle = event_loop.handle();
-    let display: Display<AppState> =
-        Display::new().context("failed to create Wayland Display")?;
+    let display: Display<AppState> = Display::new().context("failed to create Wayland Display")?;
     let dh = display.handle();
 
     let compositor_state = CompositorState::new::<AppState>(&dh);
@@ -3808,12 +3766,11 @@ fn run_compositor_loop(
             last_frame_tick = Instant::now();
             let elapsed = state.start_time.elapsed();
             for tracked in state.windows.values() {
-                tracked.window.send_frame(
-                    &state.output,
-                    elapsed,
-                    Some(Duration::ZERO),
-                    |_, _| Some(state.output.clone()),
-                );
+                tracked
+                    .window
+                    .send_frame(&state.output, elapsed, Some(Duration::ZERO), |_, _| {
+                        Some(state.output.clone())
+                    });
             }
             for popup in state.popup_windows.values() {
                 send_frames_surface_tree(
@@ -3926,11 +3883,7 @@ fn spawn_gui_shell(
     std::thread::Builder::new()
         .name(format!("rw-app-wait-{launch_id}"))
         .spawn(move || {
-            let code = child
-                .wait()
-                .ok()
-                .and_then(|s| s.code())
-                .unwrap_or(1);
+            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
             let _ = cmd_tx.send(CompositorCommand::AppExited { launch_id, code });
         })
         .ok();
@@ -4043,14 +3996,9 @@ fn sync_keyboard_enter<D: SeatHandler + 'static>(
             );
         }
         for kc in desired_keys.difference(&current_keys) {
-            keyboard.input::<(), _>(
-                state,
-                *kc,
-                KeyState::Pressed,
-                serial,
-                time_ms,
-                |_, _, _| FilterResult::Forward,
-            );
+            keyboard.input::<(), _>(state, *kc, KeyState::Pressed, serial, time_ms, |_, _, _| {
+                FilterResult::Forward
+            });
         }
     }
 
@@ -4070,14 +4018,9 @@ fn clear_keyboard_focus_and_keys<D: SeatHandler + 'static>(
     keyboard.set_focus(state, None, serial);
     let held: Vec<Keycode> = keyboard.pressed_keys().into_iter().collect();
     for kc in held {
-        keyboard.input::<(), _>(
-            state,
-            kc,
-            KeyState::Released,
-            serial,
-            time_ms,
-            |_, _, _| FilterResult::Forward,
-        );
+        keyboard.input::<(), _>(state, kc, KeyState::Released, serial, time_ms, |_, _, _| {
+            FilterResult::Forward
+        });
     }
 }
 
@@ -4174,13 +4117,17 @@ fn blit_rgba_over_scaled(
         if dy < 0 || dy >= dst_h as i32 {
             continue;
         }
-        let sy = ((ty as f64 + 0.5) * y_scale).floor().clamp(0.0, (src_h - 1) as f64) as u32;
+        let sy = ((ty as f64 + 0.5) * y_scale)
+            .floor()
+            .clamp(0.0, (src_h - 1) as f64) as u32;
         for tx in 0..(target_w as i32) {
             let dx = tx + ox;
             if dx < 0 || dx >= dst_w as i32 {
                 continue;
             }
-            let sx = ((tx as f64 + 0.5) * x_scale).floor().clamp(0.0, (src_w - 1) as f64) as u32;
+            let sx = ((tx as f64 + 0.5) * x_scale)
+                .floor()
+                .clamp(0.0, (src_w - 1) as f64) as u32;
             let s_idx = ((sy * src_w + sx) * 4) as usize;
             let d_idx = ((dy as u32 * dst_w + dx as u32) * 4) as usize;
             let sa = src[s_idx + 3] as u32;
@@ -4331,10 +4278,7 @@ mod tests {
             pick_preferred_text_mime(&mimes).as_deref(),
             Some("text/plain;charset=utf-8")
         );
-        assert_eq!(
-            pick_preferred_text_mime(&["image/png".to_string()]),
-            None
-        );
+        assert_eq!(pick_preferred_text_mime(&["image/png".to_string()]), None);
     }
 
     #[test]
@@ -4449,12 +4393,7 @@ mod tests {
             data.events.push(RecordedKeyboardEvent::Enter(self.0, raw));
         }
 
-        fn leave(
-            &self,
-            _seat: &Seat<MockSeatState>,
-            data: &mut MockSeatState,
-            _serial: Serial,
-        ) {
+        fn leave(&self, _seat: &Seat<MockSeatState>, data: &mut MockSeatState, _serial: Serial) {
             data.events.push(RecordedKeyboardEvent::Leave(self.0));
         }
 
@@ -4467,8 +4406,11 @@ mod tests {
             _serial: Serial,
             _time: u32,
         ) {
-            data.events
-                .push(RecordedKeyboardEvent::Key(self.0, key.raw_code().raw(), state));
+            data.events.push(RecordedKeyboardEvent::Key(
+                self.0,
+                key.raw_code().raw(),
+                state,
+            ));
         }
 
         fn modifiers(

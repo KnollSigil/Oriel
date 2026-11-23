@@ -35,7 +35,10 @@ const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(60);
 const FOREGROUND_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Parser)]
-#[command(name = "remotewayland-server", about = "RemoteWayland headless app & PTY server")]
+#[command(
+    name = "remotewayland-server",
+    about = "RemoteWayland headless app & PTY server"
+)]
 struct Cli {
     #[command(subcommand)]
     subcommand: Option<ServerSubcommand>,

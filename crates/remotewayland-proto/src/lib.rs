@@ -196,13 +196,19 @@ pub enum BidiStreamHeader {
 pub enum PtyMessage {
     /// Sent by the server immediately upon creating or reattaching to a PTY,
     /// carrying the current byte offset so future reconnects stay exact.
-    Attached { pty_id: u64, stream_offset: u64 },
+    Attached {
+        pty_id: u64,
+        stream_offset: u64,
+    },
     /// Historical buffered output replayed on reattach (already accounted for in `stream_offset`).
     Replay(Vec<u8>),
     /// Sent by the server when a reattach is rejected because another terminal is already attached.
     Busy,
     Data(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     /// Sent by the client on intentional close (e.g., terminal tab closed via SIGHUP).
     Close,
     Exit(i32),
@@ -299,34 +305,23 @@ pub enum ControlMessage {
         bgra: Vec<u8>,
     },
     /// Server -> Client: remote app requested interactive window move (`xdg_toplevel.move`).
-    StartMove {
-        window_id: WindowId,
-    },
+    StartMove { window_id: WindowId },
     /// Server -> Client: remote app requested interactive window resize (`xdg_toplevel.resize`).
-    StartResize {
-        window_id: WindowId,
-        edge: u32,
-    },
+    StartResize { window_id: WindowId, edge: u32 },
     /// Server -> Client: remote app requested maximize or unmaximize (`xdg_toplevel.set_maximized` / `unset_maximized`).
     SetMaximized {
         window_id: WindowId,
         maximized: bool,
     },
     /// Server -> Client: remote app requested minimize (`xdg_toplevel.set_minimized`).
-    SetMinimized {
-        window_id: WindowId,
-    },
+    SetMinimized { window_id: WindowId },
     /// Server -> Client: remote app requested fullscreen or unfullscreen (`xdg_toplevel.set_fullscreen` / `unset_fullscreen`).
     SetFullscreen {
         window_id: WindowId,
         fullscreen: bool,
     },
     /// Server -> Client: remote app requested the compositor window menu (`xdg_toplevel.show_window_menu`).
-    ShowWindowMenu {
-        window_id: WindowId,
-        x: i32,
-        y: i32,
-    },
+    ShowWindowMenu { window_id: WindowId, x: i32, y: i32 },
     /// Server -> Client: remote app requested server-side or client-side decorations (`zxdg_toplevel_decoration_v1`).
     SetDecorationMode {
         window_id: WindowId,
@@ -344,16 +339,10 @@ pub enum ControlMessage {
         tiled: bool,
     },
     /// Server -> Client or Client -> Server: window closed.
-    WindowClosed {
-        window_id: WindowId,
-    },
+    WindowClosed { window_id: WindowId },
 
     /// Client -> Server: pointer moved in surface-local logical coordinates.
-    PointerMotion {
-        window_id: WindowId,
-        x: f64,
-        y: f64,
-    },
+    PointerMotion { window_id: WindowId, x: f64, y: f64 },
     /// Client -> Server: pointer button pressed or released (Linux evdev button code).
     PointerButton {
         window_id: WindowId,
@@ -374,17 +363,11 @@ pub enum ControlMessage {
     },
 
     /// Bidirectional: UTF-8 clipboard text synchronization.
-    ClipboardText {
-        text: String,
-    },
+    ClipboardText { text: String },
     /// Bidirectional: UTF-8 primary selection (middle-click paste) text synchronization.
-    PrimarySelectionText {
-        text: String,
-    },
+    PrimarySelectionText { text: String },
     /// Server -> Client: enable/disable host microphone capture based on remote app demand.
-    SetMicActive {
-        active: bool,
-    },
+    SetMicActive { active: bool },
     /// Server -> Client: cursor visibility or named cursor shape update.
     CursorUpdate {
         window_id: WindowId,
@@ -406,9 +389,7 @@ pub enum ControlMessage {
     /// Client -> Server: request list of discovered `.desktop` applications.
     ListApps,
     /// Server -> Client: list of discovered `.desktop` applications with optional icons.
-    AppList {
-        apps: Vec<RemoteAppEntry>,
-    },
+    AppList { apps: Vec<RemoteAppEntry> },
     /// Client -> Server: launch a remote GUI application inside the headless Wayland session.
     LaunchApp {
         launch_id: u64,
@@ -422,15 +403,10 @@ pub enum ControlMessage {
         state: LaunchState,
     },
     /// Client -> Server: terminate a launched remote application (`SIGTERM`, or `SIGKILL` if `force`).
-    TerminateApp {
-        launch_id: u64,
-        force: bool,
-    },
+    TerminateApp { launch_id: u64, force: bool },
     /// Client -> Server: XDG `org.freedesktop.appearance` `color-scheme` preference
     /// (`0` = no preference, `1` = prefer dark, `2` = prefer light).
-    ColorScheme {
-        scheme: u32,
-    },
+    ColorScheme { scheme: u32 },
     /// Client -> Server: local keyboard focus entered a remote window with the
     /// given evdev keycodes already depressed (mirrors `wl_keyboard::enter`).
     KeyboardEnter {
@@ -439,20 +415,13 @@ pub enum ControlMessage {
     },
     /// Client -> Server: local keyboard focus left a remote window
     /// (mirrors `wl_keyboard::leave`).
-    KeyboardLeave {
-        window_id: WindowId,
-    },
+    KeyboardLeave { window_id: WindowId },
     /// Client -> Server: acknowledges decoding of a video frame (`pts_ns`) for
     /// end-to-end in-flight frame pacing and low-latency frame dropping.
-    FrameAck {
-        window_id: WindowId,
-        pts_ns: u64,
-    },
+    FrameAck { window_id: WindowId, pts_ns: u64 },
     /// Client -> Server: updates the session's active display scale factor (>= 1.0)
     /// used for virtual `wl_output` fallback and global XWayland HiDPI scaling.
-    DisplayScale {
-        scale_factor: f64,
-    },
+    DisplayScale { scale_factor: f64 },
 }
 
 /// Header preceding each encoded video access unit on a per-window video stream.
@@ -592,8 +561,7 @@ pub async fn write_video_frame<W: AsyncWrite + Unpin>(
     header: &VideoFrameHeader,
     payload: &[u8],
 ) -> Result<()> {
-    let encoded_hdr =
-        bincode::serialize(header).context("failed to serialize VideoFrameHeader")?;
+    let encoded_hdr = bincode::serialize(header).context("failed to serialize VideoFrameHeader")?;
     let hdr_len = u32::try_from(encoded_hdr.len()).context("video header length overflow")?;
     writer.write_u32(hdr_len).await?;
     writer.write_all(&encoded_hdr).await?;
@@ -680,8 +648,21 @@ mod tests {
         assert!(range.contains(7450) && !range.contains(7463) && !range.contains(7442));
         assert_eq!(range.ports().count(), 20);
 
-        for bad in ["", "0", "0-10", "7462-7443", "65536", "a", "1-", "-5", "1-2-3"] {
-            assert!(bad.parse::<PortRange>().is_err(), "{bad:?} should not parse");
+        for bad in [
+            "",
+            "0",
+            "0-10",
+            "7462-7443",
+            "65536",
+            "a",
+            "1-",
+            "-5",
+            "1-2-3",
+        ] {
+            assert!(
+                bad.parse::<PortRange>().is_err(),
+                "{bad:?} should not parse"
+            );
         }
     }
 
@@ -790,16 +771,39 @@ mod tests {
         write_control_message(&mut tx, &kbd_enter).await.unwrap();
         write_control_message(&mut tx, &kbd_leave).await.unwrap();
         write_control_message(&mut tx, &frame_ack).await.unwrap();
-        write_control_message(&mut tx, &display_scale).await.unwrap();
+        write_control_message(&mut tx, &display_scale)
+            .await
+            .unwrap();
         drop(tx);
 
-        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), primary);
-        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), cursor);
-        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), scheme);
-        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_enter);
-        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), kbd_leave);
-        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), frame_ack);
-        assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), display_scale);
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            primary
+        );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            cursor
+        );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            scheme
+        );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            kbd_enter
+        );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            kbd_leave
+        );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            frame_ack
+        );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            display_scale
+        );
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
     }
 

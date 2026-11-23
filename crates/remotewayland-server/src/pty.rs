@@ -256,11 +256,7 @@ impl PtyManager {
                     }
                 }
 
-                let code = child
-                    .wait()
-                    .ok()
-                    .and_then(|s| s.code())
-                    .unwrap_or(1);
+                let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
 
                 let sender = {
                     let Ok(mut st) = pty_for_reader.shared.lock() else {
@@ -297,11 +293,7 @@ impl PtyManager {
         command: Option<String>,
     ) -> Result<()> {
         let (pty, is_reattach) = if let Some(id) = req_pty_id {
-            let found = self
-                .sessions
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&id).cloned());
+            let found = self.sessions.lock().ok().and_then(|m| m.get(&id).cloned());
             match found {
                 Some(p) => (p, true),
                 None => {
@@ -320,10 +312,7 @@ impl PtyManager {
         let (out_tx, mut out_rx) = mpsc::channel::<PtyOutEvent>(128);
 
         enum AttachOutcome {
-            Attached {
-                stream_offset: u64,
-                replay: Vec<u8>,
-            },
+            Attached { stream_offset: u64, replay: Vec<u8> },
             Busy,
             Exited(i32),
         }
@@ -359,7 +348,10 @@ impl PtyManager {
                 return Ok(());
             }
             AttachOutcome::Busy => {
-                info!(pty_id, "rejecting duplicate attach; PTY already has an active terminal");
+                info!(
+                    pty_id,
+                    "rejecting duplicate attach; PTY already has an active terminal"
+                );
                 let _ = write_pty_message(&mut send, &PtyMessage::Busy).await;
                 let _ = send.finish();
                 return Ok(());
@@ -447,9 +439,7 @@ impl PtyManager {
         if !intentional_close {
             let became_detached = {
                 if let Ok(mut st) = pty.shared.lock() {
-                    if st.exited.is_none()
-                        && st.attached.as_ref().is_some_and(|(g, _)| *g == gen)
-                    {
+                    if st.exited.is_none() && st.attached.as_ref().is_some_and(|(g, _)| *g == gen) {
                         st.attached = None;
                         true
                     } else {
@@ -460,7 +450,10 @@ impl PtyManager {
                 }
             };
             if became_detached {
-                info!(pty_id, "client detached from persistent PTY (keeping alive)");
+                info!(
+                    pty_id,
+                    "client detached from persistent PTY (keeping alive)"
+                );
                 self.emit_state(
                     pty_id,
                     format!("{} (detached)", pty.base_name),
@@ -671,7 +664,21 @@ fn is_csi_query(params: &[u8], final_byte: u8) -> bool {
         // Kitty keyboard protocol query (`ESC [ ? u`)
         b'u' => params == b"?",
         // DSR / CPR (`ESC [ 5 n`, `ESC [ 6 n`, `ESC [ ? 6 n`, etc.)
-        b'n' => matches!(params, b"5" | b"6" | b"?6" | b"?15" | b"?25" | b"?26" | b"?53" | b"?55" | b"?56" | b"?62" | b"?63" | b"?75" | b"?85"),
+        b'n' => matches!(
+            params,
+            b"5" | b"6"
+                | b"?6"
+                | b"?15"
+                | b"?25"
+                | b"?26"
+                | b"?53"
+                | b"?55"
+                | b"?56"
+                | b"?62"
+                | b"?63"
+                | b"?75"
+                | b"?85"
+        ),
         // DECRQM (`ESC [ ? <n> $ p` or `ESC [ <n> $ p`)
         b'p' => params.ends_with(b"$"),
         // XTWINOPS report queries (`14t`, `16t`, `18t`, `19t`)

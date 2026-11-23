@@ -84,7 +84,11 @@ impl VideoDecoder {
             );
         }
 
-        if is_keyframe || width != self.width || height != self.height || self.prev_bgra.len() != expected_len {
+        if is_keyframe
+            || width != self.width
+            || height != self.height
+            || self.prev_bgra.len() != expected_len
+        {
             self.width = width;
             self.height = height;
             self.prev_bgra = decompressed;

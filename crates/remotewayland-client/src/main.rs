@@ -218,15 +218,7 @@ fn main() -> Result<()> {
             } else if let (Some(server), Some(fp), Some(token)) =
                 (cli.server, cli.fingerprint, cli.token)
             {
-                run_gui_session(
-                    server,
-                    fp,
-                    token,
-                    true,
-                    effective_scale_cap,
-                    None,
-                    None,
-                )
+                run_gui_session(server, fp, token, true, effective_scale_cap, None, None)
             } else {
                 launcher::run_launcher(cli_max_scale)
             }

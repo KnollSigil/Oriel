@@ -263,7 +263,11 @@ impl SessionGuard {
                     }
                 }
             }
-            wait_for_portal_backends(&mut self.children, &pending_names, Duration::from_millis(800));
+            wait_for_portal_backends(
+                &mut self.children,
+                &pending_names,
+                Duration::from_millis(800),
+            );
 
             match start_xdg_desktop_portal(&self.runtime_dir, &portal_config_dir, socket_name) {
                 Ok(child) => self.children.push(child),
@@ -331,7 +335,10 @@ fn start_private_dbus(runtime_dir: &Path) -> Result<(String, Child)> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("timed out waiting for private D-Bus socket at {}", bus_path.display());
+            bail!(
+                "timed out waiting for private D-Bus socket at {}",
+                bus_path.display()
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -477,7 +484,10 @@ fn wait_for_portal_backends(
         }
     }
     for (bus_name, _) in remaining {
-        warn!(bus_name, "timed out waiting for portal backend to own D-Bus name");
+        warn!(
+            bus_name,
+            "timed out waiting for portal backend to own D-Bus name"
+        );
     }
 }
 
@@ -490,18 +500,14 @@ fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
     fs::write(&tmp, contents)
         .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(err).with_context(|| {
-            format!("failed to rename {} -> {}", tmp.display(), path.display())
-        });
+        return Err(err)
+            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()));
     }
     Ok(())
 }
@@ -557,7 +563,8 @@ fn prepare_portal_config_dir(portal_config_dir: &Path, backend: Option<&PortalBa
         let conf = format!(
             "[preferred]\ndefault={pref}\norg.freedesktop.impl.portal.Settings={settings_pref}\n"
         );
-        if let Err(err) = write_file_atomic(&portal_conf_dir.join("portals.conf"), conf.as_bytes()) {
+        if let Err(err) = write_file_atomic(&portal_conf_dir.join("portals.conf"), conf.as_bytes())
+        {
             warn!(error = %err, "failed to write isolated portals.conf");
         }
     }
@@ -702,9 +709,7 @@ fn format_gsettings_color_scheme_keyfile(scheme: u32, has_breeze_gtk: bool) -> S
         (_, true) => ("default", "Breeze"),
         (_, false) => ("default", "Adwaita"),
     };
-    format!(
-        "[org/gnome/desktop/interface]\ncolor-scheme='{cs}'\ngtk-theme='{theme}'\n"
-    )
+    format!("[org/gnome/desktop/interface]\ncolor-scheme='{cs}'\ngtk-theme='{theme}'\n")
 }
 
 /// Update `[General]` `ColorScheme` and `[Colors:Window]` `BackgroundNormal` / `ForegroundNormal`
@@ -884,7 +889,10 @@ pub fn apply_color_scheme(scheme: u32) {
         }
     }
 
-    info!(scheme, "applied synced client color-scheme to isolated portal");
+    info!(
+        scheme,
+        "applied synced client color-scheme to isolated portal"
+    );
 }
 
 /// Return the isolated session runtime directory if initialized.
@@ -997,7 +1005,13 @@ pub fn write_xauthority_file(path: &Path, display_num: u32) -> Result<()> {
     let mut data = Vec::with_capacity(128);
     // FamilyLocal (256) with local hostname
     if !hostname.is_empty() {
-        append_xauth_record(&mut data, 256, hostname.as_bytes(), display_str.as_bytes(), &cookie);
+        append_xauth_record(
+            &mut data,
+            256,
+            hostname.as_bytes(),
+            display_str.as_bytes(),
+            &cookie,
+        );
     }
     // FamilyWild (65535) so local clients connecting via unix socket match regardless of hostname
     append_xauth_record(&mut data, 65535, &[], display_str.as_bytes(), &cookie);
@@ -1080,7 +1094,12 @@ pub fn write_xwayland_auth_shim(
         .create_new(true)
         .mode(0o700)
         .open(&shim_path)
-        .with_context(|| format!("failed to create Xwayland auth shim {}", shim_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to create Xwayland auth shim {}",
+                shim_path.display()
+            )
+        })?;
     file.write_all(script.as_bytes())?;
     set_mode(&shim_path, 0o700)?;
     Ok(bin_dir)
@@ -1111,7 +1130,9 @@ pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
             }
             if let Some(desk) = &info.xdg_current_desktop {
                 cmd.env("XDG_CURRENT_DESKTOP", desk);
-                if desk.eq_ignore_ascii_case("kde") && std::env::var_os("QT_QPA_PLATFORMTHEME").is_none() {
+                if desk.eq_ignore_ascii_case("kde")
+                    && std::env::var_os("QT_QPA_PLATFORMTHEME").is_none()
+                {
                     cmd.env("QT_QPA_PLATFORMTHEME", "kde");
                 }
             }
@@ -1172,7 +1193,10 @@ mod tests {
     fn sh_single_quote_escapes_shell_metacharacters() {
         assert_eq!(sh_single_quote("/usr/bin/Xwayland"), "'/usr/bin/Xwayland'");
         assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
-        assert_eq!(sh_single_quote("dir with spaces/$HOME/`id`"), "'dir with spaces/$HOME/`id`'");
+        assert_eq!(
+            sh_single_quote("dir with spaces/$HOME/`id`"),
+            "'dir with spaces/$HOME/`id`'"
+        );
     }
 
     #[test]
@@ -1300,10 +1324,7 @@ mod tests {
 
     #[test]
     fn write_file_atomic_replaces_target_and_leaves_no_temp_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-atomic-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rw-atomic-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join("keyfile");

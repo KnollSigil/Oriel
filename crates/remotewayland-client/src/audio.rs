@@ -237,10 +237,7 @@ fn run_playback_loop(
                 let target_bytes = (FRAME_SAMPLES * stride).min(slice.len());
                 let mut guard = rb.lock().ok();
                 for byte in &mut slice[..target_bytes] {
-                    *byte = guard
-                        .as_mut()
-                        .and_then(|q| q.pop_front())
-                        .unwrap_or(0);
+                    *byte = guard.as_mut().and_then(|q| q.pop_front()).unwrap_or(0);
                 }
                 target_bytes
             } else {
@@ -528,8 +525,7 @@ fn run_mic_capture_loop(
             };
             let slice = &bytes[..valid_bytes.min(bytes.len())];
             for chunk in slice.chunks_exact(2) {
-                st.pcm_accum
-                    .push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                st.pcm_accum.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
 
             while st.pcm_accum.len() >= FRAME_SAMPLES {
