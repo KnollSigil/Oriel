@@ -792,10 +792,10 @@ impl AppState {
         } else if let Some(xw) = self.x11_windows.get(&window_id) {
             self.last_focused_x11_window_id = Some(window_id);
             Some(KeyboardFocusTarget::X11(xw.surface.clone()))
-        } else if let Some(xp) = self.x11_popups.get(&window_id) {
-            Some(KeyboardFocusTarget::X11(xp.surface.clone()))
         } else {
-            None
+            self.x11_popups
+                .get(&window_id)
+                .map(|xp| KeyboardFocusTarget::X11(xp.surface.clone()))
         }
     }
 
@@ -1885,7 +1885,10 @@ impl CompositorHandler for AppState {
                         bgra[dst_start..dst_start + row_bytes]
                             .copy_from_slice(&src[row_start..row_start + row_bytes]);
                         if opaque {
-                            for px in bgra[dst_start..dst_start + row_bytes].chunks_exact_mut(4) {
+                            for px in bgra[dst_start..dst_start + row_bytes]
+                                .as_chunks_mut::<4>()
+                                .0
+                            {
                                 px[3] = 0xFF;
                             }
                         }
@@ -4089,7 +4092,7 @@ fn apply_xft_dpi(dpi: u32) {
     if let Ok(mut child) = cmd.spawn() {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
-            let _ = write!(stdin, "Xft.dpi: {dpi}\n");
+            let _ = writeln!(stdin, "Xft.dpi: {dpi}");
         }
         let _ = child.wait();
     }

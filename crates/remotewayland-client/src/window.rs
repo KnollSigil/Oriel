@@ -1170,7 +1170,10 @@ fn draw_shm_surface(
         if let Some(vp) = viewport {
             surface.set_buffer_scale(1);
             vp.set_destination(lw as i32, lh as i32);
-        } else if width % lw == 0 && height % lh == 0 && (width / lw) == (height / lh) {
+        } else if width.is_multiple_of(lw)
+            && height.is_multiple_of(lh)
+            && (width / lw) == (height / lh)
+        {
             surface.set_buffer_scale((width / lw).max(1) as i32);
         } else {
             surface.set_buffer_scale(1);

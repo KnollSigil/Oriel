@@ -778,8 +778,8 @@ fn run_per_app_playback_loop(
                                 return;
                             };
                             let slice = &bytes[..valid_bytes.min(bytes.len())];
-                            for chunk in slice.chunks_exact(2) {
-                                st.pcm_accum.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                            for &chunk in slice.as_chunks::<2>().0 {
+                                st.pcm_accum.push(i16::from_le_bytes(chunk));
                             }
 
                             let frame_total_samples = FRAME_SAMPLES * SINK_CHANNELS as usize;

@@ -690,7 +690,7 @@ fn is_csi_query(params: &[u8], final_byte: u8) -> bool {
 fn open_pty(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
-    let mut ws = libc::winsize {
+    let ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
@@ -702,7 +702,7 @@ fn open_pty(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut ws,
+            &ws,
         )
     };
     if rc != 0 {

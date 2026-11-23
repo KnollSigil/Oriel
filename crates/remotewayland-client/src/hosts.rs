@@ -21,6 +21,7 @@ pub enum RenderScaleCap {
 }
 
 impl RenderScaleCap {
+    #[cfg(test)]
     pub const ALL: [RenderScaleCap; 4] = [
         RenderScaleCap::Uncapped,
         RenderScaleCap::Scale200,

@@ -1024,6 +1024,7 @@ fn row_luma_profile(bgra: &[u8], width: usize, y: usize, x_start: usize, x_end: 
     let seg_w = (span / 4).max(1);
     let step = (seg_w / 16).max(1);
     let mut prof = [0i32; 4];
+    #[allow(clippy::needless_range_loop)]
     for s in 0..4 {
         let sx0 = x_start + s * seg_w;
         let sx1 = (sx0 + seg_w).min(x_end);
@@ -1195,6 +1196,7 @@ fn detect_vertical_scroll_fuzzy(
 
     let max_mismatches = sample_rows.len() / 4;
     let mut col_matches = vec![false; cols];
+    #[allow(clippy::needless_range_loop)]
     for c in 0..cols {
         let x0 = c * 16;
         let mut mismatches = 0usize;
@@ -1361,6 +1363,7 @@ fn detect_vertical_scroll_band(
 
     let max_mismatches = sample_rows.len() / 4;
     let mut col_matches = vec![false; cols];
+    #[allow(clippy::needless_range_loop)]
     for c in 0..cols {
         let x0 = c * 16;
         let mut mismatches = 0usize;
@@ -1509,6 +1512,7 @@ fn detect_horizontal_scroll(prev: &[u8], cur: &[u8], w: usize, h: usize) -> Opti
     }
 
     let mut row_matches = vec![false; rows];
+    #[allow(clippy::needless_range_loop)]
     for r in 0..rows {
         let y0 = r * 16;
         let mut ok = true;
@@ -1567,21 +1571,11 @@ fn detect_horizontal_scroll(prev: &[u8], cur: &[u8], w: usize, h: usize) -> Opti
 // SmartTileEncoder
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct TileTrack {
     motion_streak: u8,
     last_change: Option<Instant>,
     is_lossy: bool,
-}
-
-impl Default for TileTrack {
-    fn default() -> Self {
-        Self {
-            motion_streak: 0,
-            last_change: None,
-            is_lossy: false,
-        }
-    }
 }
 
 /// Output of `SmartTileEncoder::encode` or `encode_lossless_refresh`.
@@ -1852,6 +1846,7 @@ impl SmartTileEncoder {
                 let mut tile_rem = self.tiles.as_mut_slice();
                 let mut band_slices = Vec::with_capacity(num_workers);
                 let mut start_row = 0usize;
+                #[allow(clippy::needless_range_loop)]
                 for band_idx in 0..num_workers {
                     if start_row >= rows {
                         break;
@@ -3205,8 +3200,8 @@ fn should_use_inter_tile_quarter(cur_y: &[i32; 16 * 16], ref_y: &[i32; 16 * 16])
     }
     let mean = (sum_y / 256) as i32;
     let mut intra_sad: i64 = 0;
-    for i in 0..256 {
-        intra_sad += (cur_y[i] - mean).abs() as i64;
+    for &y in cur_y {
+        intra_sad += (y - mean).abs() as i64;
     }
     inter_sad * 10 <= intra_sad * 9
 }
@@ -4784,7 +4779,7 @@ mod tests {
                     "alpha DCT reference drift for {w}x{h} q={q} step={step}"
                 );
                 // Every reconstructed pixel must remain valid premultiplied ARGB8888 (B, G, R <= A).
-                for px in out.chunks_exact(4) {
+                for px in out.as_chunks::<4>().0 {
                     assert!(
                         px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3],
                         "invalid premultiplied pixel {:?} for {w}x{h} q={q}",
@@ -4951,7 +4946,7 @@ mod tests {
         let make_noisy = |seed_init: u64| -> Vec<u8> {
             let mut s = seed_init;
             let mut buf = vec![0u8; (w * h * 4) as usize];
-            for px in buf.chunks_exact_mut(4) {
+            for px in buf.as_chunks_mut::<4>().0 {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -5493,7 +5488,7 @@ mod tests {
         }
 
         // Flip every 3rd pixel and test count_identical_pixels + tile_equals
-        for (i, px) in other_bgra.chunks_exact_mut(4).enumerate() {
+        for (i, px) in other_bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             if i % 3 == 0 {
                 px[1] ^= 0x55;
             }
