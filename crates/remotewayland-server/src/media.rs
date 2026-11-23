@@ -1,10 +1,12 @@
 //! Pure-Rust video encoders (`VideoCodec::Lz4Delta` and `VideoCodec::SmartTile`).
 //!
-//! - `Lz4Delta`: lossless XOR-delta + LZ4 on full `Argb8888` (`BGRA`) frames (used for popups and fallback).
-//! - `SmartTile`: sub-region scroll `CopyRect`, 64x64 dirty-tile skipping, adaptive lossless/DCT
-//!   (Intra I-tiles & Inter residual P-tiles), and automatic lossless idle refinement.
+//! - `Lz4Delta`: lossless XOR-delta + LZ4 on full `Argb8888` (`BGRA`) frames (legacy fallback).
+//! - `SmartTile`: per-tile motion compensation, 64x64 dirty-tile skipping, adaptive lossless/DCT
+//!   (Intra I-tiles & Inter residual P-tiles with alpha support), and Golomb-Rice lossless idle refinement.
 
-use remotewayland_proto::smart_tile::SmartTileEncoder;
+use remotewayland_proto::smart_tile::{
+    SmartTileEncoder, DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES,
+};
 use remotewayland_proto::VideoCodec;
 
 /// An encoded video frame (keyframe or delta/tile packet).
@@ -14,6 +16,8 @@ pub struct EncodedFrame {
     pub height: u32,
     pub is_keyframe: bool,
     pub used_lossy: bool,
+    pub had_copy_rect: bool,
+    pub dirty_tiles: usize,
     pub data: Vec<u8>,
 }
 
@@ -49,6 +53,8 @@ impl WindowVideoEncoder {
                     height,
                     is_keyframe: pkt.is_keyframe,
                     used_lossy: pkt.used_lossy,
+                    had_copy_rect: pkt.had_copy_rect,
+                    dirty_tiles: pkt.dirty_tiles,
                     data: pkt.payload,
                 }
             }
@@ -70,14 +76,18 @@ impl WindowVideoEncoder {
     ) -> Option<EncodedFrame> {
         match self {
             Self::Lz4Delta(_) => None,
-            Self::SmartTile(enc) => enc.encode_lossless_refresh().map(|pkt| EncodedFrame {
-                pts_ns,
-                width,
-                height,
-                is_keyframe: false,
-                used_lossy: false,
-                data: pkt.payload,
-            }),
+            Self::SmartTile(enc) => enc
+                .encode_lossless_refresh(DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES)
+                .map(|pkt| EncodedFrame {
+                    pts_ns,
+                    width,
+                    height,
+                    is_keyframe: false,
+                    used_lossy: false,
+                    had_copy_rect: false,
+                    dirty_tiles: pkt.dirty_tiles,
+                    data: pkt.payload,
+                }),
         }
     }
 }
@@ -133,6 +143,8 @@ impl VideoEncoder {
             height,
             is_keyframe,
             used_lossy: false,
+            had_copy_rect: false,
+            dirty_tiles: 0,
             data,
         }
     }

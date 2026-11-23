@@ -20,7 +20,7 @@ use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use remotewayland_proto::{
     LaunchState, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
 };
-use smithay::backend::input::KeyState;
+use smithay::backend::input::{Axis, AxisSource, KeyState};
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::{PopupKind, PopupManager, Space, Window};
 use smithay::input::keyboard::{
@@ -166,7 +166,7 @@ pub enum CompositorEvent {
         height: u32,
         logical_width: u32,
         logical_height: u32,
-        bgra: Vec<u8>,
+        bgra: Arc<Vec<u8>>,
     },
     CursorUpdate {
         window_id: WindowId,
@@ -288,14 +288,25 @@ impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
 
 const WINDOW_LAUNCH_ID_BASE: u64 = 1u64 << 62;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct CachedFrame {
     width: u32,
     height: u32,
     logical_width: u32,
     logical_height: u32,
-    bgra: Vec<u8>,
+    bgra: Arc<Vec<u8>>,
 }
+
+impl PartialEq for CachedFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.logical_width == other.logical_width
+            && self.logical_height == other.logical_height
+            && (Arc::ptr_eq(&self.bgra, &other.bgra) || self.bgra == other.bgra)
+    }
+}
+impl Eq for CachedFrame {}
 
 struct TrackedWindow {
     window_id: WindowId,
@@ -487,7 +498,7 @@ struct AppState {
     /// Map from `WlSurface::id()` (`ObjectId`, unique across clients) -> WindowId (for toplevels & popups).
     surface_to_window: HashMap<ObjectId, WindowId>,
     /// Cached RGBA buffer per `WlSurface::id()` for surface-tree compositing.
-    surface_buffers: HashMap<ObjectId, (u32, u32, Vec<u8>)>,
+    surface_buffers: HashMap<ObjectId, (u32, u32, Arc<Vec<u8>>)>,
     /// KDE server-decoration modes set on a `WlSurface` before `xdg_surface.get_toplevel`.
     pending_kde_decorations: HashMap<ObjectId, bool>,
     windows: HashMap<WindowId, TrackedWindow>,
@@ -660,12 +671,12 @@ impl AppState {
                     && *llogh == logical_h
                     && *lhx == hotspot_x
                     && *lhy == hotspot_y
-                    && lbgra == bgra
+                    && lbgra == bgra.as_ref()
             })
         {
             return;
         }
-        let bgra_cloned = bgra.clone();
+        let bgra_cloned = (**bgra).clone();
         self.last_cursor_bitmap = Some((
             *w,
             *h,
@@ -1022,12 +1033,23 @@ impl AppState {
             } => {
                 self.focused_window_id = window_id;
                 if let Some(pointer) = self.seat.get_pointer() {
-                    let mut frame = AxisFrame::new(time_ms);
+                    let is_wheel = dx.abs() >= 10.0 || dy.abs() >= 10.0;
+                    let mut frame = AxisFrame::new(time_ms).source(if is_wheel {
+                        AxisSource::Wheel
+                    } else {
+                        AxisSource::Continuous
+                    });
                     if dx != 0.0 {
-                        frame = frame.value(smithay::backend::input::Axis::Horizontal, dx);
+                        frame = frame.value(Axis::Horizontal, dx);
+                        if is_wheel {
+                            frame = frame.v120(Axis::Horizontal, (dx * 8.0).round() as i32);
+                        }
                     }
                     if dy != 0.0 {
-                        frame = frame.value(smithay::backend::input::Axis::Vertical, dy);
+                        frame = frame.value(Axis::Vertical, dy);
+                        if is_wheel {
+                            frame = frame.v120(Axis::Vertical, (dy * 8.0).round() as i32);
+                        }
                     }
                     pointer.axis(self, frame);
                     pointer.frame(self);
@@ -1268,7 +1290,7 @@ impl AppState {
                                 height: frame.height,
                                 logical_width: frame.logical_width,
                                 logical_height: frame.logical_height,
-                                bgra: frame.bgra.clone(),
+                                bgra: Arc::clone(&frame.bgra),
                             });
                         }
                     }
@@ -1290,7 +1312,7 @@ impl AppState {
                                 height: frame.height,
                                 logical_width: frame.logical_width,
                                 logical_height: frame.logical_height,
-                                bgra: frame.bgra.clone(),
+                                bgra: (*frame.bgra).clone(),
                             });
                         }
                     }
@@ -1329,7 +1351,7 @@ impl AppState {
                                 height: frame.height,
                                 logical_width: frame.logical_width,
                                 logical_height: frame.logical_height,
-                                bgra: frame.bgra.clone(),
+                                bgra: Arc::clone(&frame.bgra),
                             });
                         }
                     }
@@ -1351,7 +1373,7 @@ impl AppState {
                                 height: frame.height,
                                 logical_width: frame.logical_width,
                                 logical_height: frame.logical_height,
-                                bgra: frame.bgra.clone(),
+                                bgra: (*frame.bgra).clone(),
                             });
                         }
                     }
@@ -1415,9 +1437,8 @@ impl AppState {
             )
         };
 
-        let mut composite = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
         let mut sub_info = Vec::new();
-
+        let mut has_subsurfaces = false;
         with_surface_tree_downward(
             root_surface,
             (-crop_x, -crop_y),
@@ -1429,50 +1450,108 @@ impl AppState {
                     let loc = sub_state.current().location;
                     (ox + loc.x, oy + loc.y)
                 };
-                if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id()) {
-                    let (sub_log_w, sub_log_h) = surface_logical_size_from_states(states, *sw, *sh);
+                if let Some((sw, sh, _)) = self.surface_buffers.get(&surf.id()) {
                     let dst_x = (nx as f64 * root_sx).round() as i32;
                     let dst_y = (ny as f64 * root_sy).round() as i32;
-                    let (dst_w, dst_h) = if surf == root_surface {
-                        (*sw, *sh)
-                    } else {
-                        (
-                            ((sub_log_w as f64 * root_sx).round() as u32).max(1),
-                            ((sub_log_h as f64 * root_sy).round() as u32).max(1),
-                        )
-                    };
-                    sub_info.push((surf == root_surface, *sw, *sh, dst_x, dst_y));
-                    if dst_w == *sw && dst_h == *sh {
-                        blit_rgba_over(
-                            &mut composite,
-                            win_phys_w,
-                            win_phys_h,
-                            srgba,
-                            *sw,
-                            *sh,
-                            dst_x,
-                            dst_y,
-                        );
-                    } else {
-                        blit_rgba_over_scaled(
-                            &mut composite,
-                            win_phys_w,
-                            win_phys_h,
-                            srgba,
-                            *sw,
-                            *sh,
-                            dst_x,
-                            dst_y,
-                            dst_w,
-                            dst_h,
-                        );
+                    if surf != root_surface {
+                        has_subsurfaces = true;
                     }
+                    sub_info.push((surf == root_surface, *sw, *sh, dst_x, dst_y));
                 }
                 TraversalAction::DoChildren((nx, ny))
             },
             |_, _, _| {},
             |_, _, _| true,
         );
+
+        let composite: Arc<Vec<u8>> = if !has_subsurfaces
+            && crop_x == 0
+            && crop_y == 0
+            && win_phys_w == surf_w
+            && win_phys_h == surf_h
+        {
+            // Zero-copy fast path for single-surface uncropped windows (most Wayland apps).
+            Arc::clone(&self.surface_buffers.get(&root_id).unwrap().2)
+        } else if !has_subsurfaces {
+            // Fast row-by-row memcpy crop without per-pixel alpha blending.
+            let root_buf = &self.surface_buffers.get(&root_id).unwrap().2;
+            let crop_px_x = ((crop_x as f64 * root_sx).round().max(0.0) as usize)
+                .min(surf_w as usize);
+            let crop_px_y = ((crop_y as f64 * root_sy).round().max(0.0) as usize)
+                .min(surf_h as usize);
+            let src_stride = surf_w as usize * 4;
+            let dst_stride = win_phys_w as usize * 4;
+            let copy_w = (win_phys_w as usize)
+                .min((surf_w as usize).saturating_sub(crop_px_x))
+                * 4;
+            let copy_h = (win_phys_h as usize)
+                .min((surf_h as usize).saturating_sub(crop_px_y));
+            let mut out = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
+            for y in 0..copy_h {
+                let s_off = (crop_px_y + y) * src_stride + crop_px_x * 4;
+                let d_off = y * dst_stride;
+                out[d_off..d_off + copy_w].copy_from_slice(&root_buf[s_off..s_off + copy_w]);
+            }
+            Arc::new(out)
+        } else {
+            let mut buf = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
+            with_surface_tree_downward(
+                root_surface,
+                (-crop_x, -crop_y),
+                |surf, states, (ox, oy)| {
+                    let (nx, ny) = if surf == root_surface {
+                        (*ox, *oy)
+                    } else {
+                        let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
+                        let loc = sub_state.current().location;
+                        (ox + loc.x, oy + loc.y)
+                    };
+                    if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id()) {
+                        let (sub_log_w, sub_log_h) =
+                            surface_logical_size_from_states(states, *sw, *sh);
+                        let dst_x = (nx as f64 * root_sx).round() as i32;
+                        let dst_y = (ny as f64 * root_sy).round() as i32;
+                        let (dst_w, dst_h) = if surf == root_surface {
+                            (*sw, *sh)
+                        } else {
+                            (
+                                ((sub_log_w as f64 * root_sx).round() as u32).max(1),
+                                ((sub_log_h as f64 * root_sy).round() as u32).max(1),
+                            )
+                        };
+                        if dst_w == *sw && dst_h == *sh {
+                            blit_rgba_over(
+                                &mut buf,
+                                win_phys_w,
+                                win_phys_h,
+                                srgba,
+                                *sw,
+                                *sh,
+                                dst_x,
+                                dst_y,
+                            );
+                        } else {
+                            blit_rgba_over_scaled(
+                                &mut buf,
+                                win_phys_w,
+                                win_phys_h,
+                                srgba,
+                                *sw,
+                                *sh,
+                                dst_x,
+                                dst_y,
+                                dst_w,
+                                dst_h,
+                            );
+                        }
+                    }
+                    TraversalAction::DoChildren((nx, ny))
+                },
+                |_, _, _| {},
+                |_, _, _| true,
+            );
+            Arc::new(buf)
+        };
 
         let Some(tracked) = self.windows.get_mut(&window_id) else {
             return;
@@ -1697,7 +1776,7 @@ impl AppState {
             height: pop_phys_h,
             logical_width: pop_log_w,
             logical_height: pop_log_h,
-            bgra,
+            bgra: Arc::new(bgra),
         };
 
         if popup.latest_bgra.as_ref() == Some(&new_frame) {
@@ -1723,7 +1802,7 @@ impl AppState {
             height: new_frame.height,
             logical_width: new_frame.logical_width,
             logical_height: new_frame.logical_height,
-            bgra: new_frame.bgra,
+            bgra: (*new_frame.bgra).clone(),
         });
     }
 }
@@ -1800,7 +1879,7 @@ impl CompositorHandler for AppState {
 
             if let Ok((w, h, bgra)) = extracted {
                 if w > 0 && h > 0 {
-                    self.surface_buffers.insert(surface.id(), (w, h, bgra));
+                    self.surface_buffers.insert(surface.id(), (w, h, Arc::new(bgra)));
                 }
             }
             buffer.release();
@@ -2405,7 +2484,7 @@ impl AppState {
             height: h,
             logical_width: log_w,
             logical_height: log_h,
-            bgra: bgra_ref.clone(),
+            bgra: Arc::clone(bgra_ref),
         };
         let frame_unchanged =
             xwin.announced && !title_or_app_changed && xwin.latest_bgra.as_ref() == Some(&new_frame);
@@ -2507,7 +2586,7 @@ impl AppState {
             height: h,
             logical_width: log_w,
             logical_height: log_h,
-            bgra: bgra_ref.clone(),
+            bgra: Arc::clone(bgra_ref),
         };
         if xpop.announced && xpop.latest_bgra.as_ref() == Some(&new_frame) {
             return;
@@ -2541,7 +2620,7 @@ impl AppState {
             height: new_frame.height,
             logical_width: new_frame.logical_width,
             logical_height: new_frame.logical_height,
-            bgra: new_frame.bgra,
+            bgra: (*new_frame.bgra).clone(),
         });
     }
 

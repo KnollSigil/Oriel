@@ -166,7 +166,8 @@ pub enum ControlMessage {
         width: u32,
         height: u32,
     },
-    /// Server -> Client: lossless XOR-delta + LZ4 BGRA (`Argb8888`) pixel buffer for an `xdg_popup`.
+    /// Server -> Client: encoded BGRA (`Argb8888`) pixel buffer for an `xdg_popup`,
+    /// using the session's negotiated `VideoCodec` (`SmartTile` by default).
     PopupFrame {
         window_id: WindowId,
         width: u32,

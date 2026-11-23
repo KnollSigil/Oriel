@@ -119,7 +119,8 @@ pub enum ClientUiEvent {
         height: u32,
         logical_width: u32,
         logical_height: u32,
-        bgra: Vec<u8>,
+        bgra: Arc<Vec<u8>>,
+        damage: Vec<(i32, i32, i32, i32)>,
     },
     StartMove {
         window_id: WindowId,
@@ -205,7 +206,8 @@ struct LatestDecodedFrame {
     height: u32,
     logical_width: u32,
     logical_height: u32,
-    bgra: Vec<u8>,
+    bgra: Arc<Vec<u8>>,
+    damage: Vec<(i32, i32, i32, i32)>,
 }
 
 type LatestFrameMap = Arc<Mutex<HashMap<WindowId, LatestDecodedFrame>>>;
@@ -231,10 +233,33 @@ impl UiSender {
         height: u32,
         logical_width: u32,
         logical_height: u32,
-        bgra: Vec<u8>,
+        bgra: Arc<Vec<u8>>,
+        mut damage: Vec<(i32, i32, i32, i32)>,
     ) {
         let should_notify = {
             let mut map = self.latest_frames.lock().unwrap();
+            let prev = map.remove(&window_id);
+            if let Some(old) = &prev {
+                if old.width != width || old.height != height || old.damage.is_empty() || damage.is_empty() {
+                    damage.clear(); // full-frame damage
+                } else if damage.len() + old.damage.len() <= 32 {
+                    damage.extend_from_slice(&old.damage);
+                } else {
+                    // Collapse accumulated damage into a single tight bounding box to stay O(1) memory.
+                    let mut min_x = i32::MAX;
+                    let mut min_y = i32::MAX;
+                    let mut max_x = 0i32;
+                    let mut max_y = 0i32;
+                    for &(dx, dy, dw, dh) in damage.iter().chain(old.damage.iter()) {
+                        min_x = min_x.min(dx);
+                        min_y = min_y.min(dy);
+                        max_x = max_x.max(dx.saturating_add(dw));
+                        max_y = max_y.max(dy.saturating_add(dh));
+                    }
+                    damage.clear();
+                    damage.push((min_x, min_y, (max_x - min_x).max(1), (max_y - min_y).max(1)));
+                }
+            }
             map.insert(
                 window_id,
                 LatestDecodedFrame {
@@ -243,9 +268,10 @@ impl UiSender {
                     logical_width,
                     logical_height,
                     bgra,
+                    damage,
                 },
-            )
-            .is_none()
+            );
+            prev.is_none()
         };
         if should_notify {
             let _ = self.tx.send(ClientUiEvent::FrameReady { window_id });
@@ -278,7 +304,8 @@ struct PendingFrame {
     height: u32,
     logical_width: u32,
     logical_height: u32,
-    bgra: Vec<u8>,
+    bgra: Arc<Vec<u8>>,
+    damage: Vec<(i32, i32, i32, i32)>,
 }
 
 struct RemoteWindow {
@@ -738,6 +765,7 @@ impl ClientApp {
                 logical_width,
                 logical_height,
                 bgra,
+                damage,
             } => {
                 if let Some(rp) = self.popups.get_mut(&window_id) {
                     if !rp.configured {
@@ -747,6 +775,7 @@ impl ClientApp {
                             logical_width,
                             logical_height,
                             bgra,
+                            damage,
                         });
                     } else {
                         let surf = rp.popup.wl_surface().clone();
@@ -759,6 +788,7 @@ impl ClientApp {
                             logical_width,
                             logical_height,
                             &bgra,
+                            &damage,
                             wl_shm::Format::Argb8888,
                         );
                     }
@@ -848,6 +878,7 @@ impl ClientApp {
                     logical_width,
                     logical_height,
                     bgra,
+                    damage,
                 }) = self.latest_frames.lock().unwrap().remove(&window_id)
                 else {
                     return;
@@ -860,6 +891,7 @@ impl ClientApp {
                             logical_width,
                             logical_height,
                             bgra,
+                            damage,
                         });
                     } else {
                         let lw = logical_width.max(1);
@@ -886,6 +918,7 @@ impl ClientApp {
                             lw,
                             lh,
                             &bgra,
+                            &damage,
                             wl_shm::Format::Argb8888,
                         );
                     }
@@ -1107,6 +1140,7 @@ fn border_resize_edge(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_shm_surface(
     pool: &mut SlotPool,
     surface: &wl_surface::WlSurface,
@@ -1116,6 +1150,7 @@ fn draw_shm_surface(
     logical_width: u32,
     logical_height: u32,
     bgra: &[u8],
+    damage: &[(i32, i32, i32, i32)],
     format: wl_shm::Format,
 ) {
     if width == 0 || height == 0 {
@@ -1139,7 +1174,26 @@ fn draw_shm_surface(
             surface.set_buffer_scale(1);
         }
         if buffer.attach_to(surface).is_ok() {
-            surface.damage_buffer(0, 0, width as i32, height as i32);
+            if damage.is_empty() {
+                surface.damage_buffer(0, 0, width as i32, height as i32);
+            } else if damage.len() <= 32 {
+                for &(dx, dy, dw, dh) in damage {
+                    surface.damage_buffer(dx, dy, dw, dh);
+                }
+            } else {
+                // Coalesce many dirty tiles into a single tight bounding box.
+                let mut min_x = i32::MAX;
+                let mut min_y = i32::MAX;
+                let mut max_x = 0i32;
+                let mut max_y = 0i32;
+                for &(dx, dy, dw, dh) in damage {
+                    min_x = min_x.min(dx);
+                    min_y = min_y.min(dy);
+                    max_x = max_x.max(dx + dw);
+                    max_y = max_y.max(dy + dh);
+                }
+                surface.damage_buffer(min_x, min_y, (max_x - min_x).max(1), (max_y - min_y).max(1));
+            }
             surface.commit();
         }
     }
@@ -1281,6 +1335,7 @@ impl WindowHandler for ClientApp {
                 lw,
                 lh,
                 &frame.bgra,
+                &frame.damage,
                 wl_shm::Format::Argb8888,
             );
         } else if first {
@@ -1295,6 +1350,7 @@ impl WindowHandler for ClientApp {
                 new_w,
                 new_h,
                 &blank,
+                &[],
                 wl_shm::Format::Argb8888,
             );
         }
@@ -1353,6 +1409,7 @@ impl PopupHandler for ClientApp {
                 frame.logical_width,
                 frame.logical_height,
                 &frame.bgra,
+                &frame.damage,
                 wl_shm::Format::Argb8888,
             );
         }
@@ -2174,9 +2231,9 @@ mod tests {
     #[test]
     fn ui_sender_push_frame_coalesces_to_latest_without_duplicate_wakeups() {
         let (tx, rx) = create_ui_channel();
-        tx.push_frame(7, 4, 4, 2, 2, vec![1; 64]);
-        tx.push_frame(7, 4, 4, 2, 2, vec![2; 64]);
-        tx.push_frame(7, 8, 8, 4, 4, vec![3; 256]);
+        tx.push_frame(7, 4, 4, 2, 2, Arc::new(vec![1; 64]), vec![(0, 0, 2, 2)]);
+        tx.push_frame(7, 4, 4, 2, 2, Arc::new(vec![2; 64]), vec![(2, 2, 2, 2)]);
+        tx.push_frame(7, 8, 8, 4, 4, Arc::new(vec![3; 256]), vec![(0, 0, 8, 8)]);
 
         // Only the newest frame should be stored in the 1-slot mailbox.
         let latest = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
@@ -2185,14 +2242,17 @@ mod tests {
             (8, 8, 4, 4)
         );
         assert_eq!(latest.bgra[0], 3);
+        // Dimension change resets coalesced damage to full-frame (empty vec).
+        assert!(latest.damage.is_empty());
 
         // Next push after removal re-arms the mailbox.
-        tx.push_frame(7, 2, 2, 1, 1, vec![9; 16]);
+        tx.push_frame(7, 2, 2, 1, 1, Arc::new(vec![9; 16]), vec![(0, 0, 2, 2)]);
         let next = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
         assert_eq!(
             (next.width, next.height, next.logical_width, next.logical_height),
             (2, 2, 1, 1)
         );
         assert_eq!(next.bgra[0], 9);
+        assert_eq!(next.damage, vec![(0, 0, 2, 2)]);
     }
 }

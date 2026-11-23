@@ -11,7 +11,7 @@ use remotewayland_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_stream_header,
     write_audio_packet, write_control_message, write_stream_header, write_video_frame,
     AudioPacketHeader, BidiStreamHeader, ControlMessage, StreamHeader, VideoCodec,
-    VideoFrameHeader, WindowId, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
+    VideoFrameHeader, WindowId, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
-use crate::media::{VideoEncoder, WindowVideoEncoder};
+use crate::media::WindowVideoEncoder;
 
 /// Holds the ephemeral TLS certificate fingerprint and single-use expiring session tokens.
 pub struct EphemeralCredentials {
@@ -72,6 +72,7 @@ pub fn generate_ephemeral_credentials(
         .context("failed to create QUIC server crypto config")?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
     let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.keep_alive_interval(Some(Duration::from_secs(3)));
     if let Ok(idle) = Duration::from_secs(10).try_into() {
         transport.max_idle_timeout(Some(idle));
@@ -355,9 +356,19 @@ async fn handle_connection(
         (None, None)
     };
 
+    struct PopupEncoderState {
+        encoder: WindowVideoEncoder,
+        width: u32,
+        height: u32,
+        logical_width: u32,
+        logical_height: u32,
+        last_update: Instant,
+    }
+
     let mut video_pipelines: HashMap<WindowId, WindowVideoPipeline> = HashMap::new();
-    let mut popup_encoders: HashMap<WindowId, VideoEncoder> = HashMap::new();
+    let mut popup_encoders: HashMap<WindowId, PopupEncoderState> = HashMap::new();
     let session_start = Instant::now();
+    const POPUP_IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
 
     // Serialize and coalesce client ColorScheme updates onto a single worker so bursts
     // cannot spawn unbounded blocking tasks or race on isolated portal config files.
@@ -374,9 +385,69 @@ async fn handle_connection(
         }
     });
 
+    // Dedicated control-stream reader task: `read_control_message` performs multiple
+    // `read_exact` calls and is NOT cancel-safe inside `tokio::select!`. Running it in its
+    // own task with a bounded channel prevents partial-frame drops and applies QUIC backpressure.
+    let (ctrl_in_tx, mut ctrl_in_rx) = mpsc::channel::<Result<ControlMessage>>(256);
+    let ctrl_reader_task = tokio::spawn(async move {
+        loop {
+            match read_control_message(&mut recv).await {
+                Ok(Some(msg)) => {
+                    if ctrl_in_tx.send(Ok(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let _ = ctrl_in_tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
+
     // Bridge compositor events -> QUIC control/video streams and QUIC control messages -> compositor.
+    let loop_res: Result<()> = async {
     loop {
+        let next_popup_refresh = popup_encoders
+            .iter()
+            .filter(|(_, st)| st.encoder.has_pending_lossless_refresh())
+            .map(|(&wid, st)| {
+                (
+                    wid,
+                    POPUP_IDLE_REFRESH_DELAY.saturating_sub(st.last_update.elapsed()),
+                )
+            })
+            .min_by_key(|&(_, wait)| wait);
+
         tokio::select! {
+            Some(wid) = async {
+                match next_popup_refresh {
+                    Some((wid, wait)) => {
+                        if !wait.is_zero() {
+                            tokio::time::sleep(wait).await;
+                        }
+                        Some(wid)
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(st) = popup_encoders.get_mut(&wid) {
+                    let pts_ns = session_start.elapsed().as_nanos() as u64;
+                    if let Some(frame) = st.encoder.encode_lossless_refresh(st.width, st.height, pts_ns) {
+                        st.last_update = Instant::now();
+                        write_control_message(&mut send, &ControlMessage::PopupFrame {
+                            window_id: wid,
+                            width: frame.width,
+                            height: frame.height,
+                            logical_width: st.logical_width,
+                            logical_height: st.logical_height,
+                            is_keyframe: frame.is_keyframe,
+                            bgra: frame.data,
+                        }).await?;
+                    }
+                }
+            }
             Some(active) = async {
                 match mic_active_rx.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -410,9 +481,23 @@ async fn handle_connection(
                         logical_height,
                         bgra,
                     }) => {
-                        let enc = popup_encoders.entry(window_id).or_insert_with(VideoEncoder::new);
+                        let st = popup_encoders
+                            .entry(window_id)
+                            .or_insert_with(|| PopupEncoderState {
+                                encoder: WindowVideoEncoder::new(selected_codec),
+                                width,
+                                height,
+                                logical_width,
+                                logical_height,
+                                last_update: Instant::now(),
+                            });
+                        st.width = width;
+                        st.height = height;
+                        st.logical_width = logical_width;
+                        st.logical_height = logical_height;
+                        st.last_update = Instant::now();
                         let pts_ns = session_start.elapsed().as_nanos() as u64;
-                        let frame = enc.encode_bgra(width, height, pts_ns, &bgra);
+                        let frame = st.encoder.encode_bgra(width, height, pts_ns, &bgra, 80);
                         write_control_message(&mut send, &ControlMessage::PopupFrame {
                             window_id,
                             width: frame.width,
@@ -528,8 +613,13 @@ async fn handle_connection(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            msg = read_control_message(&mut recv) => {
-                match msg? {
+            msg = ctrl_in_rx.recv() => {
+                let msg = match msg {
+                    Some(Ok(m)) => Some(m),
+                    Some(Err(err)) => return Err(err),
+                    None => None,
+                };
+                match msg {
                     Some(ControlMessage::WindowConfigured {
                         window_id,
                         width,
@@ -613,27 +703,31 @@ async fn handle_connection(
             }
         }
     }
+    Ok(())
+    }
+    .await;
 
+    ctrl_reader_task.abort();
     for (_, pipeline) in video_pipelines.drain() {
         pipeline.task.abort();
     }
 
-    Ok(())
+    loop_res
 }
 
 /// Maximum number of unacknowledged video frames allowed in flight per window.
-/// Keeps end-to-end latency bounded when UI updates outpace network bandwidth or decoding.
-const MAX_IN_FLIGHT_FRAMES: usize = 2;
+/// Allows 60 FPS pipelining over ~10-20ms Wi-Fi RTT while keeping latency bounded.
+const MAX_IN_FLIGHT_FRAMES: usize = 3;
 
 /// Safety timeout for waiting on a `FrameAck` so a stalled ack can never permanently deadlock a stream.
-const FRAME_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+const FRAME_ACK_TIMEOUT: Duration = Duration::from_millis(400);
 
 struct RawVideoFrame {
     width: u32,
     height: u32,
     logical_width: u32,
     logical_height: u32,
-    bgra: Vec<u8>,
+    bgra: Arc<Vec<u8>>,
 }
 
 struct WindowVideoPipeline {
@@ -723,24 +817,34 @@ async fn run_window_video_pipeline(
     let mut in_flight_pts: VecDeque<u64> = VecDeque::new();
     let mut last_pts_ns: u64 = 0;
     let mut quality: u8 = 80;
+    let mut last_congestion: Option<Instant> = None;
     let mut last_dims: Option<(u32, u32, u32, u32)> = None;
-    const IDLE_REFRESH_DELAY: Duration = Duration::from_millis(200);
+    let mut refining_idle = false;
+    const IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
+    const CONGESTION_COOLDOWN: Duration = Duration::from_millis(500);
+    const LOSSY_CLIMB_BYTE_CAP: usize = 95_000;
+    const LOSSY_NUDGE_BYTE_CAP: usize = 130_000;
 
     loop {
         // 1. Wait until a new frame is available in the 1-slot mailbox,
-        //    or fire an automatic lossless refinement pass after 200ms idle on lossy tiles.
+        //    or stream progressive lossless refinement chunks after 120ms idle.
         let mut do_idle_refresh = false;
         loop {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if latest_frame.lock().unwrap().is_some() {
+                refining_idle = false;
                 break;
             }
             let needs_refresh = encoder
                 .as_ref()
                 .is_some_and(|e| e.has_pending_lossless_refresh())
                 && last_dims.is_some();
+            if needs_refresh && refining_idle {
+                do_idle_refresh = true;
+                break;
+            }
             tokio::select! {
                 _ = notified => {}
                 res = ack_rx.changed() => {
@@ -758,6 +862,7 @@ async fn run_window_video_pipeline(
                     }
                 } => {
                     if latest_frame.lock().unwrap().is_none() {
+                        refining_idle = true;
                         do_idle_refresh = true;
                         break;
                     }
@@ -769,6 +874,8 @@ async fn run_window_video_pipeline(
         //    Any newer frames arriving while waiting overwrite `latest_frame` in place.
         prune_acked_pts(&mut in_flight_pts, *ack_rx.borrow_and_update());
         let mut experienced_backpressure = false;
+        let mut ack_timed_out = false;
+        let ack_wait_start = Instant::now();
         while in_flight_pts.len() >= MAX_IN_FLIGHT_FRAMES {
             experienced_backpressure = true;
             match tokio::time::timeout(FRAME_ACK_TIMEOUT, ack_rx.changed()).await {
@@ -780,20 +887,29 @@ async fn run_window_video_pipeline(
                     return;
                 }
                 Err(_) => {
+                    ack_timed_out = true;
                     in_flight_pts.pop_front();
                 }
             }
         }
+        let ack_wait_elapsed = if experienced_backpressure {
+            ack_wait_start.elapsed()
+        } else {
+            Duration::ZERO
+        };
 
         let raw_pts = session_start.elapsed().as_nanos() as u64;
         let pts_ns = raw_pts.max(last_pts_ns.saturating_add(1));
 
+        let encode_start = Instant::now();
         let (logical_width, logical_height, frame) = if do_idle_refresh {
             // Re-check mailbox in case a new frame arrived while waiting for credit.
             if latest_frame.lock().unwrap().is_some() {
+                refining_idle = false;
                 continue;
             }
             let Some((lw_phys, lh_phys, log_w, log_h)) = last_dims else {
+                refining_idle = false;
                 continue;
             };
             let mut enc = encoder.take().unwrap();
@@ -810,8 +926,13 @@ async fn run_window_video_pipeline(
                     return;
                 }
             };
+            let still_has_lossy = enc.has_pending_lossless_refresh();
             encoder = Some(enc);
+            if !still_has_lossy {
+                refining_idle = false;
+            }
             let Some(frame) = frame_opt else {
+                refining_idle = false;
                 continue;
             };
             last_pts_ns = pts_ns;
@@ -845,8 +966,22 @@ async fn run_window_video_pipeline(
             encoder = Some(enc);
             (logical_width, logical_height, frame)
         };
+        let encode_elapsed = encode_start.elapsed();
 
         // 5. Write encoded frame to the per-window QUIC stream and adapt DCT quality dynamically.
+        let Ok(payload_len) = u32::try_from(frame.data.len()) else {
+            warn!(window_id, bytes = frame.data.len(), "encoded video frame exceeds u32::MAX; dropping");
+            continue;
+        };
+        if frame.data.len() > MAX_VIDEO_FRAME_BYTES {
+            warn!(
+                window_id,
+                bytes = frame.data.len(),
+                max = MAX_VIDEO_FRAME_BYTES,
+                "encoded video frame exceeds MAX_VIDEO_FRAME_BYTES; dropping"
+            );
+            continue;
+        }
         let hdr = VideoFrameHeader {
             pts_ns: frame.pts_ns,
             width: frame.width,
@@ -854,7 +989,7 @@ async fn run_window_video_pipeline(
             logical_width,
             logical_height,
             is_keyframe: frame.is_keyframe,
-            payload_len: frame.data.len() as u32,
+            payload_len,
         };
         let send_start = Instant::now();
         if let Err(err) = write_video_frame(&mut stream, &hdr, &frame.data).await {
@@ -862,10 +997,44 @@ async fn run_window_video_pipeline(
             return;
         }
         let send_elapsed = send_start.elapsed();
-        if experienced_backpressure || send_elapsed > Duration::from_millis(16) {
-            quality = quality.saturating_sub(8).max(48);
-        } else if frame.used_lossy && send_elapsed < Duration::from_millis(8) {
-            quality = (quality + 2).min(82);
+        tracing::debug!(
+            window_id,
+            w = frame.width,
+            h = frame.height,
+            copy_rect = frame.had_copy_rect,
+            dirty_tiles = frame.dirty_tiles,
+            lossy = frame.used_lossy,
+            quality,
+            bytes = frame.data.len(),
+            ack_wait_ms = ack_wait_elapsed.as_millis() as u64,
+            encode_ms = encode_elapsed.as_millis() as u64,
+            send_ms = send_elapsed.as_millis() as u64,
+            "sent video frame"
+        );
+        if !do_idle_refresh {
+            if ack_timed_out || ack_wait_elapsed > Duration::from_millis(80) {
+                quality = quality.saturating_sub(12).max(26);
+                last_congestion = Some(Instant::now());
+            } else if ack_wait_elapsed > Duration::from_millis(30)
+                || send_elapsed > Duration::from_millis(20)
+            {
+                quality = quality.saturating_sub(6).max(26);
+                last_congestion = Some(Instant::now());
+            } else if frame.used_lossy
+                && frame.data.len() >= LOSSY_NUDGE_BYTE_CAP
+                && ack_wait_elapsed > Duration::from_millis(15)
+            {
+                quality = quality.saturating_sub(4).max(26);
+                last_congestion = Some(Instant::now());
+            } else if frame.used_lossy
+                && frame.data.len() < LOSSY_CLIMB_BYTE_CAP
+                && ack_wait_elapsed < Duration::from_millis(12)
+                && send_elapsed < Duration::from_millis(8)
+                && last_congestion.is_none_or(|t| t.elapsed() >= CONGESTION_COOLDOWN)
+            {
+                let step = if quality < 44 { 1 } else { 2 };
+                quality = (quality + step).min(82);
+            }
         }
 
         in_flight_pts.push_back(pts_ns);

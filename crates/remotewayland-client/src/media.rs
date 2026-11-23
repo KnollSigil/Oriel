@@ -1,14 +1,21 @@
 //! Pure-Rust video decoders (`VideoCodec::Lz4Delta` and `VideoCodec::SmartTile`).
 
-use anyhow::{bail, Context, Result};
-use remotewayland_proto::smart_tile::SmartTileDecoder;
+use std::sync::Arc;
+
+use anyhow::{bail, Result};
+use remotewayland_proto::smart_tile::{
+    decompress_lz4_bounded, validate_frame_dims, SmartTileDecoder,
+};
 use remotewayland_proto::VideoCodec;
 
 /// A decoded BGRA (`Argb8888`) video frame ready for Wayland SHM presentation.
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    pub bgra: Vec<u8>,
+    pub bgra: Arc<Vec<u8>>,
+    /// Damaged physical pixel rectangles `(x, y, w, h)` for partial compositor damage.
+    /// Empty means full-frame damage.
+    pub damage: Vec<(i32, i32, i32, i32)>,
 }
 
 /// Codec-polymorphic per-window video decoder.
@@ -35,11 +42,12 @@ impl WindowVideoDecoder {
         match self {
             Self::Lz4Delta(dec) => dec.decode(width, height, is_keyframe, data),
             Self::SmartTile(dec) => {
-                let bgra = dec.decode(width, height, data)?;
+                let (bgra, damage) = dec.decode_with_damage(width, height, data)?;
                 Ok(DecodedFrame {
                     width,
                     height,
                     bgra,
+                    damage,
                 })
             }
         }
@@ -67,9 +75,8 @@ impl VideoDecoder {
         is_keyframe: bool,
         data: &[u8],
     ) -> Result<DecodedFrame> {
-        let decompressed = lz4_flex::decompress_size_prepended(data)
-            .context("failed to decompress LZ4 video frame")?;
-        let expected_len = (width as usize) * (height as usize) * 4;
+        let expected_len = validate_frame_dims(width, height)?;
+        let decompressed = decompress_lz4_bounded(data, expected_len)?;
         if decompressed.len() != expected_len {
             bail!(
                 "decoded frame size mismatch: expected {expected_len}, got {}",
@@ -90,7 +97,8 @@ impl VideoDecoder {
         Ok(DecodedFrame {
             width,
             height,
-            bgra: self.prev_bgra.clone(),
+            bgra: Arc::new(self.prev_bgra.clone()),
+            damage: Vec::new(),
         })
     }
 }
@@ -105,7 +113,7 @@ mod tests {
         let raw1 = vec![10u8; 16 * 16 * 4];
         let kf = lz4_flex::compress_prepend_size(&raw1);
         let d1 = dec.decode(16, 16, true, &kf).unwrap();
-        assert_eq!(d1.bgra, raw1);
+        assert_eq!(*d1.bgra, raw1);
 
         // XOR delta flipping every byte from 10 -> 26 (10 ^ 16 = 26)
         let delta = vec![16u8; 16 * 16 * 4];

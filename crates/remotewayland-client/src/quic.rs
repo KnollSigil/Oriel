@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::audio::{start_mic_capture, AudioPlaybackSink};
-use crate::media::{VideoDecoder, WindowVideoDecoder};
+use crate::media::WindowVideoDecoder;
 use crate::window::{ClientUiEvent, UiSender};
 
 #[derive(Debug)]
@@ -98,7 +98,7 @@ pub async fn connect_and_auth(
     token: String,
     enable_audio_bridge: bool,
     initial_scale: f64,
-) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream)> {
+) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream, VideoCodec)> {
     let verifier = Arc::new(PinnedCertVerifier::new(fingerprint_sha256));
     let mut rustls_config = rustls::ClientConfig::builder()
         .dangerous()
@@ -110,6 +110,7 @@ pub async fn connect_and_auth(
         .context("failed to create QUIC client crypto config")?;
     let mut client_config = ClientConfig::new(Arc::new(quic_crypto));
     let mut transport = TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.keep_alive_interval(Some(Duration::from_secs(3)));
     if let Ok(idle) = Duration::from_secs(10).try_into() {
         transport.max_idle_timeout(Some(idle));
@@ -142,13 +143,14 @@ pub async fn connect_and_auth(
     )
     .await?;
 
-    match read_control_message(&mut recv).await? {
+    let selected_codec = match read_control_message(&mut recv).await? {
         Some(ControlMessage::AuthResponse {
             accepted: true,
             selected_codec,
             ..
         }) => {
             info!(?selected_codec, "authenticated with server");
+            selected_codec
         }
         Some(ControlMessage::AuthResponse {
             accepted: false,
@@ -161,9 +163,9 @@ pub async fn connect_and_auth(
             );
         }
         other => bail!("unexpected auth response: {other:?}"),
-    }
+    };
 
-    Ok((conn, send, recv))
+    Ok((conn, send, recv, selected_codec))
 }
 
 /// Events sent from the QUIC client to the launcher UI.
@@ -195,7 +197,7 @@ pub async fn run_client(
     launcher_tx: Option<mpsc::UnboundedSender<LauncherNetEvent>>,
     pty_socket_path: Option<PathBuf>,
 ) -> Result<()> {
-    let (conn, mut send, mut recv) = connect_and_auth(
+    let (conn, mut send, mut recv, selected_codec) = connect_and_auth(
         server_addr,
         fingerprint_sha256,
         token,
@@ -312,9 +314,24 @@ pub async fn run_client(
             tokio::spawn(async move {
                 match read_stream_header(&mut recv_uni).await {
                     Ok(StreamHeader::Video { window_id, codec }) => {
-                        let mut decoder = WindowVideoDecoder::new(codec);
+                        let mut decoder = Some(WindowVideoDecoder::new(codec));
                         while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
-                            match decoder.decode(hdr.width, hdr.height, hdr.is_keyframe, &payload) {
+                            let mut dec = decoder.take().unwrap();
+                            let decode_res = tokio::task::spawn_blocking(move || {
+                                let res =
+                                    dec.decode(hdr.width, hdr.height, hdr.is_keyframe, &payload);
+                                (dec, res)
+                            })
+                            .await;
+                            let (dec, frame_res) = match decode_res {
+                                Ok(pair) => pair,
+                                Err(err) => {
+                                    warn!(window_id, error = %err, "video decoder task panicked");
+                                    break;
+                                }
+                            };
+                            decoder = Some(dec);
+                            match frame_res {
                                 Ok(frame) => {
                                     tx.push_frame(
                                         window_id,
@@ -323,6 +340,7 @@ pub async fn run_client(
                                         hdr.logical_width,
                                         hdr.logical_height,
                                         frame.bgra,
+                                        frame.damage,
                                     );
                                     let _ = ack_tx.send((window_id, hdr.pts_ns));
                                 }
@@ -380,7 +398,7 @@ pub async fn run_client(
     });
 
     // Read server control events and dispatch to Wayland UI thread.
-    let mut popup_decoders: std::collections::HashMap<WindowId, VideoDecoder> =
+    let mut popup_decoders: std::collections::HashMap<WindowId, WindowVideoDecoder> =
         std::collections::HashMap::new();
     let mut server_mic_wanted = false;
     let mut mic_cfg_rx = crate::audio::subscribe_mic_config();
@@ -439,11 +457,33 @@ pub async fn run_client(
         }
     };
 
+    // Dedicated control-stream reader task: `read_control_message` performs multiple
+    // `read_exact` calls and is NOT cancel-safe inside `tokio::select!`.
+    let (ctrl_in_tx, mut ctrl_in_rx) = mpsc::channel::<Result<ControlMessage>>(256);
+    let ctrl_reader_task = tokio::spawn(async move {
+        loop {
+            match read_control_message(&mut recv).await {
+                Ok(Some(msg)) => {
+                    if ctrl_in_tx.send(Ok(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let _ = ctrl_in_tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let loop_res: Result<()> = async {
     loop {
         let msg = tokio::select! {
             _ = &mut ctrl_closed_rx => break,
-            res = read_control_message(&mut recv) => match res? {
-                Some(m) => m,
+            res = ctrl_in_rx.recv() => match res {
+                Some(Ok(m)) => m,
+                Some(Err(err)) => return Err(err),
                 None => break,
             },
             res = mic_cfg_rx.changed() => {
@@ -518,7 +558,7 @@ pub async fn run_client(
             } => {
                 let decoder = popup_decoders
                     .entry(window_id)
-                    .or_default();
+                    .or_insert_with(|| WindowVideoDecoder::new(selected_codec));
                 match decoder.decode(width, height, is_keyframe, &bgra) {
                     Ok(frame) => {
                         let _ = ui_tx.send(ClientUiEvent::PopupFrame {
@@ -528,6 +568,7 @@ pub async fn run_client(
                             logical_width,
                             logical_height,
                             bgra: frame.bgra,
+                            damage: frame.damage,
                         });
                     }
                     Err(err) => warn!(window_id, error = %err, "popup decode error"),
@@ -669,6 +710,9 @@ pub async fn run_client(
             }
         }
     }
+    Ok(())
+    }
+    .await;
 
     conn.close(0u32.into(), b"client disconnect");
     let _ = ui_tx.send(ClientUiEvent::Disconnected);
@@ -685,13 +729,14 @@ pub async fn run_client(
         t.abort();
     }
     color_scheme_task.abort();
+    ctrl_reader_task.abort();
     writer_task.abort();
     if let Some((handle, task)) = active_mic.take() {
         task.abort();
         drop(handle);
     }
     uni_task.abort();
-    Ok(())
+    loop_res
 }
 
 /// Parse an XDG `org.freedesktop.appearance` `color-scheme` (`uint32 0|1|2`) from
