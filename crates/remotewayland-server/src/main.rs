@@ -13,6 +13,7 @@ mod pty;
 mod quic;
 mod session;
 mod settings_portal;
+mod shell_env;
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -94,6 +95,9 @@ enum ServerSubcommand {
         #[command(flatten)]
         gpu: GpuArgs,
     },
+    /// Print the environment for `attach`'s login-shell environment resolution.
+    #[command(name = shell_env::PRINT_SUBCOMMAND, hide = true)]
+    PrintShellEnv,
 }
 
 /// GPU acceleration options for apps in the session.
@@ -134,10 +138,23 @@ struct ControlSockInfo {
     token: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.subcommand, Some(ServerSubcommand::PrintShellEnv)) {
+        return shell_env::print_env();
+    }
+    // A server started by hand, from a service or from cron gets the login-shell environment
+    // here, before the runtime starts any threads (`attach` resolves it for its own daemon).
+    let startup_env = cli.subcommand.is_none().then(shell_env::apply_at_startup);
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the tokio runtime")?
+        .block_on(run(cli, startup_env))
+}
+
+async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result<()> {
     // Validate host XDG_RUNTIME_DIR up front (strict 0700 owned by current UID, no /tmp fallback).
     let host_runtime_dir = session::validate_host_runtime_dir()?;
 
@@ -159,6 +176,29 @@ async fn main() -> Result<()> {
                 .add_directive("smithay::backend::drm::device::fd=error".parse()?),
         )
         .init();
+
+    match startup_env {
+        Some(shell_env::StartupOutcome::Applied(count)) => {
+            info!(count, "applied variables from the login shell environment")
+        }
+        Some(shell_env::StartupOutcome::Fallback(count, err)) => warn!(
+            count,
+            error = format!("{err:#}"),
+            "login shell environment unavailable; using a minimal login environment"
+        ),
+        Some(shell_env::StartupOutcome::NoLoginShell(reason)) => warn!(
+            reason,
+            "no login shell to read an environment from; using the inherited environment"
+        ),
+        Some(shell_env::StartupOutcome::NotApplied(err)) => warn!(
+            error = format!("{err:#}"),
+            "login shell environment not applied; using the inherited environment"
+        ),
+        Some(shell_env::StartupOutcome::Skipped) => {
+            info!("login shell environment skipped (REMOTEWAYLAND_SKIP_SHELL_ENV)")
+        }
+        Some(shell_env::StartupOutcome::ResolvedByAttach) | None => {}
+    }
 
     // Capture control socket path in the host XDG_RUNTIME_DIR before switching
     // the server process to its isolated session XDG_RUNTIME_DIR.
@@ -315,8 +355,32 @@ async fn run_attach(
 
     let _ = std::fs::remove_file(&sock_path);
     let exe = std::env::current_exe().context("failed to locate remotewayland-server binary")?;
+    // Give the daemon the user's login environment: a one-off SSH command gets no login
+    // shell, so it lacks /etc/profile.d additions such as Flatpak's XDG_DATA_DIRS. Resolve
+    // it here rather than in the daemon so failures reach this command's stderr, and so the
+    // daemon's startup isn't delayed past the wait below; the daemon is told to skip it.
+    let (shell_env, shell_env_note) = match shell_env::resolve(&exe).await {
+        shell_env::Resolution::Resolved(env) => {
+            let note = format!("attach: using {} variables from the login shell", env.len());
+            (Some(env), note)
+        }
+        shell_env::Resolution::Fallback { env, error } => {
+            eprintln!("warning: {error:#}; starting the server with a minimal login environment");
+            let note = format!("attach: login shell environment unavailable: {error:#}");
+            (Some(env), note)
+        }
+        shell_env::Resolution::NoLoginShell(reason) => (
+            None,
+            format!("attach: no login shell ({reason}); keeping the SSH environment"),
+        ),
+        shell_env::Resolution::Skipped => (
+            None,
+            "attach: login shell environment skipped (REMOTEWAYLAND_SKIP_SHELL_ENV)".into(),
+        ),
+    };
+
     let log_path = session::daemon_log_path(host_runtime_dir);
-    let log_file = std::fs::OpenOptions::new()
+    let mut log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
@@ -328,8 +392,17 @@ async fn run_attach(
         .as_ref()
         .and_then(|f| f.metadata().ok())
         .map_or(0, |m| m.len());
+    if let Some(file) = log_file.as_mut() {
+        use std::io::Write;
+        let _ = writeln!(file, "{shell_env_note}");
+    }
 
     let mut cmd = Command::new(exe);
+    // The daemon's environment is the login one only: nothing from this SSH connection.
+    if let Some(env) = &shell_env {
+        cmd.env_clear().envs(env);
+    }
+    cmd.env(shell_env::ATTACH_RESOLVED_VAR, "1");
     cmd.arg("--daemon")
         .arg("--listen")
         .arg(listen.to_string())
