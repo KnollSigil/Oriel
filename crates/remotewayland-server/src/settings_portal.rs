@@ -1,9 +1,14 @@
 //! A minimal `org.freedesktop.impl.portal.Settings` backend on the isolated session bus.
 //!
-//! It serves only `org.gnome.desktop.wm.preferences` `button-layout`. GTK apps that read
-//! settings through the portal (GTK3 with `GTK_USE_PORTAL=1`, Flatpak apps such as Firefox)
-//! otherwise fall back to GTK's built-in `menu:close` (close button only) on servers
-//! without xdg-desktop-portal-gtk, because the KDE portal serves no `org.gnome.*` keys.
+//! It serves the `org.gnome.*` keys GTK apps need that the KDE portal does not, for
+//! servers without xdg-desktop-portal-gtk. GTK apps that read settings through the portal
+//! (GTK3 with `GTK_USE_PORTAL=1`, Flatpak apps such as Firefox and Chromium) otherwise:
+//!
+//! - fall back to GTK's built-in `menu:close` titlebar (close button only) without
+//!   `org.gnome.desktop.wm.preferences` `button-layout`;
+//! - draw UI text with no antialiasing at all (Chromium's tab titles, for one) without the
+//!   `org.gnome.desktop.interface` font rendering keys ([`FONT_SETTINGS`]).
+//!
 //! It is listed last for the Settings interface, so a running xdg-desktop-portal-gtk
 //! still takes precedence.
 
@@ -22,6 +27,16 @@ const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 const INTERFACE: &str = "org.freedesktop.impl.portal.Settings";
 const WM_NAMESPACE: &str = "org.gnome.desktop.wm.preferences";
 const BUTTON_LAYOUT_KEY: &str = "button-layout";
+const INTERFACE_NAMESPACE: &str = "org.gnome.desktop.interface";
+
+/// `org.gnome.desktop.interface` font rendering keys and the values served: GNOME's
+/// defaults, with grayscale antialiasing since subpixel (`rgba`) rendering would not
+/// match the client's display once frames are streamed and scaled.
+const FONT_SETTINGS: [(&str, &str); 3] = [
+    ("font-antialiasing", "grayscale"),
+    ("font-hinting", "slight"),
+    ("font-rgba-order", "rgb"),
+];
 
 /// Contents of the `.portal` file that makes xdg-desktop-portal use this backend.
 pub const PORTAL_FILE: &str = "[portal]\n\
@@ -46,7 +61,11 @@ fn button_layout_value() -> OwnedValue {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    OwnedValue::from(zbus::zvariant::Str::from(layout))
+    str_value(&layout)
+}
+
+fn str_value(value: &str) -> OwnedValue {
+    OwnedValue::from(zbus::zvariant::Str::from(value))
 }
 
 /// Whether `namespace` matches one of the `ReadAll` filters: an empty list or an empty
@@ -70,12 +89,26 @@ impl SettingsPortal {
                 HashMap::from([(BUTTON_LAYOUT_KEY.to_string(), button_layout_value())]),
             );
         }
+        if namespace_matches(&namespaces, INTERFACE_NAMESPACE) {
+            out.insert(
+                INTERFACE_NAMESPACE.to_string(),
+                FONT_SETTINGS
+                    .iter()
+                    .map(|&(key, value)| (key.to_string(), str_value(value)))
+                    .collect(),
+            );
+        }
         out
     }
 
     fn read(&self, namespace: &str, key: &str) -> Result<OwnedValue, PortalError> {
+        let font_value = (namespace == INTERFACE_NAMESPACE)
+            .then(|| FONT_SETTINGS.iter().find(|(k, _)| *k == key))
+            .flatten();
         if namespace == WM_NAMESPACE && key == BUTTON_LAYOUT_KEY {
             Ok(button_layout_value())
+        } else if let Some(&(_, value)) = font_value {
+            Ok(str_value(value))
         } else {
             Err(PortalError::NotFound(format!(
                 "Requested setting {namespace}.{key} not found"
@@ -155,5 +188,24 @@ mod tests {
             WM_NAMESPACE
         ));
         assert!(!namespace_matches(&p(&["org.kde.*"]), WM_NAMESPACE));
+    }
+
+    #[test]
+    fn serves_font_rendering_keys() {
+        let all = SettingsPortal.read_all(vec![INTERFACE_NAMESPACE.to_string()]);
+        assert_eq!(
+            all[INTERFACE_NAMESPACE]["font-antialiasing"],
+            str_value("grayscale")
+        );
+        assert!(!all.contains_key(WM_NAMESPACE));
+        assert_eq!(
+            SettingsPortal
+                .read(INTERFACE_NAMESPACE, "font-hinting")
+                .unwrap(),
+            str_value("slight")
+        );
+        assert!(SettingsPortal
+            .read(INTERFACE_NAMESPACE, "font-name")
+            .is_err());
     }
 }
