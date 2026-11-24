@@ -12,6 +12,8 @@
 //!   the same apps draw UI text with no antialiasing at all (Chromium's tab titles).
 //! - Once the client syncs a color scheme, `org.freedesktop.appearance` `color-scheme` and
 //!   the matching `org.gnome.desktop.interface` `color-scheme` and `gtk-theme`.
+//! - Once the client syncs them, `org.freedesktop.appearance` `accent-color` (only when the
+//!   client has an accent, so the server's own default stands otherwise) and `contrast`.
 //!
 //! It is listed first for the Settings interface. xdg-desktop-portal merges `ReadAll`
 //! per key with the first-listed backend winning, and `Read`/`ReadOne` return the first
@@ -56,6 +58,10 @@ pub struct DesktopSettings<'a> {
     /// `None` until the client syncs a color scheme; the other backends' values stand.
     pub appearance: Option<Appearance<'a>>,
     pub button_layout: &'a str,
+    /// sRGB components in `[0, 1]`; `None` leaves the accent to the other backends.
+    pub accent_color: Option<[f64; 3]>,
+    /// `0` = no preference, `1` = higher contrast; `None` until the client syncs one.
+    pub contrast: Option<u32>,
 }
 
 /// A client-synced color scheme in the forms apps read it.
@@ -67,10 +73,12 @@ pub struct Appearance<'a> {
     pub gtk_theme: &'a str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Setting {
     Str(String),
     U32(u32),
+    /// `(ddd)`, as `org.freedesktop.appearance` `accent-color`.
+    Rgb([f64; 3]),
 }
 
 impl Setting {
@@ -78,6 +86,7 @@ impl Setting {
         match self {
             Setting::Str(s) => Value::from(Str::from(s.as_str())),
             Setting::U32(v) => Value::from(*v),
+            Setting::Rgb([r, g, b]) => Value::from((*r, *g, *b)),
         }
     }
 
@@ -85,6 +94,8 @@ impl Setting {
         match self {
             Setting::Str(s) => OwnedValue::from(Str::from(s.clone())),
             Setting::U32(v) => OwnedValue::from(*v),
+            Setting::Rgb(_) => OwnedValue::try_from(self.to_value())
+                .expect("a (ddd) structure holds no file descriptors"),
         }
     }
 }
@@ -121,19 +132,32 @@ impl SettingsStore {
                 Setting::Str(a.gtk_theme.to_string()),
             );
         }
+        if let Some(rgb) = desktop.accent_color {
+            out.insert((APPEARANCE_NAMESPACE, "accent-color"), Setting::Rgb(rgb));
+        }
+        if let Some(contrast) = desktop.contrast {
+            out.insert((APPEARANCE_NAMESPACE, "contrast"), Setting::U32(contrast));
+        }
         out
     }
 
-    /// Replace the served settings and return the keys whose value changed or appeared.
-    fn update(&mut self, desktop: &DesktopSettings) -> Vec<(Key, Setting)> {
+    /// Replace the served settings. Returns the keys whose value changed or appeared, and
+    /// the keys no longer served (the other backends' value now applies).
+    fn update(&mut self, desktop: &DesktopSettings) -> (Vec<(Key, Setting)>, Vec<Key>) {
         let desired = Self::desired(desktop);
         let changed = desired
             .iter()
             .filter(|(key, value)| self.settings.get(*key) != Some(*value))
             .map(|(key, value)| (*key, value.clone()))
             .collect();
+        let removed = self
+            .settings
+            .keys()
+            .filter(|key| !desired.contains_key(*key))
+            .copied()
+            .collect();
         self.settings = desired;
-        changed
+        (changed, removed)
     }
 
     fn read_all(&self, namespaces: &[String]) -> HashMap<String, HashMap<String, OwnedValue>> {
@@ -229,23 +253,64 @@ pub fn start(dbus_address: &str) -> Result<()> {
 }
 
 /// Serve `desktop` and notify xdg-desktop-portal (and through it, running apps) of every
-/// key that changed.
+/// key that changed, including keys no longer served (see [`value_now_in_effect`]).
 pub fn update(desktop: &DesktopSettings) {
-    let changed = store().update(desktop);
+    // The store lock is released here: the frontend reads from us while we query it below.
+    let (changed, removed) = store().update(desktop);
     let Some(conn) = CONNECTION.get() else {
         return;
     };
-    for ((namespace, key), value) in changed {
+    let emit = |namespace: &str, key: &str, value: &Value<'_>| {
         if let Err(err) = conn.emit_signal(
             None::<()>,
             OBJECT_PATH,
             INTERFACE,
             "SettingChanged",
-            &(namespace, key, value.to_value()),
+            &(namespace, key, value),
         ) {
             warn!(error = %err, namespace, key, "failed to emit settings portal SettingChanged");
         }
+    };
+    for ((namespace, key), value) in changed {
+        emit(namespace, key, &value.to_value());
     }
+    for (namespace, key) in removed {
+        if let Some(value) = value_now_in_effect(conn, namespace, key) {
+            emit(namespace, key, &value);
+        }
+    }
+}
+
+/// The value of a key we stopped serving, as apps now read it: the other backends' value
+/// through the xdg-desktop-portal frontend, or for `accent-color`, "no accent" (the spec's
+/// out-of-range triple) when no backend has one. Queried only while the frontend runs, so
+/// the call cannot D-Bus-activate a frontend without the session's configuration.
+fn value_now_in_effect(conn: &Connection, namespace: &str, key: &str) -> Option<Value<'static>> {
+    const FRONTEND: &str = "org.freedesktop.portal.Desktop";
+    let frontend_running = zbus::blocking::fdo::DBusProxy::new(conn)
+        .ok()
+        .and_then(|dbus| dbus.name_has_owner(FRONTEND.try_into().ok()?).ok())
+        .unwrap_or(false);
+    let from_frontend = frontend_running
+        .then(|| {
+            conn.call_method(
+                Some(FRONTEND),
+                OBJECT_PATH,
+                Some("org.freedesktop.portal.Settings"),
+                "ReadOne",
+                &(namespace, key),
+            )
+            .ok()?
+            .body()
+            .deserialize::<OwnedValue>()
+            .ok()
+        })
+        .flatten()
+        .map(Value::from);
+    from_frontend.or_else(|| {
+        (namespace == APPEARANCE_NAMESPACE && key == "accent-color")
+            .then(|| Value::from((-1.0f64, -1.0f64, -1.0f64)))
+    })
 }
 
 #[cfg(test)]
@@ -278,6 +343,8 @@ mod tests {
         store.update(&DesktopSettings {
             appearance: None,
             button_layout: LAYOUT,
+            accent_color: None,
+            contrast: None,
         });
         let all = store.read_all(&[INTERFACE_NAMESPACE.to_string()]);
         assert_eq!(
@@ -295,7 +362,44 @@ mod tests {
             Some(str_value("slight"))
         );
         assert_eq!(store.read(APPEARANCE_NAMESPACE, "color-scheme"), None);
+        assert_eq!(store.read(APPEARANCE_NAMESPACE, "accent-color"), None);
         assert_eq!(store.read(INTERFACE_NAMESPACE, "font-name"), None);
+    }
+
+    #[test]
+    fn serves_synced_accent_color_and_contrast() {
+        let mut store = SettingsStore::default();
+        let (changed, _) = store.update(&DesktopSettings {
+            appearance: None,
+            button_layout: LAYOUT,
+            accent_color: Some([0.25, 0.5, 1.0]),
+            contrast: Some(1),
+        });
+        assert!(changed.contains(&(
+            (APPEARANCE_NAMESPACE, "accent-color"),
+            Setting::Rgb([0.25, 0.5, 1.0])
+        )));
+        assert_eq!(
+            store.read(APPEARANCE_NAMESPACE, "accent-color"),
+            Some(OwnedValue::try_from(Value::from((0.25, 0.5, 1.0))).unwrap())
+        );
+        assert_eq!(
+            store.read(APPEARANCE_NAMESPACE, "contrast"),
+            Some(OwnedValue::from(1u32))
+        );
+        let all = store.read_all(&[APPEARANCE_NAMESPACE.to_string()]);
+        assert_eq!(all[APPEARANCE_NAMESPACE].len(), 2);
+
+        // Clearing the accent reports it as removed, so its new value gets announced.
+        let (changed, removed) = store.update(&DesktopSettings {
+            appearance: None,
+            button_layout: LAYOUT,
+            accent_color: None,
+            contrast: Some(1),
+        });
+        assert!(changed.is_empty());
+        assert_eq!(removed, vec![(APPEARANCE_NAMESPACE, "accent-color")]);
+        assert_eq!(store.read(APPEARANCE_NAMESPACE, "accent-color"), None);
     }
 
     #[test]
@@ -308,13 +412,15 @@ mod tests {
                 gtk_theme: "Breeze-Dark",
             }),
             button_layout: LAYOUT,
+            accent_color: None,
+            contrast: None,
         };
-        assert_eq!(store.update(&dark).len(), 7);
+        assert_eq!(store.update(&dark).0.len(), 7);
         assert_eq!(
             store.read(APPEARANCE_NAMESPACE, "color-scheme"),
             Some(OwnedValue::from(1u32))
         );
-        assert!(store.update(&dark).is_empty());
+        assert!(store.update(&dark).0.is_empty());
 
         let light = DesktopSettings {
             appearance: Some(Appearance {
@@ -323,8 +429,10 @@ mod tests {
                 gtk_theme: "Breeze",
             }),
             button_layout: LAYOUT,
+            accent_color: None,
+            contrast: None,
         };
-        let changed: Vec<Key> = store.update(&light).into_iter().map(|(k, _)| k).collect();
+        let changed: Vec<Key> = store.update(&light).0.into_iter().map(|(k, _)| k).collect();
         assert_eq!(
             changed,
             vec![

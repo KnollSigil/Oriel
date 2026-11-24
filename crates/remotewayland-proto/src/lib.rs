@@ -449,6 +449,17 @@ pub enum ControlMessage {
     /// titlebar buttons as local ones. `None` means the client's desktop has no
     /// preference, and the server uses its default layout.
     ButtonLayout { layout: Option<String> },
+    /// Client -> Server: XDG `org.freedesktop.appearance` `accent-color` as sRGB components
+    /// in `[0, 1]`. `None` means the client's desktop has no accent preference.
+    AccentColor { rgb: Option<[f64; 3]> },
+    /// Client -> Server: XDG `org.freedesktop.appearance` `contrast`
+    /// (`0` = no preference, `1` = higher contrast).
+    Contrast { contrast: u32 },
+}
+
+/// Whether `rgb` is a valid XDG `accent-color`: three finite components in `[0, 1]`.
+pub fn is_valid_accent_color(rgb: &[f64; 3]) -> bool {
+    rgb.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c))
 }
 
 /// A rectangle inside a frame, in logical pixels relative to the frame's top-left corner.
@@ -908,6 +919,11 @@ mod tests {
             layout: Some("appmenu:minimize,maximize,close".to_string()),
         };
         let no_button_layout = ControlMessage::ButtonLayout { layout: None };
+        let accent = ControlMessage::AccentColor {
+            rgb: Some([0.21, 0.52, 0.89]),
+        };
+        let no_accent = ControlMessage::AccentColor { rgb: None };
+        let contrast = ControlMessage::Contrast { contrast: 1 };
 
         write_control_message(&mut tx, &primary).await.unwrap();
         write_control_message(&mut tx, &cursor).await.unwrap();
@@ -924,6 +940,9 @@ mod tests {
         write_control_message(&mut tx, &no_button_layout)
             .await
             .unwrap();
+        for msg in [&accent, &no_accent, &contrast] {
+            write_control_message(&mut tx, msg).await.unwrap();
+        }
         drop(tx);
 
         assert_eq!(
@@ -962,7 +981,18 @@ mod tests {
             read_control_message(&mut rx).await.unwrap().unwrap(),
             no_button_layout
         );
+        for msg in [accent, no_accent, contrast] {
+            assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), msg);
+        }
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn is_valid_accent_color_requires_unit_range() {
+        assert!(is_valid_accent_color(&[0.0, 0.5, 1.0]));
+        assert!(!is_valid_accent_color(&[-1.0, -1.0, -1.0]));
+        assert!(!is_valid_accent_color(&[0.2, 1.5, 0.2]));
+        assert!(!is_valid_accent_color(&[f64::NAN, 0.2, 0.2]));
     }
 
     #[test]

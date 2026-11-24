@@ -32,6 +32,32 @@ pub struct SessionEnvInfo {
     pub color_scheme: Option<u32>,
     /// Client-synced `org.gnome.desktop.wm.preferences` `button-layout`.
     pub button_layout: Option<String>,
+    /// Client-synced `org.freedesktop.appearance` `accent-color` (`None`: no preference).
+    pub accent_color: Option<[f64; 3]>,
+    /// Client-synced `org.freedesktop.appearance` `contrast`.
+    pub contrast: Option<u32>,
+}
+
+/// The desktop settings a client synced, in the form [`write_desktop_settings`] applies.
+struct SyncedSettings {
+    scheme: Option<u32>,
+    button_layout: String,
+    accent_color: Option<[f64; 3]>,
+    contrast: Option<u32>,
+}
+
+impl SessionEnvInfo {
+    fn synced_settings(&self) -> SyncedSettings {
+        SyncedSettings {
+            scheme: self.color_scheme,
+            button_layout: self
+                .button_layout
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BUTTON_LAYOUT.to_string()),
+            accent_color: self.accent_color,
+            contrast: self.contrast,
+        }
+    }
 }
 
 /// Serializes writers of the isolated portal config files (GSettings keyfile, kdeglobals).
@@ -194,6 +220,8 @@ impl SessionGuard {
             gtk_modules: gtk_modules.clone(),
             color_scheme: None,
             button_layout: None,
+            accent_color: None,
+            contrast: None,
         };
         let _ = SESSION_INFO.set(Mutex::new(info));
 
@@ -572,7 +600,15 @@ fn prepare_portal_config_dir(portal_config_dir: &Path, backend: Option<&PortalBa
     // Seed the titlebar button layout before the portal starts so apps get minimize and
     // maximize even if the client never syncs its own layout. The color scheme and theme
     // stay unset (schema defaults) until the client syncs one.
-    write_desktop_settings(portal_config_dir, None, DEFAULT_BUTTON_LAYOUT);
+    write_desktop_settings(
+        portal_config_dir,
+        &SyncedSettings {
+            scheme: None,
+            button_layout: DEFAULT_BUTTON_LAYOUT.to_string(),
+            accent_color: None,
+            contrast: None,
+        },
+    );
 
     let portal_conf_dir = portal_config_dir.join("xdg-desktop-portal");
     if create_private_dir(&portal_conf_dir).is_ok() {
@@ -878,7 +914,13 @@ const DEFAULT_BUTTON_LAYOUT: &str = "appmenu:minimize,maximize,close";
 ///   backend, since xdg-desktop-portal forwards both backends' change signals;
 /// - `gtk-3.0`/`gtk-4.0` `settings.ini` (the dir is on apps' `XDG_CONFIG_DIRS`) for GTK
 ///   apps that read settings directly instead of through the portal.
-fn write_desktop_settings(portal_config_dir: &Path, scheme: Option<u32>, button_layout: &str) {
+fn write_desktop_settings(portal_config_dir: &Path, synced: &SyncedSettings) {
+    let SyncedSettings {
+        scheme,
+        ref button_layout,
+        accent_color,
+        contrast,
+    } = *synced;
     let has_breeze_gtk = find_xdg_data_path("themes/Breeze-Dark").is_some();
     crate::settings_portal::update(&crate::settings_portal::DesktopSettings {
         appearance: scheme.map(|scheme| {
@@ -890,6 +932,8 @@ fn write_desktop_settings(portal_config_dir: &Path, scheme: Option<u32>, button_
             }
         }),
         button_layout,
+        accent_color,
+        contrast,
     });
     let glib_dir = portal_config_dir.join("glib-2.0/settings");
     if create_private_dir(&glib_dir).is_ok() {
@@ -1001,6 +1045,26 @@ fn update_kdeglobals_color_scheme(existing: &str, scheme: u32) -> String {
 const KGLOBAL_PALETTE_CHANGED: &str = "0";
 const KGLOBAL_SETTINGS_CHANGED: &str = "4";
 
+/// Record a client-synced setting with `update`, then write every isolated settings target
+/// (see [`write_desktop_settings`]) from the full synced state. Returns the portal config
+/// dir, whether the session has a D-Bus, and the synced state.
+fn update_synced_settings(
+    update: impl FnOnce(&mut SessionEnvInfo),
+) -> Option<(PathBuf, bool, SyncedSettings)> {
+    let (portal_config_dir, has_dbus, synced) = {
+        let lock = SESSION_INFO.get()?;
+        let mut info = lock.lock().ok()?;
+        update(&mut info);
+        (
+            info.portal_config_dir.clone(),
+            info.dbus_address.is_some(),
+            info.synced_settings(),
+        )
+    };
+    write_desktop_settings(&portal_config_dir, &synced);
+    Some((portal_config_dir, has_dbus, synced))
+}
+
 /// Apply the client-synced `org.freedesktop.appearance` `color-scheme`
 /// (`0` = no preference, `1` = prefer dark, `2` = prefer light) to the isolated
 /// portal configuration and notify the isolated portal backend live.
@@ -1011,85 +1075,94 @@ pub fn apply_color_scheme(scheme: u32) {
     }
     let _apply_guard = PORTAL_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let (portal_config_dir, has_dbus, button_layout) = {
-        let Some(lock) = SESSION_INFO.get() else {
-            return;
-        };
-        let Ok(mut info) = lock.lock() else {
-            return;
-        };
-        info.color_scheme = Some(scheme);
-        (
-            info.portal_config_dir.clone(),
-            info.dbus_address.is_some(),
-            info.button_layout.clone(),
-        )
-    };
-
-    // Serve `color-scheme` and `gtk-theme` from our settings portal backend (live over
+    // Serves `color-scheme` and `gtk-theme` from our settings portal backend (live over
     // org.freedesktop.portal.Settings) and the GSettings keyfile for xdg-desktop-portal-gtk.
-    write_desktop_settings(
-        &portal_config_dir,
-        Some(scheme),
-        button_layout.as_deref().unwrap_or(DEFAULT_BUTTON_LAYOUT),
-    );
-
-    // Update isolated kdeglobals atomically for xdg-desktop-portal-kde and Qt/KDE apps.
-    let kdeglobals_path = portal_config_dir.join("kdeglobals");
-    let updated_kdeglobals = if scheme == 0 {
-        let orig = portal_config_dir.join("kdeglobals.orig");
-        fs::read_to_string(&orig).ok().or_else(|| {
-            find_xdg_data_path("color-schemes/BreezeLight.colors")
-                .and_then(|p| fs::read_to_string(p).ok())
-        })
-    } else {
-        let rel = if scheme == 1 {
-            "color-schemes/BreezeDark.colors"
-        } else {
-            "color-schemes/BreezeLight.colors"
-        };
-        let base = find_xdg_data_path(rel)
-            .and_then(|p| fs::read_to_string(p).ok())
-            .or_else(|| fs::read_to_string(&kdeglobals_path).ok())
-            .unwrap_or_default();
-        Some(update_kdeglobals_color_scheme(&base, scheme))
+    let Some((portal_config_dir, has_dbus, synced)) =
+        update_synced_settings(|info| info.color_scheme = Some(scheme))
+    else {
+        return;
     };
-    if let Some(updated) = updated_kdeglobals {
-        if let Err(err) = write_file_atomic(&kdeglobals_path, updated.as_bytes()) {
-            warn!(error = %err, "failed to update isolated kdeglobals");
-        }
-    }
 
-    // Notify KDE portal backend and Qt/KDE apps over the private D-Bus.
+    // Update isolated kdeglobals for xdg-desktop-portal-kde and Qt/KDE apps. Notify them
+    // even if the file is unchanged (a color scheme switch back to the same palette).
+    rewrite_kdeglobals(&portal_config_dir, &synced);
     if has_dbus {
-        for change_type in [KGLOBAL_PALETTE_CHANGED, KGLOBAL_SETTINGS_CHANGED] {
-            let mut cmd = Command::new("gdbus");
-            apply_session_env(&mut cmd, None);
-            let res = cmd
-                .args([
-                    "emit",
-                    "--session",
-                    "--object-path",
-                    "/KGlobalSettings",
-                    "--signal",
-                    "org.kde.KGlobalSettings.notifyChange",
-                    change_type,
-                    "0",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if let Err(err) = res {
-                warn!(error = %err, change_type, "failed to emit KGlobalSettings.notifyChange");
-            }
-        }
+        notify_kde_settings_changed();
     }
 
     info!(
         scheme,
         "applied synced client color-scheme to isolated portal"
     );
+}
+
+/// Apply the client-synced `org.freedesktop.appearance` `accent-color` (`None` = no
+/// preference: the server's own accent stands) to our settings portal backend and the
+/// isolated `kdeglobals`, which xdg-desktop-portal-kde and Qt/KDE apps read.
+pub fn apply_accent_color(rgb: Option<[f64; 3]>) {
+    if rgb.is_some_and(|rgb| !remotewayland_proto::is_valid_accent_color(&rgb)) {
+        warn!(?rgb, "ignoring invalid client accent-color value");
+        return;
+    }
+    let _apply_guard = PORTAL_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((portal_config_dir, has_dbus, synced)) =
+        update_synced_settings(|info| info.accent_color = rgb)
+    else {
+        return;
+    };
+    // Mirror the accent into kdeglobals: the KDE backend re-announces its accent (the
+    // palette highlight) on every KGlobalSettings change, and xdg-desktop-portal forwards
+    // that to apps unfiltered, so it must report the same accent as ours.
+    if rewrite_kdeglobals(&portal_config_dir, &synced) && has_dbus {
+        notify_kde_settings_changed();
+    }
+    info!(
+        ?rgb,
+        "applied synced client accent-color to isolated portal"
+    );
+}
+
+/// Apply the client-synced `org.freedesktop.appearance` `contrast` (`0` = no preference,
+/// `1` = higher contrast) to our settings portal backend.
+pub fn apply_contrast(contrast: u32) {
+    if contrast > 1 {
+        warn!(contrast, "ignoring invalid client contrast value");
+        return;
+    }
+    let _apply_guard = PORTAL_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if update_synced_settings(|info| info.contrast = Some(contrast)).is_some() {
+        info!(
+            contrast,
+            "applied synced client contrast to isolated portal"
+        );
+    }
+}
+
+/// Tell the KDE portal backend and Qt/KDE apps on the isolated D-Bus that `kdeglobals`
+/// (palette and general settings) changed.
+fn notify_kde_settings_changed() {
+    for change_type in [KGLOBAL_PALETTE_CHANGED, KGLOBAL_SETTINGS_CHANGED] {
+        let mut cmd = Command::new("gdbus");
+        apply_session_env(&mut cmd, None);
+        let res = cmd
+            .args([
+                "emit",
+                "--session",
+                "--object-path",
+                "/KGlobalSettings",
+                "--signal",
+                "org.kde.KGlobalSettings.notifyChange",
+                change_type,
+                "0",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Err(err) = res {
+            warn!(error = %err, change_type, "failed to emit KGlobalSettings.notifyChange");
+        }
+    }
 }
 
 /// Apply the client-synced titlebar `button-layout` (`None` = the client has no preference,
@@ -1103,25 +1176,108 @@ pub fn apply_button_layout(layout: Option<&str>) {
         }
     }
     let _apply_guard = PORTAL_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if update_synced_settings(|info| info.button_layout = layout.map(str::to_string)).is_some() {
+        info!(
+            layout = layout.unwrap_or(DEFAULT_BUTTON_LAYOUT),
+            from_client = layout.is_some(),
+            "applied titlebar button-layout to isolated portal"
+        );
+    }
+}
 
-    let (portal_config_dir, scheme) = {
-        let Some(lock) = SESSION_INFO.get() else {
-            return;
-        };
-        let Ok(mut info) = lock.lock() else {
-            return;
-        };
-        info.button_layout = layout.map(str::to_string);
-        (info.portal_config_dir.clone(), info.color_scheme)
+/// Rebuild the isolated `kdeglobals` from the synced color scheme and accent: the color
+/// scheme's palette (or the host's own `kdeglobals` without a color scheme preference),
+/// with the accent as the selection color. Returns whether the file changed.
+fn rewrite_kdeglobals(portal_config_dir: &Path, synced: &SyncedSettings) -> bool {
+    let kdeglobals_path = portal_config_dir.join("kdeglobals");
+    let existing = fs::read_to_string(&kdeglobals_path).ok();
+    let host = || fs::read_to_string(portal_config_dir.join("kdeglobals.orig")).ok();
+    let base = match synced.scheme {
+        None => host().or_else(|| existing.clone()),
+        Some(0) => host().or_else(|| {
+            find_xdg_data_path("color-schemes/BreezeLight.colors")
+                .and_then(|p| fs::read_to_string(p).ok())
+        }),
+        Some(scheme) => {
+            let rel = if scheme == 1 {
+                "color-schemes/BreezeDark.colors"
+            } else {
+                "color-schemes/BreezeLight.colors"
+            };
+            let base = find_xdg_data_path(rel)
+                .and_then(|p| fs::read_to_string(p).ok())
+                .or_else(|| existing.clone())
+                .unwrap_or_default();
+            Some(update_kdeglobals_color_scheme(&base, scheme))
+        }
     };
+    let Some(mut updated) = base else {
+        return false;
+    };
+    if let Some(rgb) = synced.accent_color {
+        updated = set_kdeglobals_accent(&updated, rgb);
+    }
+    if existing.as_deref() == Some(updated.as_str()) {
+        return false;
+    }
+    if let Err(err) = write_file_atomic(&kdeglobals_path, updated.as_bytes()) {
+        warn!(error = %err, "failed to update isolated kdeglobals");
+        return false;
+    }
+    true
+}
 
-    let effective = layout.unwrap_or(DEFAULT_BUTTON_LAYOUT);
-    write_desktop_settings(&portal_config_dir, scheme, effective);
-    info!(
-        layout = effective,
-        from_client = layout.is_some(),
-        "applied titlebar button-layout to isolated portal"
-    );
+/// Apply an accent color to a `kdeglobals` buffer the way KDE does: as the selection
+/// background (the palette highlight, which xdg-desktop-portal-kde reports as
+/// `accent-color`), plus `[General]` `AccentColor`.
+fn set_kdeglobals_accent(existing: &str, rgb: [f64; 3]) -> String {
+    let [r, g, b] = rgb.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let value = format!("{r},{g},{b}");
+    let out = set_ini_value(existing, "Colors:Selection", "BackgroundNormal", &value);
+    set_ini_value(&out, "General", "AccentColor", &value)
+}
+
+/// Set `key=value` in `[section]` of an INI buffer, replacing an existing entry or adding
+/// it (and the section) if missing.
+fn set_ini_value(existing: &str, section: &str, key: &str, value: &str) -> String {
+    let header = format!("[{section}]");
+    let prefix = format!("{key}=");
+    let entry = format!("{key}={value}");
+    let mut out = String::with_capacity(existing.len() + entry.len() + header.len() + 4);
+    let mut in_section = false;
+    let mut written = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_section && !written {
+                out.push_str(&entry);
+                out.push('\n');
+                written = true;
+            }
+            in_section = trimmed == header;
+        } else if in_section && trimmed.starts_with(&prefix) {
+            if !written {
+                out.push_str(&entry);
+                out.push('\n');
+                written = true;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !written {
+        if !in_section {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str(&header);
+            out.push('\n');
+        }
+        out.push_str(&entry);
+        out.push('\n');
+    }
+    out
 }
 
 /// Return the isolated session runtime directory if initialized.
@@ -1507,6 +1663,56 @@ mod tests {
             .as_deref(),
             Some("window-decorations-gtk-module:colorreload-gtk-module")
         );
+    }
+
+    #[test]
+    fn set_ini_value_replaces_or_adds_entry() {
+        assert_eq!(
+            set_ini_value(
+                "[General]\nAccentColor=1,2,3\nFont=x\n[KDE]\nA=1\n",
+                "General",
+                "AccentColor",
+                "9"
+            ),
+            "[General]\nAccentColor=9\nFont=x\n[KDE]\nA=1\n"
+        );
+        assert_eq!(
+            set_ini_value(
+                "[General]\nFont=x\n\n[KDE]\nA=1\n",
+                "General",
+                "AccentColor",
+                "9"
+            ),
+            "[General]\nFont=x\n\nAccentColor=9\n[KDE]\nA=1\n"
+        );
+        assert_eq!(
+            set_ini_value("[KDE]\nA=1\n", "General", "AccentColor", "9"),
+            "[KDE]\nA=1\n\n[General]\nAccentColor=9\n"
+        );
+        assert_eq!(
+            set_ini_value("", "General", "AccentColor", "9"),
+            "[General]\nAccentColor=9\n"
+        );
+        // Keys of the same name in other sections are left alone.
+        assert_eq!(
+            set_ini_value(
+                "[Colors:View]\nBackgroundNormal=1\n",
+                "Colors:Selection",
+                "BackgroundNormal",
+                "2"
+            ),
+            "[Colors:View]\nBackgroundNormal=1\n\n[Colors:Selection]\nBackgroundNormal=2\n"
+        );
+    }
+
+    #[test]
+    fn set_kdeglobals_accent_sets_selection_and_accent() {
+        let out = set_kdeglobals_accent(
+            "[Colors:Selection]\nBackgroundNormal=61,174,233\n",
+            [0.2, 0.4, 1.0],
+        );
+        assert!(out.contains("[Colors:Selection]\nBackgroundNormal=51,102,255\n"));
+        assert!(out.contains("[General]\nAccentColor=51,102,255\n"));
     }
 
     #[test]

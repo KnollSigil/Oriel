@@ -10,10 +10,10 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use quinn::{ClientConfig, ConnectionError, Endpoint, TransportConfig, VarInt};
 use remotewayland_proto::{
-    is_valid_button_layout, read_audio_packet, read_control_message, read_stream_header,
-    read_video_frame, write_audio_packet, write_control_message, write_protocol_preamble,
-    write_stream_header, AudioPacketHeader, ClientRole, ControlMessage, LaunchState,
-    RemoteAppEntry, StreamHeader, VideoCodec, WindowId, CLOSE_CODE_PROTOCOL_MISMATCH,
+    is_valid_accent_color, is_valid_button_layout, read_audio_packet, read_control_message,
+    read_stream_header, read_video_frame, write_audio_packet, write_control_message,
+    write_protocol_preamble, write_stream_header, AudioPacketHeader, ClientRole, ControlMessage,
+    LaunchState, RemoteAppEntry, StreamHeader, VideoCodec, WindowId, CLOSE_CODE_PROTOCOL_MISMATCH,
     CLOSE_CODE_SUPERSEDED,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -845,6 +845,36 @@ fn parse_gdbus_color_scheme(text: &str) -> Option<u32> {
     None
 }
 
+/// Parse an XDG `org.freedesktop.appearance` `contrast` (`uint32 0|1`) from `gdbus call`
+/// output.
+fn parse_gdbus_contrast(text: &str) -> Option<u32> {
+    let idx = text.find("uint32 ")?;
+    let digits: String = text[idx + "uint32 ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok().filter(|v| *v <= 1)
+}
+
+/// Parse an XDG `org.freedesktop.appearance` `accent-color` (`(ddd)`) from `gdbus call`
+/// output such as `(<<(0.2, 0.4, 1.0)>>,)`. Returns `Some(None)` for a parsed but
+/// out-of-range triple, which the spec defines as "no accent".
+fn parse_gdbus_accent_color(text: &str) -> Option<Option<[f64; 3]>> {
+    let start = text.match_indices('(').map(|(i, _)| i + 1).find(|&i| {
+        text[i..]
+            .trim_start()
+            .starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '.')
+    })?;
+    let end = start + text[start..].find(')')?;
+    let parts: Vec<f64> = text[start..end]
+        .split(',')
+        .map(|p| p.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let rgb: [f64; 3] = parts.try_into().ok()?;
+    Some(is_valid_accent_color(&rgb).then_some(rgb))
+}
+
 fn find_on_path(binary: &str) -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
@@ -919,6 +949,18 @@ async fn query_local_color_scheme() -> Option<u32> {
     parse_gdbus_color_scheme(&stdout)
 }
 
+/// Read the local accent color. Returns `None` if it could not be read (including a
+/// portal with no accent at all), and `Some(None)` for an explicitly unset accent.
+async fn query_local_accent_color() -> Option<Option<[f64; 3]>> {
+    let stdout = read_portal_setting("org.freedesktop.appearance", "accent-color").await?;
+    parse_gdbus_accent_color(&stdout)
+}
+
+async fn query_local_contrast() -> Option<u32> {
+    let stdout = read_portal_setting("org.freedesktop.appearance", "contrast").await?;
+    parse_gdbus_contrast(&stdout)
+}
+
 /// Read the local titlebar button layout from the settings portal, else straight from
 /// GSettings. Returns `None` if neither could be read, and `Some(None)` when the desktop
 /// has no real preference (see [`effective_button_layout`]).
@@ -942,12 +984,46 @@ async fn query_local_button_layout() -> Option<Option<String>> {
     ))
 }
 
+/// Which synced desktop settings to (re-)query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SettingsMask {
+    scheme: bool,
+    button_layout: bool,
+    accent_color: bool,
+    contrast: bool,
+}
+
+impl SettingsMask {
+    const ALL: Self = Self {
+        scheme: true,
+        button_layout: true,
+        accent_color: true,
+        contrast: true,
+    };
+
+    fn any(self) -> bool {
+        self.scheme || self.button_layout || self.accent_color || self.contrast
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            scheme: self.scheme || other.scheme,
+            button_layout: self.button_layout || other.button_layout,
+            accent_color: self.accent_color || other.accent_color,
+            contrast: self.contrast || other.contrast,
+        }
+    }
+}
+
 /// Tracks the last desktop settings sent to the server and sends only changes.
 #[derive(Default)]
 struct DesktopSettingsSync {
     scheme: Option<u32>,
     /// Last layout sent: `None` until the first send, `Some(None)` for "no preference".
     button_layout: Option<Option<String>>,
+    /// Last accent sent: `None` until the first send, `Some(None)` for "no accent".
+    accent_color: Option<Option<[f64; 3]>>,
+    contrast: Option<u32>,
 }
 
 impl DesktopSettingsSync {
@@ -979,28 +1055,66 @@ impl DesktopSettingsSync {
         tx.send(ControlMessage::ButtonLayout { layout }).is_ok()
     }
 
-    /// Re-query the requested settings (concurrently) and send those that changed.
-    /// On the `initial` sync an unreadable button layout counts as "no preference", so
-    /// the server drops any layout a previous client synced. Returns `false` once the
-    /// receiver is gone.
+    /// Send `rgb` (`None` = no accent) if it changed. Returns `false` once the receiver
+    /// is gone.
+    fn send_accent_color(
+        &mut self,
+        tx: &mpsc::UnboundedSender<ControlMessage>,
+        rgb: Option<[f64; 3]>,
+    ) -> bool {
+        if self.accent_color == Some(rgb) {
+            return true;
+        }
+        info!(?rgb, "syncing local accent-color to server");
+        self.accent_color = Some(rgb);
+        tx.send(ControlMessage::AccentColor { rgb }).is_ok()
+    }
+
+    /// Send `contrast` if it changed. Returns `false` once the receiver is gone.
+    fn send_contrast(&mut self, tx: &mpsc::UnboundedSender<ControlMessage>, contrast: u32) -> bool {
+        if self.contrast == Some(contrast) {
+            return true;
+        }
+        info!(contrast, "syncing local contrast to server");
+        self.contrast = Some(contrast);
+        tx.send(ControlMessage::Contrast { contrast }).is_ok()
+    }
+
+    /// Re-query the settings in `mask` (concurrently) and send those that changed.
+    /// On the `initial` sync an unreadable button layout, accent or contrast counts as
+    /// "no preference", so the server drops any value a previous client synced. Returns
+    /// `false` once the receiver is gone.
     async fn sync(
         &mut self,
         tx: &mpsc::UnboundedSender<ControlMessage>,
-        scheme: bool,
-        button_layout: bool,
+        mask: SettingsMask,
         initial: bool,
     ) -> bool {
-        let (new_scheme, new_layout) = tokio::join!(
+        let (new_scheme, new_layout, new_accent, new_contrast) = tokio::join!(
             async {
-                if scheme {
+                if mask.scheme {
                     query_local_color_scheme().await
                 } else {
                     None
                 }
             },
             async {
-                if button_layout {
+                if mask.button_layout {
                     query_local_button_layout().await
+                } else {
+                    None
+                }
+            },
+            async {
+                if mask.accent_color {
+                    query_local_accent_color().await
+                } else {
+                    None
+                }
+            },
+            async {
+                if mask.contrast {
+                    query_local_contrast().await
                 } else {
                     None
                 }
@@ -1011,7 +1125,7 @@ impl DesktopSettingsSync {
                 return false;
             }
         }
-        let new_layout = if initial && button_layout {
+        let new_layout = if initial && mask.button_layout {
             Some(new_layout.flatten())
         } else {
             new_layout
@@ -1021,21 +1135,48 @@ impl DesktopSettingsSync {
                 return false;
             }
         }
+        let new_accent = if initial && mask.accent_color {
+            Some(new_accent.flatten())
+        } else {
+            new_accent
+        };
+        if let Some(rgb) = new_accent {
+            if !self.send_accent_color(tx, rgb) {
+                return false;
+            }
+        }
+        let new_contrast = if initial && mask.contrast {
+            Some(new_contrast.unwrap_or(0))
+        } else {
+            new_contrast
+        };
+        if let Some(contrast) = new_contrast {
+            if !self.send_contrast(tx, contrast) {
+                return false;
+            }
+        }
         true
     }
 }
 
-/// Which settings a line of `dbus-monitor` / `gdbus monitor` output says changed,
-/// as `(color_scheme, button_layout)`.
-fn monitor_line_triggers(line: &str, using_dbus_monitor: bool) -> (bool, bool) {
-    let layout = line.contains("button-layout");
-    let scheme = if using_dbus_monitor {
-        // dbus-monitor prints signal arguments on separate lines.
-        line.contains("member=notifyChange") || line.contains("color-scheme")
-    } else {
-        line.contains("org.freedesktop.appearance") && line.contains("color-scheme")
+/// Which settings a line of `dbus-monitor` / `gdbus monitor` output says changed.
+fn monitor_line_triggers(line: &str, using_dbus_monitor: bool) -> SettingsMask {
+    let appearance = |key: &str| {
+        if using_dbus_monitor {
+            // dbus-monitor prints signal arguments on separate lines.
+            line.contains(key)
+        } else {
+            line.contains("org.freedesktop.appearance") && line.contains(key)
+        }
     };
-    (scheme, layout)
+    // A KDE palette change can switch both the color scheme and the accent.
+    let kde_palette = using_dbus_monitor && line.contains("member=notifyChange");
+    SettingsMask {
+        scheme: kde_palette || appearance("color-scheme"),
+        button_layout: line.contains("button-layout"),
+        accent_color: kde_palette || appearance("accent-color"),
+        contrast: appearance("'contrast'") || appearance("\"contrast\""),
+    }
 }
 
 fn spawn_settings_monitor() -> Option<(tokio::process::Child, bool)> {
@@ -1107,7 +1248,7 @@ async fn watch_local_desktop_settings(tx: mpsc::UnboundedSender<ControlMessage>)
 
     // 2. Query and send the initial settings.
     let mut synced = DesktopSettingsSync::default();
-    if !synced.sync(&tx, true, true, true).await {
+    if !synced.sync(&tx, SettingsMask::ALL, true).await {
         return;
     }
 
@@ -1121,8 +1262,7 @@ async fn watch_local_desktop_settings(tx: mpsc::UnboundedSender<ControlMessage>)
 
     // Trailing-edge debounce: wait 80ms after the last trigger line so KDE/portal
     // finishes updating its cached settings before we re-query.
-    let mut pending_scheme = false;
-    let mut pending_layout = false;
+    let mut pending = SettingsMask::default();
     let debounce = tokio::time::sleep(Duration::from_secs(3600));
     tokio::pin!(debounce);
 
@@ -1131,10 +1271,9 @@ async fn watch_local_desktop_settings(tx: mpsc::UnboundedSender<ControlMessage>)
             line_res = lines.next_line() => {
                 match line_res {
                     Ok(Some(line)) => {
-                        let (scheme, layout) = monitor_line_triggers(&line, using_dbus_monitor);
-                        if scheme || layout {
-                            pending_scheme |= scheme;
-                            pending_layout |= layout;
+                        let triggered = monitor_line_triggers(&line, using_dbus_monitor);
+                        if triggered.any() {
+                            pending = pending.union(triggered);
                             debounce
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + Duration::from_millis(80));
@@ -1150,11 +1289,9 @@ async fn watch_local_desktop_settings(tx: mpsc::UnboundedSender<ControlMessage>)
                     }
                 }
             }
-            () = &mut debounce, if pending_scheme || pending_layout => {
-                let (scheme, layout) = (pending_scheme, pending_layout);
-                pending_scheme = false;
-                pending_layout = false;
-                if !synced.sync(&tx, scheme, layout, false).await {
+            () = &mut debounce, if pending.any() => {
+                let mask = std::mem::take(&mut pending);
+                if !synced.sync(&tx, mask, false).await {
                     break;
                 }
             }
@@ -1220,25 +1357,39 @@ mod tests {
 
     #[test]
     fn monitor_line_triggers_only_the_changed_setting() {
+        let mask = |scheme, button_layout, accent_color, contrast| SettingsMask {
+            scheme,
+            button_layout,
+            accent_color,
+            contrast,
+        };
         // dbus-monitor: arguments arrive on their own lines.
         assert_eq!(
             monitor_line_triggers("   string \"color-scheme\"", true),
-            (true, false)
+            mask(true, false, false, false)
         );
         assert_eq!(
             monitor_line_triggers("   string \"button-layout\"", true),
-            (false, true)
+            mask(false, true, false, false)
+        );
+        assert_eq!(
+            monitor_line_triggers("   string \"accent-color\"", true),
+            mask(false, false, true, false)
+        );
+        assert_eq!(
+            monitor_line_triggers("   string \"contrast\"", true),
+            mask(false, false, false, true)
         );
         assert_eq!(
             monitor_line_triggers(
                 "signal time=1 sender=:1.5 -> destination=(null destination) path=/KGlobalSettings; interface=org.kde.KGlobalSettings; member=notifyChange",
                 true
             ),
-            (true, false)
+            mask(true, false, true, false)
         );
         assert_eq!(
             monitor_line_triggers("   string \"gtk-theme\"", true),
-            (false, false)
+            SettingsMask::default()
         );
         // gdbus monitor: one line per signal.
         assert_eq!(
@@ -1246,14 +1397,50 @@ mod tests {
                 "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged ('org.gnome.desktop.wm.preferences', 'button-layout', <'close:'>)",
                 false
             ),
-            (false, true)
+            mask(false, true, false, false)
         );
         assert_eq!(
             monitor_line_triggers(
                 "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged ('org.freedesktop.appearance', 'color-scheme', <uint32 1>)",
                 false
             ),
-            (true, false)
+            mask(true, false, false, false)
         );
+        assert_eq!(
+            monitor_line_triggers(
+                "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged ('org.freedesktop.appearance', 'accent-color', <(0.2, 0.4, 1.0)>)",
+                false
+            ),
+            mask(false, false, true, false)
+        );
+        assert_eq!(
+            monitor_line_triggers(
+                "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged ('org.freedesktop.appearance', 'contrast', <uint32 1>)",
+                false
+            ),
+            mask(false, false, false, true)
+        );
+    }
+
+    #[test]
+    fn parses_gdbus_accent_color_and_contrast() {
+        assert_eq!(
+            parse_gdbus_accent_color("(<<(0.25, 0.5, 1.0)>>,)"),
+            Some(Some([0.25, 0.5, 1.0]))
+        );
+        assert_eq!(
+            parse_gdbus_accent_color("(<(0.2078431, 0.5176471, 0.8941177)>,)"),
+            Some(Some([0.2078431, 0.5176471, 0.8941177]))
+        );
+        // Out-of-range components mean "no accent".
+        assert_eq!(
+            parse_gdbus_accent_color("(<<(-1.0, -1.0, -1.0)>>,)"),
+            Some(None)
+        );
+        assert_eq!(parse_gdbus_accent_color("(<<uint32 1>>,)"), None);
+        assert_eq!(parse_gdbus_accent_color("unrelated"), None);
+        assert_eq!(parse_gdbus_contrast("(<<uint32 1>>,)"), Some(1));
+        assert_eq!(parse_gdbus_contrast("(<<uint32 0>>,)"), Some(0));
+        assert_eq!(parse_gdbus_contrast("(<<uint32 7>>,)"), None);
     }
 }

@@ -636,34 +636,14 @@ async fn run_display_session(
         (None, None)
     };
 
-    // Serialize and coalesce client ColorScheme updates onto a single worker so bursts
-    // cannot spawn unbounded blocking tasks or race on isolated portal config files.
-    let (color_scheme_tx, mut color_scheme_rx) = tokio::sync::watch::channel::<Option<u32>>(None);
-    tokio::spawn(async move {
-        while color_scheme_rx.changed().await.is_ok() {
-            let scheme_opt = *color_scheme_rx.borrow_and_update();
-            if let Some(scheme) = scheme_opt {
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::session::apply_color_scheme(scheme);
-                })
-                .await;
-            }
-        }
+    // Serialize and coalesce each client-synced desktop setting onto its own worker so
+    // bursts cannot spawn unbounded blocking tasks or race on isolated portal config files.
+    let color_scheme_tx = spawn_latest_applier(crate::session::apply_color_scheme);
+    let button_layout_tx = spawn_latest_applier(|layout: Option<String>| {
+        crate::session::apply_button_layout(layout.as_deref())
     });
-    // Same for ButtonLayout updates.
-    let (button_layout_tx, mut button_layout_rx) =
-        tokio::sync::watch::channel::<Option<Option<String>>>(None);
-    tokio::spawn(async move {
-        while button_layout_rx.changed().await.is_ok() {
-            let layout_opt = button_layout_rx.borrow_and_update().clone();
-            if let Some(layout) = layout_opt {
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::session::apply_button_layout(layout.as_deref());
-                })
-                .await;
-            }
-        }
-    });
+    let accent_color_tx = spawn_latest_applier(crate::session::apply_accent_color);
+    let contrast_tx = spawn_latest_applier(crate::session::apply_contrast);
 
     // Dedicated control-stream reader task: `read_control_message` performs multiple
     // `read_exact` calls and is NOT cancel-safe inside `tokio::select!`. Running it in its
@@ -836,6 +816,12 @@ async fn run_display_session(
                     Some(ControlMessage::ButtonLayout { layout }) => {
                         let _ = button_layout_tx.send(Some(layout));
                     }
+                    Some(ControlMessage::AccentColor { rgb }) => {
+                        let _ = accent_color_tx.send(Some(rgb));
+                    }
+                    Some(ControlMessage::Contrast { contrast }) => {
+                        let _ = contrast_tx.send(Some(contrast));
+                    }
                     Some(ControlMessage::FrameAck { window_id, pts_ns }) => {
                         fwd.ack_frame(window_id, pts_ns);
                     }
@@ -868,6 +854,25 @@ async fn run_display_session(
         return Ok(());
     }
     loop_res
+}
+
+/// Run `apply` on a blocking worker for the latest value sent on the returned channel,
+/// skipping values superseded while a previous one was being applied.
+fn spawn_latest_applier<T>(apply: impl Fn(T) + Clone + Send + 'static) -> watch::Sender<Option<T>>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let (tx, mut rx) = watch::channel::<Option<T>>(None);
+    tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let Some(value) = rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let apply = apply.clone();
+            let _ = tokio::task::spawn_blocking(move || apply(value)).await;
+        }
+    });
+    tx
 }
 
 struct PopupEncoderState {
