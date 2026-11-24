@@ -44,7 +44,7 @@ cargo test -p remotewayland-proto
 
 ### Cross-compiling for `aarch64-unknown-linux-gnu`
 
-Using `podman` (or `docker`) with `qemu-aarch64-static` via [`scripts/build-aarch64.sh`](scripts/build-aarch64.sh):
+Using the Rust/GCC aarch64 cross toolchain in a `podman` (or `docker`) container via [`scripts/build-aarch64.sh`](scripts/build-aarch64.sh); no `qemu` emulation is needed:
 
 ```bash
 # Build workspace with GTK4/libadwaita launcher (default)
@@ -54,7 +54,7 @@ Using `podman` (or `docker`) with `qemu-aarch64-static` via [`scripts/build-aarc
 ./scripts/build-aarch64.sh --no-gui --client-only
 ```
 
-Builds run in an Ubuntu 24.04 arm64 container; outputs are written to `target/aarch64-unknown-linux-gnu/release/`.
+Builds run natively in an x86_64 Ubuntu 24.04 container that uses arm64 multiarch `-dev` packages as the target sysroot; outputs are written to `target/aarch64-unknown-linux-gnu/release/`.
 
 ### Flatpak
 

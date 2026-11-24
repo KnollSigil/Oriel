@@ -12,7 +12,8 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-aarch64.sh [OPTIONS]
 
-Build RemoteWayland for aarch64-unknown-linux-gnu inside an arm64 Ubuntu 24.04 container.
+Cross-compile RemoteWayland for aarch64-unknown-linux-gnu with the Rust/GCC aarch64
+cross toolchain inside a native (x86_64) Ubuntu 24.04 container. No qemu emulation.
 
 Options:
   --gtk4             Build client with GTK4/libadwaita launcher (default)
@@ -20,7 +21,7 @@ Options:
   --client-only      Build only remotewayland-client
   --server-only      Build only remotewayland-server
   --debug            Build debug profile instead of release
-  --rebuild-image    Rebuild the selected arm64 builder container image
+  --rebuild-image    Rebuild the cross-compilation builder container image
   -h, --help         Show this help message
 EOF
 }
@@ -38,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IMAGE_NAME="localhost/remotewayland-aarch64-builder:latest"
+IMAGE_NAME="localhost/remotewayland-aarch64-cross-builder:latest"
 CONTAINERFILE="${REPO_ROOT}/scripts/Containerfile.aarch64"
 TARGET_DIR="${REPO_ROOT}/target"
 
@@ -62,7 +63,7 @@ fi
 
 if [[ "${REBUILD_IMAGE}" -eq 1 ]] || [[ -z "${IMAGE_HASH}" ]]; then
     echo "==> Building container image ${IMAGE_NAME}..."
-    "${RUNTIME[@]}" build --arch arm64 --label "containerfile-sha256=${CONTAINERFILE_HASH}" \
+    "${RUNTIME[@]}" build --arch amd64 --label "containerfile-sha256=${CONTAINERFILE_HASH}" \
         -t "${IMAGE_NAME}" -f "${CONTAINERFILE}" "${REPO_ROOT}/scripts"
 fi
 
@@ -89,7 +90,7 @@ CONTAINER_TARGET_DIR="/work/${TARGET_DIR#${REPO_ROOT}/}"
 CONTAINER_BUILD_DIR="${CONTAINER_TARGET_DIR}/aarch64-builder"
 
 run_cargo() {
-    "${RUNTIME[@]}" run --rm --arch arm64 \
+    "${RUNTIME[@]}" run --rm --arch amd64 \
         -v "${REPO_ROOT}:/work" \
         "${CARGO_MOUNT[@]}" \
         -w /work \

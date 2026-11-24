@@ -1,6 +1,21 @@
-FROM --platform=linux/arm64 docker.io/library/ubuntu:24.04
+# Cross-compilation image: runs natively on the x86_64 host and builds for
+# aarch64-unknown-linux-gnu with the aarch64 GNU cross toolchain plus arm64
+# multiarch -dev packages as the target sysroot. No qemu emulation involved.
+FROM --platform=linux/amd64 docker.io/library/ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+# The default archive only carries amd64/i386; arm64 lives on ports.ubuntu.com.
+RUN sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' \
+        'Types: deb' \
+        'URIs: http://ports.ubuntu.com/ubuntu-ports/' \
+        'Suites: noble noble-updates noble-security' \
+        'Components: main universe' \
+        'Architectures: arm64' \
+        'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+        > /etc/apt/sources.list.d/ubuntu-ports.sources \
+    && dpkg --add-architecture arm64
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -10,13 +25,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     clang \
     libclang-dev \
-    libwayland-dev \
-    libxkbcommon-dev \
-    libpipewire-0.3-dev \
-    libopus-dev \
-    libgtk-4-dev \
-    libadwaita-1-dev \
+    gcc-aarch64-linux-gnu \
+    g++-aarch64-linux-gnu \
+    libc6-dev-arm64-cross \
+    libwayland-dev:arm64 \
+    libxkbcommon-dev:arm64 \
+    libpipewire-0.3-dev:arm64 \
+    libopus-dev:arm64 \
+    libgtk-4-dev:arm64 \
+    libadwaita-1-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+        --default-toolchain stable --target aarch64-unknown-linux-gnu
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Target-scoped settings so host-side build scripts and proc-macros still
+# build against the x86_64 toolchain and libraries.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
+    BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="--target=aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu"
