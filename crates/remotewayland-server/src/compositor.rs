@@ -21,7 +21,8 @@ use calloop::channel::{self, Channel, Sender as CalloopSender};
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use remotewayland_proto::{
-    LaunchState, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
+    LaunchState, FrameRect, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES,
+    SUPPORTED_TEXT_MIMES,
 };
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer as _;
@@ -55,7 +56,8 @@ use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, get_parent, send_surface_state, Blocker, BlockerState,
     Cacheable, with_states, with_surface_tree_downward,
-    CompositorClientState, CompositorHandler, CompositorState, SubsurfaceCachedState,
+    CompositorClientState, CompositorHandler, CompositorState, RectangleKind, RegionAttributes,
+    SubsurfaceCachedState, SurfaceAttributes,
     TraversalAction,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
@@ -141,6 +143,8 @@ pub enum CompositorEvent {
         height: u32,
         logical_width: u32,
         logical_height: u32,
+        geometry: FrameRect,
+        input_bounds: FrameRect,
         bgra: Vec<u8>,
     },
     StartMove {
@@ -185,6 +189,8 @@ pub enum CompositorEvent {
         height: u32,
         logical_width: u32,
         logical_height: u32,
+        geometry: FrameRect,
+        input_bounds: FrameRect,
         bgra: Arc<Vec<u8>>,
     },
     CursorUpdate {
@@ -326,6 +332,10 @@ struct CachedFrame {
     height: u32,
     logical_width: u32,
     logical_height: u32,
+    /// Window rectangle inside the frame (logical); the rest is the app's drop shadow.
+    geometry: FrameRect,
+    /// Bounding box of the app's input region inside the frame (logical).
+    input_bounds: FrameRect,
     bgra: Arc<Vec<u8>>,
 }
 
@@ -335,6 +345,8 @@ impl PartialEq for CachedFrame {
             && self.height == other.height
             && self.logical_width == other.logical_width
             && self.logical_height == other.logical_height
+            && self.geometry == other.geometry
+            && self.input_bounds == other.input_bounds
             && (Arc::ptr_eq(&self.bgra, &other.bgra) || self.bgra == other.bgra)
     }
 }
@@ -348,7 +360,6 @@ struct TrackedWindow {
     last_width: u32,
     last_height: u32,
     scale_factor: f64,
-    geo_offset: (i32, i32),
     server_side_decoration: bool,
     announced: bool,
     has_window_entry: bool,
@@ -361,7 +372,6 @@ struct TrackedPopup {
     parent_id: WindowId,
     surface: PopupSurface,
     geo: Rectangle<i32, Logical>,
-    geo_offset: (i32, i32),
     announced: bool,
     latest_bgra: Option<CachedFrame>,
 }
@@ -757,6 +767,59 @@ impl AppState {
         }
     }
 
+    /// Bounding box of the input regions of every mapped surface in the tree under
+    /// `tree_root` (each surface's whole area when it set no input region), relative to the
+    /// root and clipped to a `log_w` x `log_h` frame: [`FrameRect::NONE`] when no surface
+    /// takes input. Subsurfaces have input regions of their own, so the root's alone would
+    /// miss input on a subsurface reaching past it.
+    fn tree_input_bounds(&self, tree_root: &WlSurface, log_w: u32, log_h: u32) -> FrameRect {
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        with_surface_tree_downward(
+            tree_root,
+            (0, 0),
+            |surf, states, (ox, oy)| {
+                let (nx, ny) = if surf == tree_root {
+                    (*ox, *oy)
+                } else {
+                    let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
+                    let loc = sub_state.current().location;
+                    (ox + loc.x, oy + loc.y)
+                };
+                if let Some((sw, sh, _)) = self.surface_buffers.get(&surf.id()) {
+                    let (sub_w, sub_h) = surface_logical_size_from_states(states, *sw, *sh);
+                    let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+                    let b =
+                        input_region_bounds(attrs.current().input_region.as_ref(), sub_w, sub_h);
+                    if !b.is_empty() {
+                        let (x0, y0) = (nx + b.x, ny + b.y);
+                        let (x1, y1) = (x0 + b.width as i32, y0 + b.height as i32);
+                        bounds = Some(match bounds {
+                            Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
+                            None => (x0, y0, x1, y1),
+                        });
+                    }
+                }
+                TraversalAction::DoChildren((nx, ny))
+            },
+            |_, _, _| {},
+            |_, _, _| true,
+        );
+        let Some((x0, y0, x1, y1)) = bounds else {
+            return FrameRect::NONE;
+        };
+        let (x0, y0) = (x0.max(0), y0.max(0));
+        let (x1, y1) = (x1.min(log_w as i32), y1.min(log_h as i32));
+        if x1 <= x0 || y1 <= y0 {
+            return FrameRect::NONE;
+        }
+        FrameRect {
+            x: x0,
+            y: y0,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        }
+    }
+
     fn hit_test_tree(
         &self,
         tree_root: &WlSurface,
@@ -978,13 +1041,11 @@ impl AppState {
                 self.focused_window_id = window_id;
                 if let Some(pointer) = self.seat.get_pointer() {
                     let focus_and_loc = if let Some(tw) = self.windows.get(&window_id) {
-                        let (gx, gy) = tw.geo_offset;
                         tw.window
                             .toplevel()
-                            .and_then(|t| self.hit_test_tree(t.wl_surface(), (-gx, -gy), x, y))
+                            .and_then(|t| self.hit_test_tree(t.wl_surface(), (0, 0), x, y))
                     } else if let Some(tp) = self.popup_windows.get(&window_id) {
-                        let (gx, gy) = tp.geo_offset;
-                        self.hit_test_tree(tp.surface.wl_surface(), (-gx, -gy), x, y)
+                        self.hit_test_tree(tp.surface.wl_surface(), (0, 0), x, y)
                     } else if let Some(xw) = self.x11_windows.get(&window_id) {
                         let ox = xw.geo.loc.x as f64;
                         let oy = xw.geo.loc.y as f64;
@@ -1384,6 +1445,8 @@ impl AppState {
                         height: frame.height,
                         logical_width: frame.logical_width,
                         logical_height: frame.logical_height,
+                        geometry: frame.geometry,
+                        input_bounds: frame.input_bounds,
                         bgra: Arc::clone(&frame.bgra),
                     });
                 }
@@ -1406,6 +1469,8 @@ impl AppState {
                         height: frame.height,
                         logical_width: frame.logical_width,
                         logical_height: frame.logical_height,
+                        geometry: frame.geometry,
+                        input_bounds: frame.input_bounds,
                         bgra: (*frame.bgra).clone(),
                     });
                 }
@@ -1445,6 +1510,8 @@ impl AppState {
                         height: frame.height,
                         logical_width: frame.logical_width,
                         logical_height: frame.logical_height,
+                        geometry: frame.geometry,
+                        input_bounds: frame.input_bounds,
                         bgra: Arc::clone(&frame.bgra),
                     });
                 }
@@ -1467,6 +1534,8 @@ impl AppState {
                         height: frame.height,
                         logical_width: frame.logical_width,
                         logical_height: frame.logical_height,
+                        geometry: frame.geometry,
+                        input_bounds: frame.input_bounds,
                         bgra: (*frame.bgra).clone(),
                     });
                 }
@@ -1507,31 +1576,18 @@ impl AppState {
                 .current()
                 .geometry
         });
-        let (crop_x, crop_y, win_log_w, win_log_h) = match xdg_geo {
-            Some(g) if g.size.w > 0 && g.size.h > 0 => {
-                let cx = g.loc.x.max(0);
-                let cy = g.loc.y.max(0);
-                let cw = (g.size.w as u32).min(root_log_w.saturating_sub(cx as u32));
-                let ch = (g.size.h as u32).min(root_log_h.saturating_sub(cy as u32));
-                (cx, cy, cw.max(1), ch.max(1))
-            }
-            _ => (0, 0, root_log_w, root_log_h),
-        };
-        let (win_phys_w, win_phys_h) =
-            if crop_x == 0 && crop_y == 0 && win_log_w == root_log_w && win_log_h == root_log_h {
-                (surf_w, surf_h)
-            } else {
-                (
-                    ((win_log_w as f64 * root_sx).round() as u32).max(1),
-                    ((win_log_h as f64 * root_sy).round() as u32).max(1),
-                )
-            };
+        // Stream the whole surface, drop shadow included, and tell the client where the
+        // window sits inside it so its own compositor sees the same window geometry.
+        let geometry = clamp_window_geometry(xdg_geo, root_log_w, root_log_h);
+        let input_bounds = self.tree_input_bounds(root_surface, root_log_w, root_log_h);
+        let (win_log_w, win_log_h) = (geometry.width, geometry.height);
+        let (win_phys_w, win_phys_h) = (surf_w, surf_h);
 
         let mut sub_info = Vec::new();
         let mut has_subsurfaces = false;
         with_surface_tree_downward(
             root_surface,
-            (-crop_x, -crop_y),
+            (0, 0),
             |surf, states, (ox, oy)| {
                 let (nx, ny) = if surf == root_surface {
                     (*ox, *oy)
@@ -1554,37 +1610,14 @@ impl AppState {
             |_, _, _| true,
         );
 
-        let composite: Arc<Vec<u8>> = if !has_subsurfaces
-            && crop_x == 0
-            && crop_y == 0
-            && win_phys_w == surf_w
-            && win_phys_h == surf_h
-        {
-            // Zero-copy fast path for single-surface uncropped windows (most Wayland apps).
+        let composite: Arc<Vec<u8>> = if !has_subsurfaces {
+            // Zero-copy fast path for single-surface windows (most Wayland apps).
             Arc::clone(&self.surface_buffers.get(&root_id).unwrap().2)
-        } else if !has_subsurfaces {
-            // Fast row-by-row memcpy crop without per-pixel alpha blending.
-            let root_buf = &self.surface_buffers.get(&root_id).unwrap().2;
-            let crop_px_x =
-                ((crop_x as f64 * root_sx).round().max(0.0) as usize).min(surf_w as usize);
-            let crop_px_y =
-                ((crop_y as f64 * root_sy).round().max(0.0) as usize).min(surf_h as usize);
-            let src_stride = surf_w as usize * 4;
-            let dst_stride = win_phys_w as usize * 4;
-            let copy_w = (win_phys_w as usize).min((surf_w as usize).saturating_sub(crop_px_x)) * 4;
-            let copy_h = (win_phys_h as usize).min((surf_h as usize).saturating_sub(crop_px_y));
-            let mut out = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
-            for y in 0..copy_h {
-                let s_off = (crop_px_y + y) * src_stride + crop_px_x * 4;
-                let d_off = y * dst_stride;
-                out[d_off..d_off + copy_w].copy_from_slice(&root_buf[s_off..s_off + copy_w]);
-            }
-            Arc::new(out)
         } else {
             let mut buf = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
             with_surface_tree_downward(
                 root_surface,
-                (-crop_x, -crop_y),
+                (0, 0),
                 |surf, states, (ox, oy)| {
                     let (nx, ny) = if surf == root_surface {
                         (*ox, *oy)
@@ -1628,7 +1661,6 @@ impl AppState {
         let Some(tracked) = self.windows.get_mut(&window_id) else {
             return;
         };
-        tracked.geo_offset = (crop_x, crop_y);
         if sub_info != tracked.last_sub_info {
             debug!(
                 window_id,
@@ -1636,8 +1668,7 @@ impl AppState {
                 win_phys_h,
                 win_log_w,
                 win_log_h,
-                crop_x,
-                crop_y,
+                ?geometry,
                 ?sub_info,
                 "window surface tree changed"
             );
@@ -1647,8 +1678,10 @@ impl AppState {
         let new_frame = CachedFrame {
             width: win_phys_w,
             height: win_phys_h,
-            logical_width: win_log_w,
-            logical_height: win_log_h,
+            logical_width: root_log_w,
+            logical_height: root_log_h,
+            geometry,
+            input_bounds,
             bgra: composite,
         };
 
@@ -1717,6 +1750,8 @@ impl AppState {
             height: new_frame.height,
             logical_width: new_frame.logical_width,
             logical_height: new_frame.logical_height,
+            geometry: new_frame.geometry,
+            input_bounds: new_frame.input_bounds,
             bgra: new_frame.bgra,
         });
     }
@@ -1751,30 +1786,17 @@ impl AppState {
                 .current()
                 .geometry
         });
-        let (crop_x, crop_y, pop_log_w, pop_log_h) = match xdg_geo {
-            Some(g) if g.size.w > 0 && g.size.h > 0 => {
-                let cx = g.loc.x.max(0);
-                let cy = g.loc.y.max(0);
-                let cw = (g.size.w as u32).min(root_log_w.saturating_sub(cx as u32));
-                let ch = (g.size.h as u32).min(root_log_h.saturating_sub(cy as u32));
-                (cx, cy, cw.max(1), ch.max(1))
-            }
-            _ => (0, 0, root_log_w, root_log_h),
-        };
-        let (pop_phys_w, pop_phys_h) =
-            if crop_x == 0 && crop_y == 0 && pop_log_w == root_log_w && pop_log_h == root_log_h {
-                (surf_w, surf_h)
-            } else {
-                (
-                    ((pop_log_w as f64 * root_sx).round() as u32).max(1),
-                    ((pop_log_h as f64 * root_sy).round() as u32).max(1),
-                )
-            };
+        // Like toplevels, stream the whole popup surface (popovers draw their own shadow)
+        // along with where the popup's window rectangle sits inside it.
+        let geometry = clamp_window_geometry(xdg_geo, root_log_w, root_log_h);
+        let input_bounds = self.tree_input_bounds(&root_surface, root_log_w, root_log_h);
+        let (pop_log_w, pop_log_h) = (geometry.width, geometry.height);
+        let (pop_phys_w, pop_phys_h) = (surf_w, surf_h);
 
         let mut bgra = vec![0u8; (pop_phys_w * pop_phys_h * 4) as usize];
         with_surface_tree_downward(
             &root_surface,
-            (-crop_x, -crop_y),
+            (0, 0),
             |surf, states, (ox, oy)| {
                 let (nx, ny) = if surf == &root_surface {
                     (*ox, *oy)
@@ -1820,13 +1842,14 @@ impl AppState {
                 popup.geo = g;
             }
         }
-        popup.geo_offset = (crop_x, crop_y);
 
         let new_frame = CachedFrame {
             width: pop_phys_w,
             height: pop_phys_h,
-            logical_width: pop_log_w,
-            logical_height: pop_log_h,
+            logical_width: root_log_w,
+            logical_height: root_log_h,
+            geometry,
+            input_bounds,
             bgra: Arc::new(bgra),
         };
 
@@ -1853,6 +1876,8 @@ impl AppState {
             height: new_frame.height,
             logical_width: new_frame.logical_width,
             logical_height: new_frame.logical_height,
+            geometry: new_frame.geometry,
+            input_bounds: new_frame.input_bounds,
             bgra: (*new_frame.bgra).clone(),
         });
     }
@@ -2425,7 +2450,6 @@ impl XdgShellHandler for AppState {
                 last_width: 0,
                 last_height: 0,
                 scale_factor: initial_scale,
-                geo_offset: (0, 0),
                 server_side_decoration: initial_ssd,
                 announced: false,
                 has_window_entry: false,
@@ -2563,15 +2587,11 @@ impl XdgShellHandler for AppState {
     ) {
         let surf_id = surface.wl_surface().id();
         if let Some(&window_id) = self.surface_to_window.get(&surf_id) {
-            let (gx, gy) = self
-                .windows
-                .get(&window_id)
-                .map(|tw| tw.geo_offset)
-                .unwrap_or((0, 0));
+            // Frames carry the whole surface, so surface-local coordinates match the client's.
             let _ = self.event_tx.send(CompositorEvent::ShowWindowMenu {
                 window_id,
-                x: location.x - gx,
-                y: location.y - gy,
+                x: location.x,
+                y: location.y,
             });
         }
     }
@@ -2609,7 +2629,6 @@ impl XdgShellHandler for AppState {
                 parent_id,
                 surface,
                 geo,
-                geo_offset: (0, 0),
                 announced: false,
                 latest_bgra: None,
             },
@@ -2959,6 +2978,8 @@ impl AppState {
             height: h,
             logical_width: log_w,
             logical_height: log_h,
+            geometry: FrameRect::full(log_w, log_h),
+            input_bounds: FrameRect::full(log_w, log_h),
             bgra: Arc::clone(bgra_ref),
         };
         let frame_unchanged = xwin.announced
@@ -3034,6 +3055,8 @@ impl AppState {
             height: new_frame.height,
             logical_width: new_frame.logical_width,
             logical_height: new_frame.logical_height,
+            geometry: new_frame.geometry,
+            input_bounds: new_frame.input_bounds,
             bgra: new_frame.bgra,
         });
     }
@@ -3057,6 +3080,8 @@ impl AppState {
             height: h,
             logical_width: log_w,
             logical_height: log_h,
+            geometry: FrameRect::full(log_w, log_h),
+            input_bounds: FrameRect::full(log_w, log_h),
             bgra: Arc::clone(bgra_ref),
         };
         if xpop.announced && xpop.latest_bgra.as_ref() == Some(&new_frame) {
@@ -3091,6 +3116,8 @@ impl AppState {
             height: new_frame.height,
             logical_width: new_frame.logical_width,
             logical_height: new_frame.logical_height,
+            geometry: new_frame.geometry,
+            input_bounds: new_frame.input_bounds,
             bgra: (*new_frame.bgra).clone(),
         });
     }
@@ -4530,6 +4557,75 @@ fn clear_keyboard_focus_and_keys<D: SeatHandler + 'static>(
     }
 }
 
+/// The `xdg_surface` window geometry clamped to a `log_w` x `log_h` surface, or the whole
+/// surface when the app set none.
+fn clamp_window_geometry(
+    geo: Option<Rectangle<i32, Logical>>,
+    log_w: u32,
+    log_h: u32,
+) -> FrameRect {
+    // Clip each axis to the surface: a part outside it is cut off, not shifted inside.
+    let clip = |start: i32, len: i32, max: u32| -> Option<(i32, u32)> {
+        let max = max.min(i32::MAX as u32) as i32;
+        let lo = start.clamp(0, max);
+        let hi = start.saturating_add(len).clamp(0, max);
+        (hi > lo).then(|| (lo, (hi - lo) as u32))
+    };
+    match geo {
+        Some(g) if g.size.w > 0 && g.size.h > 0 => {
+            match (
+                clip(g.loc.x, g.size.w, log_w),
+                clip(g.loc.y, g.size.h, log_h),
+            ) {
+                (Some((x, width)), Some((y, height))) => FrameRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                // Entirely outside the surface: treat the whole surface as the window.
+                _ => FrameRect::full(log_w, log_h),
+            }
+        }
+        _ => FrameRect::full(log_w, log_h),
+    }
+}
+
+/// Bounding box of the added rectangles of a surface's input region, clamped to a
+/// `log_w` x `log_h` surface: the whole surface when the app set no input region, and a
+/// zero-size rectangle (no input, as for a click-through surface) when it set an empty one.
+fn input_region_bounds(region: Option<&RegionAttributes>, log_w: u32, log_h: u32) -> FrameRect {
+    let Some(region) = region else {
+        return FrameRect::full(log_w, log_h);
+    };
+    let mut bounds: Option<(i32, i32, i32, i32)> = None;
+    for (kind, r) in &region.rects {
+        if !matches!(kind, RectangleKind::Add) || r.size.w <= 0 || r.size.h <= 0 {
+            continue;
+        }
+        let x0 = r.loc.x.max(0);
+        let y0 = r.loc.y.max(0);
+        let x1 = r.loc.x.saturating_add(r.size.w).min(log_w as i32);
+        let y1 = r.loc.y.saturating_add(r.size.h).min(log_h as i32);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        bounds = Some(match bounds {
+            Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
+            None => (x0, y0, x1, y1),
+        });
+    }
+    match bounds {
+        Some((x0, y0, x1, y1)) => FrameRect {
+            x: x0,
+            y: y0,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+        None => FrameRect::NONE,
+    }
+}
+
 fn sanitize_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale >= 1.0 {
         scale.min(4.0)
@@ -4696,6 +4792,84 @@ mod tests {
 
     /// A pgid no process can have (above Linux's maximum pid).
     const UNRELATED_PGID: i32 = 1 << 30;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    #[test]
+    fn window_geometry_excludes_shadow_and_stays_inside_surface() {
+        // libadwaita-style: 1000x700 window inside a 1060x760 surface with shadow.
+        assert_eq!(
+            clamp_window_geometry(Some(rect(30, 30, 1000, 700)), 1060, 760),
+            FrameRect {
+                x: 30,
+                y: 30,
+                width: 1000,
+                height: 700
+            }
+        );
+        // Geometry hanging past the surface is clipped to it.
+        assert_eq!(
+            clamp_window_geometry(Some(rect(-5, 10, 2000, 2000)), 800, 600),
+            FrameRect {
+                x: 0,
+                y: 10,
+                width: 800,
+                height: 590
+            }
+        );
+        // A negative offset is clipped, not shifted: only (0,0)-(50,100) is visible.
+        assert_eq!(
+            clamp_window_geometry(Some(rect(-50, 0, 100, 100)), 800, 600),
+            FrameRect {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 100
+            }
+        );
+        // No (or empty) geometry means the whole surface is the window.
+        assert_eq!(
+            clamp_window_geometry(None, 640, 480),
+            FrameRect::full(640, 480)
+        );
+        assert_eq!(
+            clamp_window_geometry(Some(rect(0, 0, 0, 10)), 640, 480),
+            FrameRect::full(640, 480)
+        );
+    }
+
+    #[test]
+    fn input_bounds_cover_added_rects_only() {
+        assert_eq!(input_region_bounds(None, 100, 80), FrameRect::full(100, 80));
+        let region = RegionAttributes {
+            rects: vec![
+                (RectangleKind::Add, rect(18, 18, 1024, 724)),
+                (RectangleKind::Subtract, rect(0, 0, 40, 40)),
+                (RectangleKind::Add, rect(1040, 18, 100, 10)),
+            ],
+        };
+        assert_eq!(
+            input_region_bounds(Some(&region), 1060, 760),
+            FrameRect {
+                x: 18,
+                y: 18,
+                width: 1042,
+                height: 724
+            }
+        );
+        // An empty region (or one that only subtracts) takes no input at all.
+        let empty = RegionAttributes { rects: vec![] };
+        assert_eq!(input_region_bounds(Some(&empty), 100, 80), FrameRect::NONE);
+        let subtract_only = RegionAttributes {
+            rects: vec![(RectangleKind::Subtract, rect(0, 0, 10, 10))],
+        };
+        assert_eq!(
+            input_region_bounds(Some(&subtract_only), 100, 80),
+            FrameRect::NONE
+        );
+    }
 
     fn launch(launch_id: u64, pgid: i32) -> (u64, LaunchedApp) {
         let app = LaunchedApp {

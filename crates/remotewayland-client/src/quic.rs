@@ -414,6 +414,8 @@ pub async fn run_client(
                                         frame.height,
                                         hdr.logical_width,
                                         hdr.logical_height,
+                                        hdr.geometry,
+                                        hdr.input_bounds,
                                         frame.bgra,
                                         frame.damage,
                                     );
@@ -628,6 +630,8 @@ pub async fn run_client(
                     height,
                     logical_width,
                     logical_height,
+                    geometry,
+                    input_bounds,
                     is_keyframe,
                     bgra,
                 } => {
@@ -642,6 +646,8 @@ pub async fn run_client(
                                 height: frame.height,
                                 logical_width,
                                 logical_height,
+                                geometry,
+                                input_bounds,
                                 bgra: frame.bgra,
                                 damage: frame.damage,
                             });

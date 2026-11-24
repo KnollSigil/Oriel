@@ -11,7 +11,7 @@ use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
 use remotewayland_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_protocol_preamble,
     read_stream_header, write_audio_packet, write_control_message, write_stream_header,
-    write_video_frame, AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage,
+    write_video_frame, AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage, FrameRect,
     LaunchState, PeerProtocol, PortRange, StreamHeader, VideoCodec, VideoFrameHeader, WindowId,
     CLOSE_CODE_PROTOCOL_MISMATCH, CLOSE_CODE_SUPERSEDED, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION,
     PTY_LAUNCH_ID_BASE,
@@ -876,6 +876,8 @@ struct PopupEncoderState {
     height: u32,
     logical_width: u32,
     logical_height: u32,
+    geometry: FrameRect,
+    input_bounds: FrameRect,
     last_update: Instant,
 }
 
@@ -946,6 +948,8 @@ impl EventForwarder {
                 height: frame.height,
                 logical_width: st.logical_width,
                 logical_height: st.logical_height,
+                geometry: st.geometry,
+                input_bounds: st.input_bounds,
                 is_keyframe: frame.is_keyframe,
                 bgra: frame.data,
             },
@@ -1059,6 +1063,8 @@ impl EventForwarder {
                 height,
                 logical_width,
                 logical_height,
+                geometry,
+                input_bounds,
                 bgra,
             } => {
                 let selected_codec = self.selected_codec;
@@ -1071,12 +1077,16 @@ impl EventForwarder {
                             height,
                             logical_width,
                             logical_height,
+                            geometry,
+                            input_bounds,
                             last_update: Instant::now(),
                         });
                 st.width = width;
                 st.height = height;
                 st.logical_width = logical_width;
                 st.logical_height = logical_height;
+                st.geometry = geometry;
+                st.input_bounds = input_bounds;
                 st.last_update = Instant::now();
                 let pts_ns = self.session_start.elapsed().as_nanos() as u64;
                 let frame = st.encoder.encode_bgra(width, height, pts_ns, &bgra, 80);
@@ -1088,6 +1098,8 @@ impl EventForwarder {
                         height: frame.height,
                         logical_width,
                         logical_height,
+                        geometry,
+                        input_bounds,
                         is_keyframe: frame.is_keyframe,
                         bgra: frame.data,
                     },
@@ -1248,6 +1260,8 @@ impl EventForwarder {
                 height,
                 logical_width,
                 logical_height,
+                geometry,
+                input_bounds,
                 bgra,
             } => {
                 let (conn, selected_codec, session_start) =
@@ -1265,6 +1279,8 @@ impl EventForwarder {
                     height,
                     logical_width,
                     logical_height,
+                    geometry,
+                    input_bounds,
                     bgra,
                 });
             }
@@ -1330,6 +1346,8 @@ struct RawVideoFrame {
     height: u32,
     logical_width: u32,
     logical_height: u32,
+    geometry: FrameRect,
+    input_bounds: FrameRect,
     bgra: Arc<Vec<u8>>,
 }
 
@@ -1421,7 +1439,7 @@ async fn run_window_video_pipeline(
     let mut last_pts_ns: u64 = 0;
     let mut quality: u8 = 80;
     let mut last_congestion: Option<Instant> = None;
-    let mut last_dims: Option<(u32, u32, u32, u32)> = None;
+    let mut last_dims: Option<(u32, u32, u32, u32, FrameRect, FrameRect)> = None;
     let mut refining_idle = false;
     const IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
     const CONGESTION_COOLDOWN: Duration = Duration::from_millis(500);
@@ -1505,13 +1523,13 @@ async fn run_window_video_pipeline(
         let pts_ns = raw_pts.max(last_pts_ns.saturating_add(1));
 
         let encode_start = Instant::now();
-        let (logical_width, logical_height, frame) = if do_idle_refresh {
+        let (logical_width, logical_height, geometry, input_bounds, frame) = if do_idle_refresh {
             // Re-check mailbox in case a new frame arrived while waiting for credit.
             if latest_frame.lock().unwrap().is_some() {
                 refining_idle = false;
                 continue;
             }
-            let Some((lw_phys, lh_phys, log_w, log_h)) = last_dims else {
+            let Some((lw_phys, lh_phys, log_w, log_h, geometry, input_bounds)) = last_dims else {
                 refining_idle = false;
                 continue;
             };
@@ -1539,7 +1557,7 @@ async fn run_window_video_pipeline(
                 continue;
             };
             last_pts_ns = pts_ns;
-            (log_w, log_h, frame)
+            (log_w, log_h, geometry, input_bounds, frame)
         } else {
             // 3. Take the latest frame AFTER acquiring credit so stale intermediate frames are skipped.
             let Some(raw) = latest_frame.lock().unwrap().take() else {
@@ -1548,7 +1566,15 @@ async fn run_window_video_pipeline(
             last_pts_ns = pts_ns;
             let logical_width = raw.logical_width;
             let logical_height = raw.logical_height;
-            last_dims = Some((raw.width, raw.height, logical_width, logical_height));
+            let (geometry, input_bounds) = (raw.geometry, raw.input_bounds);
+            last_dims = Some((
+                raw.width,
+                raw.height,
+                logical_width,
+                logical_height,
+                geometry,
+                input_bounds,
+            ));
 
             // 4. Encode off the async runtime thread so control/input latency stays unaffected.
             let mut enc = encoder.take().unwrap();
@@ -1567,7 +1593,7 @@ async fn run_window_video_pipeline(
                 }
             };
             encoder = Some(enc);
-            (logical_width, logical_height, frame)
+            (logical_width, logical_height, geometry, input_bounds, frame)
         };
         let encode_elapsed = encode_start.elapsed();
 
@@ -1595,6 +1621,8 @@ async fn run_window_video_pipeline(
             height: frame.height,
             logical_width,
             logical_height,
+            geometry,
+            input_bounds,
             is_keyframe: frame.is_keyframe,
             payload_len,
         };

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -319,6 +319,10 @@ pub enum ControlMessage {
         height: u32,
         logical_width: u32,
         logical_height: u32,
+        /// The popup's window rectangle inside the frame; see [`VideoFrameHeader::geometry`].
+        geometry: FrameRect,
+        /// See [`VideoFrameHeader::input_bounds`].
+        input_bounds: FrameRect,
         is_keyframe: bool,
         bgra: Vec<u8>,
     },
@@ -447,6 +451,41 @@ pub enum ControlMessage {
     ButtonLayout { layout: Option<String> },
 }
 
+/// A rectangle inside a frame, in logical pixels relative to the frame's top-left corner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl FrameRect {
+    /// A zero-size rectangle: for [`VideoFrameHeader::input_bounds`], a surface that takes
+    /// no pointer input (a click-through surface).
+    pub const NONE: Self = Self {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    };
+
+    /// Whether the rectangle has no area.
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// A rectangle covering a whole `width` x `height` frame.
+    pub fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+}
+
 /// Header preceding each encoded video access unit on a per-window video stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoFrameHeader {
@@ -455,6 +494,13 @@ pub struct VideoFrameHeader {
     pub height: u32,
     pub logical_width: u32,
     pub logical_height: u32,
+    /// The window's visible rectangle (`xdg_surface.set_window_geometry`). Apps that
+    /// draw their own titlebar paint their drop shadow around it, outside this rectangle.
+    pub geometry: FrameRect,
+    /// Bounding box of the app's input region: the window plus whatever resize margin
+    /// the app keeps in its shadow. Pointer input outside it belongs to windows below;
+    /// empty ([`FrameRect::NONE`]) when the surface takes no input at all.
+    pub input_bounds: FrameRect,
     pub is_keyframe: bool,
     pub payload_len: u32,
 }
@@ -782,6 +828,18 @@ mod tests {
             height: 900,
             logical_width: 800,
             logical_height: 600,
+            geometry: FrameRect {
+                x: 24,
+                y: 18,
+                width: 752,
+                height: 558,
+            },
+            input_bounds: FrameRect {
+                x: 12,
+                y: 6,
+                width: 776,
+                height: 582,
+            },
             is_keyframe: true,
             payload_len: 4,
         };

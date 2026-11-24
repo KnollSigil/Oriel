@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use remotewayland_proto::{
-    ControlMessage, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
+    ControlMessage, FrameRect, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
 };
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Sender as CalloopSender};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     data_device_manager::{
         data_device::{DataDevice, DataDeviceHandler},
         data_offer::{DataOfferHandler, DragOffer},
@@ -77,6 +77,7 @@ use wayland_protocols::wp::viewporter::client::{
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
+    xdg_surface,
     xdg_toplevel::ResizeEdge,
 };
 use wayland_protocols::xdg::toplevel_icon::v1::client::{
@@ -118,6 +119,8 @@ pub enum ClientUiEvent {
         height: u32,
         logical_width: u32,
         logical_height: u32,
+        geometry: FrameRect,
+        input_bounds: FrameRect,
         bgra: Arc<Vec<u8>>,
         damage: Vec<(i32, i32, i32, i32)>,
     },
@@ -205,6 +208,8 @@ struct LatestDecodedFrame {
     height: u32,
     logical_width: u32,
     logical_height: u32,
+    geometry: FrameRect,
+    input_bounds: FrameRect,
     bgra: Arc<Vec<u8>>,
     damage: Vec<(i32, i32, i32, i32)>,
 }
@@ -235,6 +240,8 @@ impl UiSender {
         height: u32,
         logical_width: u32,
         logical_height: u32,
+        geometry: FrameRect,
+        input_bounds: FrameRect,
         bgra: Arc<Vec<u8>>,
         mut damage: Vec<(i32, i32, i32, i32)>,
     ) {
@@ -273,6 +280,8 @@ impl UiSender {
                     height,
                     logical_width,
                     logical_height,
+                    geometry,
+                    input_bounds,
                     bgra,
                     damage,
                 },
@@ -310,6 +319,8 @@ struct PendingFrame {
     height: u32,
     logical_width: u32,
     logical_height: u32,
+    geometry: FrameRect,
+    input_bounds: FrameRect,
     bgra: Arc<Vec<u8>>,
     damage: Vec<(i32, i32, i32, i32)>,
 }
@@ -333,6 +344,100 @@ struct RemoteWindow {
     tiled: bool,
     pending_frame: Option<PendingFrame>,
     pending_resize_prev: Option<((u32, u32), Instant)>,
+    /// Logical size of the last frame shown, and the window and input rectangles inside
+    /// it. Frames include the app's drop shadow around the window rectangle.
+    frame_size: (u32, u32),
+    geometry: FrameRect,
+    input_bounds: Option<FrameRect>,
+}
+
+impl RemoteWindow {
+    /// Whether the app takes pointer input outside its window rectangle: the resize margin
+    /// apps that draw their own shadow (GTK, libadwaita, Firefox, Chromium) keep there, to
+    /// start edge resizes themselves.
+    fn app_has_resize_margin(&self) -> bool {
+        let input = self
+            .input_bounds
+            .unwrap_or(FrameRect::full(self.frame_size.0, self.frame_size.1));
+        input_reaches_past(input, self.geometry)
+    }
+
+    /// The edge to resize from when the pointer is at `(x, y)` (surface-local), for windows
+    /// without a resize margin of their own: a band along the window rectangle's edges.
+    fn border_resize_edge(&self, x: f64, y: f64) -> Option<(ResizeEdge, CursorIcon)> {
+        if self.maximized || self.fullscreen || self.tiled || self.app_has_resize_margin() {
+            return None;
+        }
+        let g = self.geometry;
+        if g.is_empty() {
+            return border_resize_edge(x, y, self.width, self.height);
+        }
+        border_resize_edge(x - g.x as f64, y - g.y as f64, g.width, g.height)
+    }
+
+    /// See [`apply_frame_rects`]; also remembers the frame's size and window rectangle.
+    fn apply_frame_rects(
+        &mut self,
+        compositor: &CompositorState,
+        frame_w: u32,
+        frame_h: u32,
+        geometry: FrameRect,
+        input_bounds: FrameRect,
+    ) {
+        apply_frame_rects(
+            self.window.xdg_surface(),
+            self.window.wl_surface(),
+            compositor,
+            (frame_w, frame_h),
+            geometry,
+            input_bounds,
+            &mut self.input_bounds,
+        );
+        self.frame_size = (frame_w, frame_h);
+        self.geometry = geometry;
+    }
+}
+
+/// Point the host compositor at the window rectangle inside a frame of logical size
+/// `frame`, and limit pointer input to `input_bounds` so clicks on the app's outer shadow
+/// reach whatever is below. `applied` tracks the input region last set on `surface`.
+fn apply_frame_rects(
+    xdg_surface: &xdg_surface::XdgSurface,
+    surface: &wl_surface::WlSurface,
+    compositor: &CompositorState,
+    frame: (u32, u32),
+    geometry: FrameRect,
+    input_bounds: FrameRect,
+    applied: &mut Option<FrameRect>,
+) {
+    xdg_surface.set_window_geometry(
+        geometry.x,
+        geometry.y,
+        geometry.width.max(1) as i32,
+        geometry.height.max(1) as i32,
+    );
+    let full = FrameRect::full(frame.0, frame.1);
+    let input_bounds = if input_bounds == full {
+        None
+    } else {
+        Some(input_bounds)
+    };
+    if input_bounds != *applied {
+        match input_bounds {
+            Some(b) => match Region::new(compositor) {
+                Ok(region) => {
+                    // An empty region: the surface takes no input (click-through).
+                    if !b.is_empty() {
+                        region.add(b.x, b.y, b.width as i32, b.height as i32);
+                    }
+                    surface.set_input_region(Some(region.wl_region()));
+                }
+                Err(err) => warn!(error = %err, "failed to create input region"),
+            },
+            None => surface.set_input_region(None),
+        }
+        *applied = input_bounds;
+    }
 }
 
 impl Drop for RemoteWindow {
@@ -352,6 +457,8 @@ struct RemotePopup {
     configured: bool,
     pending_frame: Option<PendingFrame>,
     next_token: u32,
+    /// Input region last set on the popup's surface (`None`: the whole surface).
+    input_bounds: Option<FrameRect>,
 }
 
 impl Drop for RemotePopup {
@@ -657,6 +764,9 @@ impl ClientApp {
                         tiled: false,
                         pending_frame: None,
                         pending_resize_prev: None,
+                        frame_size: (0, 0),
+                        geometry: FrameRect::full(0, 0),
+                        input_bounds: None,
                     },
                 );
                 if has_app_id {
@@ -730,6 +840,7 @@ impl ClientApp {
                                 configured: false,
                                 pending_frame: None,
                                 next_token: 1,
+                                input_bounds: None,
                             },
                         );
                     }
@@ -768,6 +879,8 @@ impl ClientApp {
                 height,
                 logical_width,
                 logical_height,
+                geometry,
+                input_bounds,
                 bgra,
                 damage,
             } => {
@@ -778,10 +891,21 @@ impl ClientApp {
                             height,
                             logical_width,
                             logical_height,
+                            geometry,
+                            input_bounds,
                             bgra,
                             damage,
                         });
                     } else {
+                        apply_frame_rects(
+                            rp.popup.xdg_surface(),
+                            rp.popup.wl_surface(),
+                            &self.compositor_state,
+                            (logical_width, logical_height),
+                            geometry,
+                            input_bounds,
+                            &mut rp.input_bounds,
+                        );
                         let surf = rp.popup.wl_surface().clone();
                         draw_shm_surface(
                             &mut self.pool,
@@ -881,6 +1005,8 @@ impl ClientApp {
                     height,
                     logical_width,
                     logical_height,
+                    geometry,
+                    input_bounds,
                     bgra,
                     damage,
                 }) = self.latest_frames.lock().unwrap().remove(&window_id)
@@ -894,24 +1020,32 @@ impl ClientApp {
                             height,
                             logical_width,
                             logical_height,
+                            geometry,
+                            input_bounds,
                             bgra,
                             damage,
                         });
                     } else {
                         let lw = logical_width.max(1);
                         let lh = logical_height.max(1);
+                        // The configured size is the window geometry, without the shadow.
+                        let win_size = (geometry.width, geometry.height);
                         if let Some((prev_size, since)) = win.pending_resize_prev {
-                            if (lw, lh) == prev_size
-                                && (lw, lh) != (win.width, win.height)
+                            if win_size == prev_size
+                                && win_size != (win.width, win.height)
                                 && since.elapsed() < Duration::from_millis(250)
                             {
                                 return;
                             }
                             win.pending_resize_prev = None;
                         }
-                        win.window
-                            .xdg_surface()
-                            .set_window_geometry(0, 0, lw as i32, lh as i32);
+                        win.apply_frame_rects(
+                            &self.compositor_state,
+                            lw,
+                            lh,
+                            geometry,
+                            input_bounds,
+                        );
                         let surf = win.window.wl_surface().clone();
                         draw_shm_surface(
                             &mut self.pool,
@@ -1117,6 +1251,17 @@ impl ClientApp {
         }
         self.maybe_send_display_scale();
     }
+}
+
+/// Whether the `input` rectangle extends past the window rectangle `geometry` on any side.
+fn input_reaches_past(input: FrameRect, geometry: FrameRect) -> bool {
+    let g = geometry;
+    !input.is_empty()
+        && !g.is_empty()
+        && (input.x < g.x
+            || input.y < g.y
+            || input.x + input.width as i32 > g.x + g.width as i32
+            || input.y + input.height as i32 > g.y + g.height as i32)
 }
 
 fn border_resize_edge(x: f64, y: f64, width: u32, height: u32) -> Option<(ResizeEdge, CursorIcon)> {
@@ -1365,9 +1510,13 @@ impl WindowHandler for ClientApp {
         if let Some(frame) = win.pending_frame.take() {
             let lw = frame.logical_width.max(1);
             let lh = frame.logical_height.max(1);
-            win.window
-                .xdg_surface()
-                .set_window_geometry(0, 0, lw as i32, lh as i32);
+            win.apply_frame_rects(
+                &self.compositor_state,
+                lw,
+                lh,
+                frame.geometry,
+                frame.input_bounds,
+            );
             let surf = win.window.wl_surface().clone();
             draw_shm_surface(
                 &mut self.pool,
@@ -1442,6 +1591,15 @@ impl PopupHandler for ClientApp {
         };
         rp.configured = true;
         if let Some(frame) = rp.pending_frame.take() {
+            apply_frame_rects(
+                rp.popup.xdg_surface(),
+                rp.popup.wl_surface(),
+                &self.compositor_state,
+                (frame.logical_width, frame.logical_height),
+                frame.geometry,
+                frame.input_bounds,
+                &mut rp.input_bounds,
+            );
             let surf = rp.popup.wl_surface().clone();
             draw_shm_surface(
                 &mut self.pool,
@@ -1655,17 +1813,8 @@ impl PointerHandler for ClientApp {
                     self.pointer_window_id = window_id;
                     self.last_cursor = ActiveCursor::Named(CursorIcon::Default);
                     let resize_icon = self.windows.get(&window_id).and_then(|win| {
-                        (!win.maximized && !win.fullscreen && !win.tiled)
-                            .then(|| {
-                                border_resize_edge(
-                                    event.position.0,
-                                    event.position.1,
-                                    win.width,
-                                    win.height,
-                                )
-                                .map(|(_, icon)| icon)
-                            })
-                            .flatten()
+                        win.border_resize_edge(event.position.0, event.position.1)
+                            .map(|(_, icon)| icon)
                     });
                     if let Some(icon) = resize_icon {
                         self.border_resize_active = true;
@@ -1685,17 +1834,8 @@ impl PointerHandler for ClientApp {
                 PointerEventKind::Motion { .. } => {
                     self.pointer_window_id = window_id;
                     let resize_icon = self.windows.get(&window_id).and_then(|win| {
-                        (!win.maximized && !win.fullscreen && !win.tiled)
-                            .then(|| {
-                                border_resize_edge(
-                                    event.position.0,
-                                    event.position.1,
-                                    win.width,
-                                    win.height,
-                                )
-                                .map(|(_, icon)| icon)
-                            })
-                            .flatten()
+                        win.border_resize_edge(event.position.0, event.position.1)
+                            .map(|(_, icon)| icon)
                     });
                     if let Some(icon) = resize_icon {
                         self.border_resize_active = true;
@@ -1719,16 +1859,11 @@ impl PointerHandler for ClientApp {
                     if button == BTN_LEFT {
                         if let (Some(seat), Some(win)) = (&self.seat, self.windows.get(&window_id))
                         {
-                            if !win.maximized && !win.fullscreen && !win.tiled {
-                                if let Some((edge, _)) = border_resize_edge(
-                                    event.position.0,
-                                    event.position.1,
-                                    win.width,
-                                    win.height,
-                                ) {
-                                    win.window.resize(seat, serial, edge);
-                                    continue;
-                                }
+                            if let Some((edge, _)) =
+                                win.border_resize_edge(event.position.0, event.position.1)
+                            {
+                                win.window.resize(seat, serial, edge);
+                                continue;
                             }
                         }
                     }
@@ -2309,11 +2444,61 @@ mod tests {
     }
 
     #[test]
+    fn resize_margin_means_input_past_the_window_rectangle() {
+        let rect = |x, y, width, height| FrameRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let window = rect(25, 25, 700, 616);
+        // GTK-style: input covers a resize margin inside the shadow.
+        assert!(input_reaches_past(rect(13, 13, 724, 640), window));
+        // Shadow drawn, but input limited to the window: no margin of its own.
+        assert!(!input_reaches_past(window, window));
+        // No shadow at all.
+        let full = FrameRect::full(700, 616);
+        assert!(!input_reaches_past(full, full));
+        // Click-through.
+        assert!(!input_reaches_past(FrameRect::NONE, window));
+    }
+
+    #[test]
     fn ui_sender_push_frame_coalesces_to_latest_without_duplicate_wakeups() {
         let (tx, rx) = create_ui_channel();
-        tx.push_frame(7, 4, 4, 2, 2, Arc::new(vec![1; 64]), vec![(0, 0, 2, 2)]);
-        tx.push_frame(7, 4, 4, 2, 2, Arc::new(vec![2; 64]), vec![(2, 2, 2, 2)]);
-        tx.push_frame(7, 8, 8, 4, 4, Arc::new(vec![3; 256]), vec![(0, 0, 8, 8)]);
+        tx.push_frame(
+            7,
+            4,
+            4,
+            2,
+            2,
+            FrameRect::full(2, 2),
+            FrameRect::full(2, 2),
+            Arc::new(vec![1; 64]),
+            vec![(0, 0, 2, 2)],
+        );
+        tx.push_frame(
+            7,
+            4,
+            4,
+            2,
+            2,
+            FrameRect::full(2, 2),
+            FrameRect::full(2, 2),
+            Arc::new(vec![2; 64]),
+            vec![(2, 2, 2, 2)],
+        );
+        tx.push_frame(
+            7,
+            8,
+            8,
+            4,
+            4,
+            FrameRect::full(4, 4),
+            FrameRect::full(4, 4),
+            Arc::new(vec![3; 256]),
+            vec![(0, 0, 8, 8)],
+        );
 
         // Only the newest frame should be stored in the 1-slot mailbox.
         let latest = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
@@ -2331,7 +2516,17 @@ mod tests {
         assert!(latest.damage.is_empty());
 
         // Next push after removal re-arms the mailbox.
-        tx.push_frame(7, 2, 2, 1, 1, Arc::new(vec![9; 16]), vec![(0, 0, 2, 2)]);
+        tx.push_frame(
+            7,
+            2,
+            2,
+            1,
+            1,
+            FrameRect::full(1, 1),
+            FrameRect::full(1, 1),
+            Arc::new(vec![9; 16]),
+            vec![(0, 0, 2, 2)],
+        );
         let next = rx.latest_frames.lock().unwrap().remove(&7).unwrap();
         assert_eq!(
             (
