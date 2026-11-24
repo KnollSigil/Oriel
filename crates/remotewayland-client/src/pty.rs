@@ -833,10 +833,24 @@ fn prepare_konsole_remote_profile_with_env(
         existing_config_dirs,
         "/etc/xdg",
     );
+    // The sandbox's XDG_DATA_DIRS is useless on the host, and the profile's `flatpak run`
+    // inherits this value: without Flatpak's export dirs the host `flatpak` CLI prints a
+    // "directories are not in the search path set by XDG_DATA_DIRS" warning into the PTY.
+    let flatpak_data_dirs_fallback = env.home.as_ref().map(|h| {
+        format!(
+            "{}:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share",
+            h.join(".local/share/flatpak/exports/share").display()
+        )
+    });
+    let data_dirs_fallback = match (flatpak, flatpak_data_dirs_fallback.as_deref()) {
+        (true, Some(dirs)) => dirs,
+        (true, None) => "/var/lib/flatpak/exports/share:/usr/local/share:/usr/share",
+        (false, _) => "/usr/local/share:/usr/share",
+    };
     let data_dirs = join_xdg_dirs(
         orig_data_home.as_deref(),
         existing_data_dirs,
-        "/usr/local/share:/usr/share",
+        data_dirs_fallback,
     );
 
     Ok(KonsoleProfileOverlay {
@@ -1031,6 +1045,9 @@ pub fn available_local_terminals() -> Vec<String> {
 /// Wrap the `flatpak run` attach prefix for Konsole's profile overlay so the overridden
 /// `XDG_DATA_HOME` (pointing at our temporary overlay dir) does not prevent `flatpak run`
 /// from finding `--user` installations under `~/.local/share/flatpak`.
+///
+/// `XDG_DATA_DIRS` is deliberately kept: the overlay's value includes Flatpak's export
+/// dirs, whereas unsetting it makes `flatpak` warn that they are missing from the path.
 fn konsole_overlay_attach_prefix(attach_prefix: &[String], is_flatpak: bool) -> Vec<String> {
     if !is_flatpak {
         return attach_prefix.to_vec();
@@ -1043,8 +1060,6 @@ fn konsole_overlay_attach_prefix(attach_prefix: &[String], is_flatpak: bool) -> 
         "XDG_CONFIG_DIRS".to_string(),
         "-u".to_string(),
         "XDG_DATA_HOME".to_string(),
-        "-u".to_string(),
-        "XDG_DATA_DIRS".to_string(),
     ];
     wrapped.extend(attach_prefix.iter().cloned());
     wrapped
@@ -1473,7 +1488,7 @@ name=other
         assert_eq!(overlay.config_dirs, "/home/alice/.config:/etc/xdg");
         assert_eq!(
             overlay.data_dirs,
-            "/home/alice/.local/share:/usr/local/share:/usr/share"
+            "/home/alice/.local/share:/home/alice/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share"
         );
 
         let profile = fs::read_to_string(
@@ -1484,7 +1499,7 @@ name=other
         )
         .unwrap();
         assert!(profile.contains(&format!(
-            "Command=env -u XDG_CONFIG_HOME -u XDG_CONFIG_DIRS -u XDG_DATA_HOME -u XDG_DATA_DIRS flatpak run --command=remotewayland-client dev.knoll.Oriel pty-attach --socket {}",
+            "Command=env -u XDG_CONFIG_HOME -u XDG_CONFIG_DIRS -u XDG_DATA_HOME flatpak run --command=remotewayland-client dev.knoll.Oriel pty-attach --socket {}",
             sock.display()
         )));
 
