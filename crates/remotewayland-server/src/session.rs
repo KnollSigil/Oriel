@@ -1187,17 +1187,22 @@ pub fn apply_button_layout(layout: Option<&str>) {
 
 /// Rebuild the isolated `kdeglobals` from the synced color scheme and accent: the color
 /// scheme's palette (or the host's own `kdeglobals` without a color scheme preference),
-/// with the accent as the selection color. Returns whether the file changed.
+/// with the accent as the selection color, marked immutable (see
+/// [`mark_palette_immutable`]). Returns whether the file changed.
 fn rewrite_kdeglobals(portal_config_dir: &Path, synced: &SyncedSettings) -> bool {
     let kdeglobals_path = portal_config_dir.join("kdeglobals");
-    let existing = fs::read_to_string(&kdeglobals_path).ok();
+    let written = fs::read_to_string(&kdeglobals_path).ok();
+    // Always rebuild from a pristine base, never from the file written before: that one
+    // carries the previous accent, which must go when the client clears its accent.
     let host = || fs::read_to_string(portal_config_dir.join("kdeglobals.orig")).ok();
-    let base = match synced.scheme {
-        None => host().or_else(|| existing.clone()),
-        Some(0) => host().or_else(|| {
-            find_xdg_data_path("color-schemes/BreezeLight.colors")
-                .and_then(|p| fs::read_to_string(p).ok())
-        }),
+    let mut updated = match synced.scheme {
+        None => host().unwrap_or_default(),
+        Some(0) => host()
+            .or_else(|| {
+                find_xdg_data_path("color-schemes/BreezeLight.colors")
+                    .and_then(|p| fs::read_to_string(p).ok())
+            })
+            .unwrap_or_default(),
         Some(scheme) => {
             let rel = if scheme == 1 {
                 "color-schemes/BreezeDark.colors"
@@ -1206,18 +1211,15 @@ fn rewrite_kdeglobals(portal_config_dir: &Path, synced: &SyncedSettings) -> bool
             };
             let base = find_xdg_data_path(rel)
                 .and_then(|p| fs::read_to_string(p).ok())
-                .or_else(|| existing.clone())
                 .unwrap_or_default();
-            Some(update_kdeglobals_color_scheme(&base, scheme))
+            update_kdeglobals_color_scheme(&base, scheme)
         }
-    };
-    let Some(mut updated) = base else {
-        return false;
     };
     if let Some(rgb) = synced.accent_color {
         updated = set_kdeglobals_accent(&updated, rgb);
     }
-    if existing.as_deref() == Some(updated.as_str()) {
+    let updated = mark_palette_immutable(&updated);
+    if written.as_deref() == Some(updated.as_str()) {
         return false;
     }
     if let Err(err) = write_file_atomic(&kdeglobals_path, updated.as_bytes()) {
@@ -1225,6 +1227,40 @@ fn rewrite_kdeglobals(portal_config_dir: &Path, synced: &SyncedSettings) -> bool
         return false;
     }
     true
+}
+
+/// Mark the palette of a `kdeglobals` buffer immutable with KConfig's `[$i]` (Kiosk) flag:
+/// the `[Colors:*]`, `[ColorEffects:*]` and `[WM]` groups and `[General]` `ColorScheme`
+/// and `AccentColor`. Apps see the isolated `kdeglobals` through `XDG_CONFIG_DIRS`, below
+/// the user's own `~/.config/kdeglobals`, whose palette would otherwise win and keep KDE
+/// apps on the server's color scheme. Everything else (fonts, shortcuts, ...) still comes
+/// from the user's file.
+fn mark_palette_immutable(kdeglobals: &str) -> String {
+    let mut out = String::with_capacity(kdeglobals.len() + 256);
+    let mut in_general = false;
+    for line in kdeglobals.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_general = trimmed == "[General]";
+            let palette = trimmed.starts_with("[Colors:")
+                || trimmed.starts_with("[ColorEffects:")
+                || trimmed == "[WM]";
+            out.push_str(trimmed);
+            if palette && !trimmed.ends_with("[$i]") {
+                out.push_str("[$i]");
+            }
+        } else if let Some((key, value)) = in_general
+            .then(|| trimmed.split_once('='))
+            .flatten()
+            .filter(|(key, _)| matches!(key.trim(), "ColorScheme" | "AccentColor"))
+        {
+            out.push_str(&format!("{}[$i]={value}", key.trim()));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Apply an accent color to a `kdeglobals` buffer the way KDE does: as the selection
@@ -1703,6 +1739,36 @@ mod tests {
             ),
             "[Colors:View]\nBackgroundNormal=1\n\n[Colors:Selection]\nBackgroundNormal=2\n"
         );
+    }
+
+    #[test]
+    fn mark_palette_immutable_flags_only_the_palette() {
+        let base = "[General]\nColorScheme=BreezeLight\nAccentColor=1,2,3\nfont=Noto Sans,10\n\n[Colors:Window]\nBackgroundNormal=1,2,3\n\n[Colors:Header][Inactive]\nBackgroundNormal=4,5,6\n\n[ColorEffects:Disabled]\nColor=1,1,1\n\n[WM]\nactiveBackground=1,1,1\n\n[KDE]\nSingleClick=false\n";
+        let marked = mark_palette_immutable(base);
+        assert_eq!(
+            marked,
+            "[General]\nColorScheme[$i]=BreezeLight\nAccentColor[$i]=1,2,3\nfont=Noto Sans,10\n\n[Colors:Window][$i]\nBackgroundNormal=1,2,3\n\n[Colors:Header][Inactive][$i]\nBackgroundNormal=4,5,6\n\n[ColorEffects:Disabled][$i]\nColor=1,1,1\n\n[WM][$i]\nactiveBackground=1,1,1\n\n[KDE]\nSingleClick=false\n"
+        );
+        // Idempotent.
+        assert_eq!(mark_palette_immutable(&marked), marked);
+    }
+
+    #[test]
+    fn rewrite_kdeglobals_drops_a_cleared_accent_without_host_kdeglobals() {
+        // A server with no ~/.config/kdeglobals, so no kdeglobals.orig.
+        let dir = TestTempDir::new("rw-kdeglobals-accent-test");
+        let synced = |accent_color| SyncedSettings {
+            scheme: None,
+            button_layout: DEFAULT_BUTTON_LAYOUT.to_string(),
+            accent_color,
+            contrast: None,
+        };
+        assert!(rewrite_kdeglobals(&dir.0, &synced(Some([1.0, 0.0, 0.0]))));
+        let red = fs::read_to_string(dir.0.join("kdeglobals")).unwrap();
+        assert!(red.contains("AccentColor[$i]=255,0,0"));
+        assert!(rewrite_kdeglobals(&dir.0, &synced(None)));
+        let cleared = fs::read_to_string(dir.0.join("kdeglobals")).unwrap();
+        assert!(!cleared.contains("255,0,0"), "{cleared}");
     }
 
     #[test]
