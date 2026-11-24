@@ -258,6 +258,9 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
+    // A closed terminal or SSH session sends SIGHUP, whose default action would skip the
+    // session cleanup below.
+    let mut sighup = signal(SignalKind::hangup())?;
 
     let server_res = tokio::select! {
         res = quic::run_server(endpoint, server_creds, comp_handle, event_rx) => res,
@@ -267,6 +270,10 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
         }
         _ = sigint.recv() => {
             info!("received SIGINT; shutting down isolated session");
+            Ok(())
+        }
+        _ = sighup.recv() => {
+            info!("received SIGHUP; shutting down isolated session");
             Ok(())
         }
     };

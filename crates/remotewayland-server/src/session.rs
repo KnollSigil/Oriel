@@ -6,8 +6,10 @@
 //! `xdg-desktop-portal` processes, and applies a unified isolated environment
 //! to both GUI applications and remote PTYs.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, Permissions};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -149,6 +151,9 @@ pub struct SessionGuard {
     runtime_dir: PathBuf,
     dbus_address: Option<String>,
     children: Vec<Child>,
+    /// Exclusive `flock` on the session's lock file for the server's lifetime, telling
+    /// other servers' [`reap_stale_sessions`] that this session is live.
+    _lock: Option<fs::File>,
 }
 
 impl SessionGuard {
@@ -157,12 +162,20 @@ impl SessionGuard {
     /// their sockets inside the isolated session, and start a private D-Bus
     /// session bus.
     pub fn init(host_runtime_dir: &Path) -> Result<Self> {
+        reap_stale_sessions(host_runtime_dir);
         let runtime_dir =
-            host_runtime_dir.join(format!("remotewayland-session-{}", std::process::id()));
+            host_runtime_dir.join(format!("{SESSION_DIR_PREFIX}{}", std::process::id()));
         if runtime_dir.exists() {
             let _ = fs::remove_dir_all(&runtime_dir);
         }
         create_private_dir(&runtime_dir)?;
+        let lock = match lock_session_dir(&runtime_dir) {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                warn!(error = %err, "failed to lock session directory");
+                None
+            }
+        };
         create_private_dir(&runtime_dir.join("pulse"))?;
 
         // Point this server process (Smithay ListeningSocketSource, libpipewire)
@@ -237,6 +250,7 @@ impl SessionGuard {
             runtime_dir,
             dbus_address,
             children,
+            _lock: lock,
         })
     }
 
@@ -340,6 +354,12 @@ impl Drop for SessionGuard {
             let _ = child.wait();
         }
         crate::audio::shutdown_isolated_pipewire();
+        // Daemons the private bus started on demand (xdg-desktop-portal, the at-spi bus)
+        // are reparented to the user's systemd, not ours; stop them too.
+        terminate_processes(
+            &session_process_ids(&self.runtime_dir),
+            Duration::from_secs(2),
+        );
         if let Err(err) = fs::remove_dir_all(&self.runtime_dir) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(
@@ -349,6 +369,193 @@ impl Drop for SessionGuard {
                 );
             }
         }
+    }
+}
+
+/// Session runtime directories are `<host XDG_RUNTIME_DIR>/<prefix><server pid>`.
+const SESSION_DIR_PREFIX: &str = "remotewayland-session-";
+
+/// This user's processes (other than this one) running with `XDG_RUNTIME_DIR` set to the
+/// session `runtime_dir`: everything the session started, including daemons the private
+/// D-Bus activated, which inherit the bus's activation environment but not its parentage.
+fn session_process_ids(runtime_dir: &Path) -> Vec<libc::pid_t> {
+    let me = std::process::id() as libc::pid_t;
+    let mut wanted = b"XDG_RUNTIME_DIR=".to_vec();
+    wanted.extend_from_slice(runtime_dir.as_os_str().as_bytes());
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter(|&pid| pid != me)
+        .filter(|pid| {
+            // Other users' environments are unreadable, so they never match.
+            fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|&b| b == 0).any(|var| var == wanted))
+        })
+        .collect()
+}
+
+/// Whether `pid` has exited (or is a zombie waiting for its parent to reap it).
+fn process_gone(pid: libc::pid_t) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the parenthesized command name, which may contain spaces.
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with(['Z', 'X'])),
+        Err(_) => true,
+    }
+}
+
+/// Send `SIGTERM` to `pids`, then `SIGKILL` to those still running after `grace`.
+fn terminate_processes(pids: &[libc::pid_t], grace: Duration) {
+    if pids.is_empty() {
+        return;
+    }
+    for &pid in pids {
+        // SAFETY: kill(2) has no memory-safety preconditions.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + grace;
+    loop {
+        let remaining: Vec<_> = pids.iter().copied().filter(|&p| !process_gone(p)).collect();
+        if remaining.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            for pid in remaining {
+                // SAFETY: as above.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A session's lock file: its server holds an exclusive `flock` on it while it runs.
+const SESSION_LOCK_FILE: &str = ".lock";
+
+/// Create the session's lock file and take an exclusive `flock` on it, held as long as
+/// the returned file stays open. Rust opens files close-on-exec, so launched apps don't
+/// inherit the lock and can't keep a dead session looking live.
+fn lock_session_dir(runtime_dir: &Path) -> std::io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(runtime_dir.join(SESSION_LOCK_FILE))?;
+    // SAFETY: flock(2) on a file descriptor we own.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Whether the server of session directory `dir` (pid `server`) is still running: its
+/// lock file is locked. Sessions of servers from before lock files fall back to
+/// [`is_running_server`].
+fn session_is_live(dir: &Path, server: u32) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = fs::File::open(dir.join(SESSION_LOCK_FILE)) else {
+        return is_running_server(server);
+    };
+    // SAFETY: flock(2) on a file descriptor we own; closing it releases our lock.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0;
+    locked && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+}
+
+/// Whether `pid` is a running RemoteWayland server (its executable may have been replaced
+/// by an upgrade, which Linux reports as `remotewayland-server (deleted)`).
+fn is_running_server(pid: u32) -> bool {
+    fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| {
+        exe.file_name()
+            .is_some_and(|name| name.as_bytes().starts_with(b"remotewayland-server"))
+    })
+}
+
+/// The server pid of a session runtime directory `<host_runtime_dir>/<prefix><pid>`.
+fn session_dir_server_pid(host_runtime_dir: &Path, dir: &Path) -> Option<u32> {
+    if dir.parent()? != host_runtime_dir {
+        return None;
+    }
+    dir.file_name()?
+        .to_str()?
+        .strip_prefix(SESSION_DIR_PREFIX)?
+        .parse()
+        .ok()
+}
+
+/// This user's processes running in a session under `host_runtime_dir`, by session
+/// runtime directory (from their `XDG_RUNTIME_DIR`, whether or not it still exists).
+fn processes_by_session(host_runtime_dir: &Path) -> HashMap<PathBuf, Vec<libc::pid_t>> {
+    let me = std::process::id() as libc::pid_t;
+    let mut out: HashMap<PathBuf, Vec<libc::pid_t>> = HashMap::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return out;
+    };
+    for pid in entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter(|&pid| pid != me)
+    {
+        // Other users' environments are unreadable, so they are never included.
+        let Ok(env) = fs::read(format!("/proc/{pid}/environ")) else {
+            continue;
+        };
+        let Some(dir) = env
+            .split(|&b| b == 0)
+            .find_map(|var| var.strip_prefix(b"XDG_RUNTIME_DIR="))
+            .map(|dir| PathBuf::from(OsStr::from_bytes(dir)))
+        else {
+            continue;
+        };
+        if session_dir_server_pid(host_runtime_dir, &dir).is_some() {
+            out.entry(dir).or_default().push(pid);
+        }
+    }
+    out
+}
+
+/// Clean up sessions of servers that are no longer running: stop the processes still
+/// running in them and remove their runtime directories. A server killed outright
+/// (`SIGKILL`, a crash) leaves both behind; older servers also left daemons the private
+/// D-Bus activated, and daemonizing programs from remote terminals (tmux, zellij), whose
+/// sockets went away with the directory.
+fn reap_stale_sessions(host_runtime_dir: &Path) {
+    let mut sessions = processes_by_session(host_runtime_dir);
+    if let Ok(entries) = fs::read_dir(host_runtime_dir) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if session_dir_server_pid(host_runtime_dir, &dir).is_some() {
+                sessions.entry(dir).or_default();
+            }
+        }
+    }
+    for (dir, pids) in sessions {
+        let Some(server) = session_dir_server_pid(host_runtime_dir, &dir) else {
+            continue;
+        };
+        if server == std::process::id() || session_is_live(&dir, server) {
+            continue;
+        }
+        terminate_processes(&pids, Duration::from_secs(2));
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warn!(
+                path = %dir.display(),
+                error = %err,
+                "failed to remove stale session runtime directory"
+            ),
+        }
+        info!(
+            path = %dir.display(),
+            processes = pids.len(),
+            "cleaned up stale session of an exited server"
+        );
     }
 }
 
@@ -1608,6 +1815,85 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn session_processes_are_found_and_terminated() {
+        let host = TestTempDir::new("rw-reap-test");
+        let session = host.0.join(format!("{SESSION_DIR_PREFIX}999999999"));
+        create_private_dir(&session).unwrap();
+        // A daemon detached from us, like one the private bus activated.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env("XDG_RUNTIME_DIR", &session)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        // Its environment only shows the session once it has exec'd.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session_process_ids(&session).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session_process_ids(&session), vec![pid]);
+        assert!(session_process_ids(&host.0).is_empty());
+
+        // No server with that pid is running, so its session is stale.
+        reap_stale_sessions(&host.0);
+        let _ = child.wait();
+        assert!(process_gone(pid));
+        assert!(!session.exists());
+    }
+
+    #[test]
+    fn reap_stops_processes_of_removed_sessions() {
+        let host = TestTempDir::new("rw-reap-dirless-test");
+        // The session directory is already gone, as after an old server's clean exit.
+        let session = host.0.join(format!("{SESSION_DIR_PREFIX}999999998"));
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env("XDG_RUNTIME_DIR", &session)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !processes_by_session(&host.0).contains_key(&session) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(processes_by_session(&host.0)[&session], vec![pid]);
+        reap_stale_sessions(&host.0);
+        let _ = child.wait();
+        assert!(process_gone(pid));
+    }
+
+    #[test]
+    fn locked_sessions_are_live_whatever_their_server_binary() {
+        let host = TestTempDir::new("rw-session-lock-test");
+        // A pid that is no remotewayland-server: only the lock can say it's live.
+        let session = host.0.join(format!("{SESSION_DIR_PREFIX}999999997"));
+        create_private_dir(&session).unwrap();
+        let lock = lock_session_dir(&session).unwrap();
+        assert!(session_is_live(&session, 999_999_997));
+        reap_stale_sessions(&host.0);
+        assert!(session.exists(), "a locked session must not be reaped");
+
+        drop(lock);
+        assert!(!session_is_live(&session, 999_999_997));
+        reap_stale_sessions(&host.0);
+        assert!(!session.exists());
+    }
+
+    #[test]
+    fn reap_keeps_sessions_of_running_servers_and_other_dirs() {
+        let host = TestTempDir::new("rw-reap-keep-test");
+        let other = host.0.join("not-a-session");
+        let mine = host
+            .0
+            .join(format!("{SESSION_DIR_PREFIX}{}", std::process::id()));
+        create_private_dir(&other).unwrap();
+        create_private_dir(&mine).unwrap();
+        reap_stale_sessions(&host.0);
+        assert!(other.exists());
+        assert!(mine.exists());
     }
 
     #[test]
