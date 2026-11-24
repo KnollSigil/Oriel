@@ -51,9 +51,19 @@ else
     exit 1
 fi
 
-if [[ "${REBUILD_IMAGE}" -eq 1 ]] || ! "${RUNTIME[@]}" image exists "${IMAGE_NAME}" 2>/dev/null; then
+# Rebuild the image whenever the Containerfile changes, so new build
+# dependencies are picked up without needing --rebuild-image.
+CONTAINERFILE_HASH="$(sha256sum "${CONTAINERFILE}" | cut -d' ' -f1)"
+IMAGE_HASH="$("${RUNTIME[@]}" image inspect --format '{{ index .Config.Labels "containerfile-sha256" }}' "${IMAGE_NAME}" 2>/dev/null || true)"
+if [[ -n "${IMAGE_HASH}" && "${IMAGE_HASH}" != "${CONTAINERFILE_HASH}" ]]; then
+    echo "==> ${CONTAINERFILE##*/} changed since the image was built; rebuilding."
+    REBUILD_IMAGE=1
+fi
+
+if [[ "${REBUILD_IMAGE}" -eq 1 ]] || [[ -z "${IMAGE_HASH}" ]]; then
     echo "==> Building container image ${IMAGE_NAME}..."
-    "${RUNTIME[@]}" build --arch arm64 -t "${IMAGE_NAME}" -f "${CONTAINERFILE}" "${REPO_ROOT}/scripts"
+    "${RUNTIME[@]}" build --arch arm64 --label "containerfile-sha256=${CONTAINERFILE_HASH}" \
+        -t "${IMAGE_NAME}" -f "${CONTAINERFILE}" "${REPO_ROOT}/scripts"
 fi
 
 PROFILE_FLAG=()
@@ -73,12 +83,17 @@ if [[ -d "${HOME}/.cargo/registry" ]]; then
 fi
 
 CONTAINER_TARGET_DIR="/work/${TARGET_DIR#${REPO_ROOT}/}"
+# Keep intermediates (build scripts, proc-macros, deps) out of target/release:
+# host builds use the same unit hashes, so sharing it makes native and
+# container builds clobber each other and rebuild from scratch every time.
+CONTAINER_BUILD_DIR="${CONTAINER_TARGET_DIR}/aarch64-builder"
 
 run_cargo() {
     "${RUNTIME[@]}" run --rm --arch arm64 \
         -v "${REPO_ROOT}:/work" \
         "${CARGO_MOUNT[@]}" \
         -w /work \
+        -e CARGO_BUILD_BUILD_DIR="${CONTAINER_BUILD_DIR}" \
         "${IMAGE_NAME}" \
         cargo "$@" --target-dir "${CONTAINER_TARGET_DIR}"
 }
