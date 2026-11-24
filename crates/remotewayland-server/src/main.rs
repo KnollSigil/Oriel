@@ -239,6 +239,11 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
         "headless Wayland compositor ready"
     );
     session_guard.set_wayland_socket_and_start_portal(&comp_handle.socket_name);
+    // The initial command waits for this, so it reads settings from the session's portals
+    // instead of D-Bus-activating a portal without the session's configuration.
+    let _ = comp_handle
+        .cmd_tx
+        .send(compositor::CompositorCommand::SessionReady);
 
     let owns_control_sock = Arc::new(AtomicBool::new(false));
     let sock_creds = Arc::clone(&creds);

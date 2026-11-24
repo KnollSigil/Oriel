@@ -335,7 +335,17 @@ impl SessionGuard {
                 socket_name,
                 portal_dir.as_deref(),
             ) {
-                Ok(child) => self.children.push(child),
+                Ok(child) => {
+                    self.children.push(child);
+                    // Until the frontend owns its name, a portal call from an app would
+                    // D-Bus-activate a second frontend without the session's portals.conf.
+                    let idx = self.children.len() - 1;
+                    wait_for_portal_backends(
+                        &mut self.children,
+                        &[("org.freedesktop.portal.Desktop", idx)],
+                        Duration::from_secs(2),
+                    );
+                }
                 Err(err) => {
                     warn!(
                         error = %err,
@@ -695,7 +705,8 @@ fn build_gtk_modules(
     }
 }
 
-fn dbus_name_has_owner(bus_name: &str) -> bool {
+/// The process id of the connection owning `bus_name` on the isolated session bus.
+fn dbus_name_owner_pid(bus_name: &str) -> Option<u32> {
     let mut cmd = Command::new("gdbus");
     apply_session_env(&mut cmd, None);
     cmd.args([
@@ -708,15 +719,25 @@ fn dbus_name_has_owner(bus_name: &str) -> bool {
         "--object-path",
         "/org/freedesktop/DBus",
         "--method",
-        "org.freedesktop.DBus.NameHasOwner",
+        "org.freedesktop.DBus.GetConnectionUnixProcessID",
         bus_name,
     ])
     .stdin(Stdio::null())
-    .stderr(Stdio::null())
-    .output()
-    .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).contains("true"))
+    .stderr(Stdio::null());
+    let out = cmd.output().ok().filter(|out| out.status.success())?;
+    parse_gdbus_uint32(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Parse `gdbus call` output for a single `uint32` such as `(uint32 1234,)`.
+fn parse_gdbus_uint32(text: &str) -> Option<u32> {
+    let rest = &text[text.find("uint32 ")? + "uint32 ".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Wait until each portal process in `pending` (bus name, index into `children`) owns its
+/// bus name itself. Apps can D-Bus-activate a portal before ours starts; ours replaces it
+/// (`--replace`), so the name merely having an owner is not enough.
 fn wait_for_portal_backends(
     children: &mut [Child],
     pending: &[(&'static str, usize)],
@@ -729,13 +750,14 @@ fn wait_for_portal_backends(
     let deadline = Instant::now() + timeout;
     while !remaining.is_empty() && Instant::now() < deadline {
         remaining.retain(|&(bus_name, child_idx)| {
-            if let Some(child) = children.get_mut(child_idx) {
-                if let Ok(Some(status)) = child.try_wait() {
-                    warn!(bus_name, %status, "portal backend exited before owning D-Bus name");
-                    return false;
-                }
+            let Some(child) = children.get_mut(child_idx) else {
+                return false;
+            };
+            if let Ok(Some(status)) = child.try_wait() {
+                warn!(bus_name, %status, "portal backend exited before owning D-Bus name");
+                return false;
             }
-            !dbus_name_has_owner(bus_name)
+            dbus_name_owner_pid(bus_name) != Some(child.id())
         });
         if !remaining.is_empty() {
             std::thread::sleep(Duration::from_millis(50));
@@ -2188,6 +2210,13 @@ mod tests {
             ),
             "[Colors:View]\nBackgroundNormal=1\n\n[Colors:Selection]\nBackgroundNormal=2\n"
         );
+    }
+
+    #[test]
+    fn parses_gdbus_uint32() {
+        assert_eq!(parse_gdbus_uint32("(uint32 723919,)\n"), Some(723919));
+        assert_eq!(parse_gdbus_uint32("(uint32 0,)"), Some(0));
+        assert_eq!(parse_gdbus_uint32("Error: no owner"), None);
     }
 
     #[test]

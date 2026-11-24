@@ -229,6 +229,9 @@ pub enum CompositorEvent {
 /// Commands sent from the QUIC server loop to the headless compositor.
 #[derive(Debug)]
 pub enum CompositorCommand {
+    /// The isolated session (D-Bus, settings portal, xdg-desktop-portal) is up, so the
+    /// initial command can launch without racing the portals it reads settings from.
+    SessionReady,
     ConfigureWindow {
         window_id: WindowId,
         width: u32,
@@ -549,7 +552,13 @@ struct AppState {
     primary_owner: SelectionOwner,
     primary_text: Option<String>,
     pending_primary_mime: Option<String>,
+    /// The command to launch once [`Self::initial_x11_settled`] and
+    /// [`Self::initial_session_ready`] (see [`AppState::maybe_launch_initial_command`]).
     pending_initial_command: Vec<String>,
+    /// XWayland is ready, failed, or not used, so X11 apps find their `DISPLAY`.
+    initial_x11_settled: bool,
+    /// [`CompositorCommand::SessionReady`] arrived.
+    initial_session_ready: bool,
     start_time: Instant,
     /// Map from `WlSurface::id()` (`ObjectId`, unique across clients) -> WindowId (for toplevels & popups).
     surface_to_window: HashMap<ObjectId, WindowId>,
@@ -1010,6 +1019,10 @@ impl AppState {
                     }
                     self.update_output_and_xwayland_scale();
                 }
+            }
+            CompositorCommand::SessionReady => {
+                self.initial_session_ready = true;
+                self.maybe_launch_initial_command();
             }
             CompositorCommand::SetDisplayScale { scale_factor } => {
                 let scale = sanitize_scale(scale_factor);
@@ -1542,6 +1555,17 @@ impl AppState {
             }
         }
         events
+    }
+
+    /// Launch the initial command once XWayland has settled and the session is ready.
+    fn maybe_launch_initial_command(&mut self) {
+        if self.initial_x11_settled
+            && self.initial_session_ready
+            && !self.pending_initial_command.is_empty()
+        {
+            let cmd = std::mem::take(&mut self.pending_initial_command);
+            spawn_gui_command(&self.socket_name, &cmd);
+        }
     }
 
     fn recomposite_window(&mut self, window_id: WindowId, root_surface: &WlSurface) {
@@ -4176,18 +4200,14 @@ fn run_compositor_loop(
                                     );
                                 }
                             }
-                            if !state.pending_initial_command.is_empty() {
-                                let cmd = std::mem::take(&mut state.pending_initial_command);
-                                spawn_gui_command(&state.socket_name, &cmd);
-                            }
+                            state.initial_x11_settled = true;
+                            state.maybe_launch_initial_command();
                         }
                         XWaylandEvent::Error => {
                             warn!("XWayland exited unexpectedly; clearing X11 state and continuing Wayland-only");
                             state.cleanup_xwayland_state();
-                            if !state.pending_initial_command.is_empty() {
-                                let cmd = std::mem::take(&mut state.pending_initial_command);
-                                spawn_gui_command(&state.socket_name, &cmd);
-                            }
+                            state.initial_x11_settled = true;
+                            state.maybe_launch_initial_command();
                         }
                     }
                 }) {
@@ -4202,14 +4222,7 @@ fn run_compositor_loop(
         }
     }
 
-    let pending_initial_command = if xwayland_spawned {
-        command
-    } else {
-        if !command.is_empty() {
-            spawn_gui_command(&socket_name, &command);
-        }
-        Vec::new()
-    };
+    let pending_initial_command = command;
 
     let mut state = AppState {
         display_handle: dh.clone(),
@@ -4260,6 +4273,8 @@ fn run_compositor_loop(
         primary_text: None,
         pending_primary_mime: None,
         pending_initial_command,
+        initial_x11_settled: !xwayland_spawned,
+        initial_session_ready: false,
         start_time: Instant::now(),
         surface_to_window: HashMap::new(),
         surface_buffers: HashMap::new(),
@@ -4314,14 +4329,20 @@ fn run_compositor_loop(
     let _ = ready_tx.send(Ok(socket_name.clone()));
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-    let initial_cmd_deadline = Instant::now() + Duration::from_secs(3);
+    // Fallback if XWayland or the session never reports ready (portal startup waits up to
+    // a few seconds for its D-Bus names).
+    let initial_cmd_deadline = Instant::now() + Duration::from_secs(5);
     let mut last_frame_tick = Instant::now() - FRAME_INTERVAL;
 
     loop {
         let timeout = FRAME_INTERVAL.saturating_sub(last_frame_tick.elapsed());
         event_loop.dispatch(timeout, &mut state)?;
         if !state.pending_initial_command.is_empty() && Instant::now() >= initial_cmd_deadline {
-            warn!("XWayland startup timed out; launching initial command without waiting");
+            warn!(
+                xwayland_ready = state.initial_x11_settled,
+                session_ready = state.initial_session_ready,
+                "timed out waiting for XWayland/session startup; launching initial command anyway"
+            );
             let cmd = std::mem::take(&mut state.pending_initial_command);
             spawn_gui_command(&state.socket_name, &cmd);
         }
