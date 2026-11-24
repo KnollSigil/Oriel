@@ -1531,6 +1531,169 @@ pub fn session_runtime_dir() -> Option<PathBuf> {
         .map(|info| info.runtime_dir.clone())
 }
 
+/// Extra `flatpak run` options that let a sandboxed app see the session's synced desktop
+/// settings: the isolated config directory, read-only and first on the sandbox's
+/// `XDG_CONFIG_DIRS` (ahead of the app's own, see [`flatpak_config_dirs`]). Its `kdeglobals` palette is
+/// immutable (see `mark_palette_immutable`), so it beats the user's `kdeglobals` that KDE
+/// apps mount into their sandbox (`xdg-config/kdeglobals:ro`). KDE apps take most of their
+/// palette from the settings portal, but Breeze builds the toolbar/header colors from
+/// `kdeglobals` itself, and reloads them from it on every palette change.
+pub fn flatpak_run_options(run_args: &[&str]) -> Vec<String> {
+    let Some(dir) = SESSION_INFO
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .map(|info| info.portal_config_dir.clone())
+    else {
+        return Vec::new();
+    };
+    let dir = dir.display();
+    let config_dirs = flatpak_config_dirs(run_args);
+    vec![
+        format!("--filesystem={dir}:ro"),
+        format!("--env=XDG_CONFIG_DIRS={dir}:{config_dirs}"),
+    ]
+}
+
+/// flatpak's own `XDG_CONFIG_DIRS` for sandboxes that set none.
+const FLATPAK_DEFAULT_CONFIG_DIRS: &str = "/app/etc/xdg:/etc/xdg";
+
+/// The `XDG_CONFIG_DIRS` the app of a `flatpak run` (its arguments after `run`) would get
+/// without us: the user's then the system's `flatpak override`, the app's metadata, its
+/// runtime's metadata, else flatpak's default. Prepending to it keeps directories an app
+/// relies on.
+fn flatpak_config_dirs(run_args: &[&str]) -> String {
+    const KEY: &str = "XDG_CONFIG_DIRS";
+    let Some(app) = flatpak_run_app(run_args) else {
+        return FLATPAK_DEFAULT_CONFIG_DIRS.to_string();
+    };
+    let arch = run_args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--arch="))
+        .map(|arch| format!("--arch={arch}"));
+    let mut info = vec!["info", "--show-metadata"];
+    if let Some(arch) = &arch {
+        info.push(arch);
+    }
+    let app_meta = command_stdout("flatpak", &[info.as_slice(), &[app.as_str()]].concat());
+    let runtime_meta = app_meta
+        .as_deref()
+        .and_then(|meta| keyfile_value(meta, "Application", "runtime"))
+        .and_then(|runtime| {
+            command_stdout(
+                "flatpak",
+                &["info", "--show-metadata", &format!("runtime/{runtime}")],
+            )
+        });
+    let app_id = app.split("//").next().unwrap_or(&app);
+    [
+        command_stdout("flatpak", &["override", "--user", "--show", app_id]),
+        command_stdout("flatpak", &["override", "--show", app_id]),
+        app_meta,
+        runtime_meta,
+    ]
+    .iter()
+    .flatten()
+    .find_map(|meta| keyfile_value(meta, "Environment", KEY))
+    .unwrap_or_else(|| FLATPAK_DEFAULT_CONFIG_DIRS.to_string())
+}
+
+/// The app reference of `flatpak run` arguments: the first argument that is not an
+/// option (flatpak's options all take their value as `--option=value`), with
+/// `--branch=` appended as `app//branch`.
+fn flatpak_run_app(run_args: &[&str]) -> Option<String> {
+    let app = run_args.iter().find(|arg| !arg.starts_with('-'))?;
+    let branch = run_args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--branch="));
+    Some(match branch {
+        Some(branch) if !app.contains("//") => format!("{app}//{branch}"),
+        _ => app.to_string(),
+    })
+}
+
+/// The value of `key` in `[section]` of a keyfile (`key=value` or `key = value`).
+fn keyfile_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    let mut in_section = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_section = line == header;
+        } else if in_section {
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim() == key {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stdout of a short command, if it succeeds.
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Insert the options `options_for` builds (from the arguments after `run`) after `run`
+/// in a `flatpak run` argument list (`argv[0]` is the program); other commands are
+/// returned unchanged.
+pub fn with_flatpak_run_options(
+    argv: &[String],
+    options_for: impl FnOnce(&[&str]) -> Vec<String>,
+) -> Vec<String> {
+    let is_flatpak = argv
+        .first()
+        .is_some_and(|program| Path::new(program).file_name() == Some(OsStr::new("flatpak")));
+    let mut out = argv.to_vec();
+    if let Some(run) = is_flatpak
+        .then(|| argv.iter().position(|arg| arg == "run"))
+        .flatten()
+    {
+        let run_args: Vec<&str> = argv[run + 1..].iter().map(String::as_str).collect();
+        out.splice(run + 1..run + 1, options_for(&run_args));
+    }
+    out
+}
+
+/// [`with_flatpak_run_options`] for a `/bin/sh -c` command line: when it starts with
+/// `flatpak run` (as `.desktop` files of Flatpak apps do), insert the shell-quoted
+/// options after `run`, leaving the rest of the line as written.
+pub fn shell_with_flatpak_run_options(
+    exec: &str,
+    options_for: impl FnOnce(&[&str]) -> Vec<String>,
+) -> String {
+    let trimmed = exec.trim_start();
+    let mut words = trimmed.splitn(3, char::is_whitespace);
+    let (Some(program), Some("run")) = (words.next(), words.next()) else {
+        return exec.to_string();
+    };
+    if Path::new(program).file_name() != Some(OsStr::new("flatpak")) {
+        return exec.to_string();
+    }
+    let rest = words.next().unwrap_or("");
+    // .desktop Exec lines of Flatpak apps don't quote, so whitespace splitting is enough
+    // to find the app among the options.
+    let run_args: Vec<&str> = rest.split_whitespace().collect();
+    let options = options_for(&run_args);
+    if options.is_empty() {
+        return exec.to_string();
+    }
+    let quoted: Vec<String> = options
+        .iter()
+        .map(|opt| format!("'{}'", opt.replace('\'', "'\\''")))
+        .collect();
+    format!("{program} run {} {rest}", quoted.join(" "))
+        .trim_end()
+        .to_string()
+}
+
 /// Record the active XWayland `DISPLAY` and `XAUTHORITY` paths so subsequent
 /// GUI applications and remote PTYs automatically inherit them.
 pub fn set_x11_env(display: String, xauthority: Option<PathBuf>) {
@@ -2025,6 +2188,102 @@ mod tests {
             ),
             "[Colors:View]\nBackgroundNormal=1\n\n[Colors:Selection]\nBackgroundNormal=2\n"
         );
+    }
+
+    #[test]
+    fn flatpak_run_options_are_inserted_after_run() {
+        let opts = vec![
+            "--filesystem=/s/p:ro".to_string(),
+            "--env=A=b c".to_string(),
+        ];
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut seen = Vec::new();
+        assert_eq!(
+            with_flatpak_run_options(
+                &argv(&[
+                    "/usr/bin/flatpak",
+                    "run",
+                    "--branch=stable",
+                    "org.kde.kwrite"
+                ]),
+                |run_args| {
+                    seen = run_args.iter().map(|s| s.to_string()).collect();
+                    opts.clone()
+                }
+            ),
+            argv(&[
+                "/usr/bin/flatpak",
+                "run",
+                "--filesystem=/s/p:ro",
+                "--env=A=b c",
+                "--branch=stable",
+                "org.kde.kwrite"
+            ])
+        );
+        assert_eq!(seen, ["--branch=stable", "org.kde.kwrite"]);
+        assert_eq!(
+            with_flatpak_run_options(&argv(&["kwrite", "run"]), |_| opts.clone()),
+            argv(&["kwrite", "run"])
+        );
+        assert_eq!(
+            shell_with_flatpak_run_options(
+                "/usr/bin/flatpak run --branch=stable --command=kwrite org.kde.kwrite @@u %U @@",
+                |run_args| {
+                    assert_eq!(flatpak_run_app(run_args).as_deref(), Some("org.kde.kwrite//stable"));
+                    opts.clone()
+                }
+            ),
+            "/usr/bin/flatpak run '--filesystem=/s/p:ro' '--env=A=b c' --branch=stable --command=kwrite org.kde.kwrite @@u %U @@"
+        );
+        assert_eq!(
+            shell_with_flatpak_run_options("flatpak run org.x.Y", |_| vec![
+                "--env=it's".to_string()
+            ]),
+            "flatpak run '--env=it'\\''s' org.x.Y"
+        );
+        for unchanged in [
+            "kwrite %U",
+            "env A=1 flatpak run org.x.Y",
+            "flatpak info org.x.Y",
+            "flatpak",
+        ] {
+            assert_eq!(
+                shell_with_flatpak_run_options(unchanged, |_| opts.clone()),
+                unchanged
+            );
+        }
+    }
+
+    #[test]
+    fn reads_flatpak_metadata_keyfiles() {
+        let app = "[Application]\nname=org.x.Y\nruntime=org.kde.Platform/aarch64/6.11\n\n[Environment]\nXDG_CONFIG_DIRS=/app/share/xdg:/app/etc/xdg:/etc/xdg\n";
+        assert_eq!(
+            keyfile_value(app, "Environment", "XDG_CONFIG_DIRS").as_deref(),
+            Some("/app/share/xdg:/app/etc/xdg:/etc/xdg")
+        );
+        assert_eq!(
+            keyfile_value(app, "Application", "runtime").as_deref(),
+            Some("org.kde.Platform/aarch64/6.11")
+        );
+        // Runtime metadata spaces its `=`.
+        let runtime = "[Runtime]\nname = org.kde.Platform\n\n[Environment]\nQT_PLUGIN_PATH = /app/lib/plugins\n";
+        assert_eq!(
+            keyfile_value(runtime, "Environment", "QT_PLUGIN_PATH").as_deref(),
+            Some("/app/lib/plugins")
+        );
+        assert_eq!(
+            keyfile_value(runtime, "Environment", "XDG_CONFIG_DIRS"),
+            None
+        );
+        assert_eq!(
+            flatpak_run_app(&["--command=sh", "org.x.Y", "-c", "x"]).as_deref(),
+            Some("org.x.Y")
+        );
+        assert_eq!(
+            flatpak_run_app(&["--branch=beta", "org.x.Y//stable"]).as_deref(),
+            Some("org.x.Y//stable")
+        );
+        assert_eq!(flatpak_run_app(&["--verbose"]), None);
     }
 
     #[test]

@@ -4392,6 +4392,8 @@ fn spawn_gui_command(socket_name: &OsString, command: &[String]) {
     if let Err(err) = crate::audio::ensure_virtual_audio_devices() {
         tracing::warn!(error = %err, "failed to initialize isolated PipeWire audio session");
     }
+    let command =
+        crate::session::with_flatpak_run_options(command, crate::session::flatpak_run_options);
     let mut proc = Command::new(&command[0]);
     proc.args(&command[1..]);
     apply_gui_env(&mut proc, socket_name);
@@ -4431,6 +4433,9 @@ fn spawn_gui_shell(
     if let Err(err) = crate::audio::ensure_virtual_audio_devices() {
         tracing::warn!(error = %err, "failed to initialize isolated PipeWire audio session");
     }
+    let exec =
+        crate::session::shell_with_flatpak_run_options(exec, crate::session::flatpak_run_options);
+    let exec = exec.as_str();
     let mut proc = Command::new("/bin/sh");
     proc.arg("-c").arg(exec);
     apply_gui_env(&mut proc, socket_name);
