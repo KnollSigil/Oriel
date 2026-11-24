@@ -1,33 +1,41 @@
 //! A minimal `org.freedesktop.impl.portal.Settings` backend on the isolated session bus.
 //!
-//! It serves the `org.gnome.*` keys GTK apps need that the KDE portal does not, for
-//! servers without xdg-desktop-portal-gtk. GTK apps that read settings through the portal
-//! (GTK3 with `GTK_USE_PORTAL=1`, Flatpak apps such as Firefox and Chromium) otherwise:
+//! It serves the settings RemoteWayland decides itself, so every server presents the same
+//! values to apps whichever other portal backends it has:
 //!
-//! - fall back to GTK's built-in `menu:close` titlebar (close button only) without
-//!   `org.gnome.desktop.wm.preferences` `button-layout`;
-//! - draw UI text with no antialiasing at all (Chromium's tab titles, for one) without the
-//!   `org.gnome.desktop.interface` font rendering keys ([`FONT_SETTINGS`]).
+//! - `org.gnome.desktop.wm.preferences` `button-layout`, synced from the client. Without
+//!   it, GTK apps that read settings through the portal (GTK3 with `GTK_USE_PORTAL=1`,
+//!   Flatpak apps such as Firefox and Chromium) fall back to GTK's `menu:close` titlebar
+//!   on servers without xdg-desktop-portal-gtk, since the KDE portal serves no
+//!   `org.gnome.*` keys.
+//! - `org.gnome.desktop.interface` font rendering keys ([`FONT_SETTINGS`]). Without them,
+//!   the same apps draw UI text with no antialiasing at all (Chromium's tab titles).
+//! - Once the client syncs a color scheme, `org.freedesktop.appearance` `color-scheme` and
+//!   the matching `org.gnome.desktop.interface` `color-scheme` and `gtk-theme`.
 //!
-//! It is listed last for the Settings interface, so a running xdg-desktop-portal-gtk
-//! still takes precedence.
+//! It is listed first for the Settings interface. xdg-desktop-portal merges `ReadAll`
+//! per key with the first-listed backend winning, and `Read`/`ReadOne` return the first
+//! backend that has the key, so the KDE and GTK backends still serve every other key.
+//! xdg-desktop-portal forwards `SettingChanged` from every backend unfiltered, so the
+//! session writes the same values to the isolated GSettings keyfile that
+//! xdg-desktop-portal-gtk serves (see `session::write_desktop_settings`).
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 use zbus::blocking::Connection;
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::zvariant::{OwnedValue, Str, Value};
 
 /// Portal id used in `portals.conf` and the `.portal` file name.
 pub const PORTAL_ID: &str = "remotewayland";
 const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.remotewayland";
 const OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
 const INTERFACE: &str = "org.freedesktop.impl.portal.Settings";
-const WM_NAMESPACE: &str = "org.gnome.desktop.wm.preferences";
-const BUTTON_LAYOUT_KEY: &str = "button-layout";
+const APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
 const INTERFACE_NAMESPACE: &str = "org.gnome.desktop.interface";
+const WM_NAMESPACE: &str = "org.gnome.desktop.wm.preferences";
 
 /// `org.gnome.desktop.interface` font rendering keys and the values served: GNOME's
 /// defaults, with grayscale antialiasing since subpixel (`rgba`) rendering would not
@@ -43,8 +51,118 @@ pub const PORTAL_FILE: &str = "[portal]\n\
      DBusName=org.freedesktop.impl.portal.desktop.remotewayland\n\
      Interfaces=org.freedesktop.impl.portal.Settings;\n";
 
-static BUTTON_LAYOUT: Mutex<String> = Mutex::new(String::new());
+/// The desktop settings the session decides, as written to the isolated GSettings keyfile.
+pub struct DesktopSettings<'a> {
+    /// `None` until the client syncs a color scheme; the other backends' values stand.
+    pub appearance: Option<Appearance<'a>>,
+    pub button_layout: &'a str,
+}
+
+/// A client-synced color scheme in the forms apps read it.
+pub struct Appearance<'a> {
+    /// `org.freedesktop.appearance` `color-scheme`: `0` no preference, `1` dark, `2` light.
+    pub color_scheme: u32,
+    /// `org.gnome.desktop.interface` `color-scheme` (`default`, `prefer-dark`, ...).
+    pub gnome_color_scheme: &'a str,
+    pub gtk_theme: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Setting {
+    Str(String),
+    U32(u32),
+}
+
+impl Setting {
+    fn to_value(&self) -> Value<'_> {
+        match self {
+            Setting::Str(s) => Value::from(Str::from(s.as_str())),
+            Setting::U32(v) => Value::from(*v),
+        }
+    }
+
+    fn to_owned_value(&self) -> OwnedValue {
+        match self {
+            Setting::Str(s) => OwnedValue::from(Str::from(s.clone())),
+            Setting::U32(v) => OwnedValue::from(*v),
+        }
+    }
+}
+
+type Key = (&'static str, &'static str);
+
+/// The served settings by `(namespace, key)`.
+#[derive(Debug, Default)]
+struct SettingsStore {
+    settings: BTreeMap<Key, Setting>,
+}
+
+impl SettingsStore {
+    fn desired(desktop: &DesktopSettings) -> BTreeMap<Key, Setting> {
+        let mut out = BTreeMap::new();
+        for (key, value) in FONT_SETTINGS {
+            out.insert((INTERFACE_NAMESPACE, key), Setting::Str(value.to_string()));
+        }
+        out.insert(
+            (WM_NAMESPACE, "button-layout"),
+            Setting::Str(desktop.button_layout.to_string()),
+        );
+        if let Some(a) = &desktop.appearance {
+            out.insert(
+                (APPEARANCE_NAMESPACE, "color-scheme"),
+                Setting::U32(a.color_scheme),
+            );
+            out.insert(
+                (INTERFACE_NAMESPACE, "color-scheme"),
+                Setting::Str(a.gnome_color_scheme.to_string()),
+            );
+            out.insert(
+                (INTERFACE_NAMESPACE, "gtk-theme"),
+                Setting::Str(a.gtk_theme.to_string()),
+            );
+        }
+        out
+    }
+
+    /// Replace the served settings and return the keys whose value changed or appeared.
+    fn update(&mut self, desktop: &DesktopSettings) -> Vec<(Key, Setting)> {
+        let desired = Self::desired(desktop);
+        let changed = desired
+            .iter()
+            .filter(|(key, value)| self.settings.get(*key) != Some(*value))
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
+        self.settings = desired;
+        changed
+    }
+
+    fn read_all(&self, namespaces: &[String]) -> HashMap<String, HashMap<String, OwnedValue>> {
+        let mut out: HashMap<String, HashMap<String, OwnedValue>> = HashMap::new();
+        for ((namespace, key), value) in &self.settings {
+            if namespace_matches(namespaces, namespace) {
+                out.entry(namespace.to_string())
+                    .or_default()
+                    .insert(key.to_string(), value.to_owned_value());
+            }
+        }
+        out
+    }
+
+    fn read(&self, namespace: &str, key: &str) -> Option<OwnedValue> {
+        self.settings
+            .iter()
+            .find(|((ns, k), _)| *ns == namespace && *k == key)
+            .map(|(_, value)| value.to_owned_value())
+    }
+}
+
+/// Served settings; the session fills them in with [`update`] before the portal starts.
+static STORE: LazyLock<Mutex<SettingsStore>> = LazyLock::new(Mutex::default);
 static CONNECTION: OnceLock<Connection> = OnceLock::new();
+
+fn store() -> std::sync::MutexGuard<'static, SettingsStore> {
+    STORE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.freedesktop.portal.Error")]
@@ -55,18 +173,6 @@ enum PortalError {
 }
 
 struct SettingsPortal;
-
-fn button_layout_value() -> OwnedValue {
-    let layout = BUTTON_LAYOUT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    str_value(&layout)
-}
-
-fn str_value(value: &str) -> OwnedValue {
-    OwnedValue::from(zbus::zvariant::Str::from(value))
-}
 
 /// Whether `namespace` matches one of the `ReadAll` filters: an empty list or an empty
 /// pattern matches everything, and a trailing `*` matches by prefix.
@@ -82,38 +188,13 @@ fn namespace_matches(patterns: &[String], namespace: &str) -> bool {
 #[zbus::interface(name = "org.freedesktop.impl.portal.Settings")]
 impl SettingsPortal {
     fn read_all(&self, namespaces: Vec<String>) -> HashMap<String, HashMap<String, OwnedValue>> {
-        let mut out = HashMap::new();
-        if namespace_matches(&namespaces, WM_NAMESPACE) {
-            out.insert(
-                WM_NAMESPACE.to_string(),
-                HashMap::from([(BUTTON_LAYOUT_KEY.to_string(), button_layout_value())]),
-            );
-        }
-        if namespace_matches(&namespaces, INTERFACE_NAMESPACE) {
-            out.insert(
-                INTERFACE_NAMESPACE.to_string(),
-                FONT_SETTINGS
-                    .iter()
-                    .map(|&(key, value)| (key.to_string(), str_value(value)))
-                    .collect(),
-            );
-        }
-        out
+        store().read_all(&namespaces)
     }
 
     fn read(&self, namespace: &str, key: &str) -> Result<OwnedValue, PortalError> {
-        let font_value = (namespace == INTERFACE_NAMESPACE)
-            .then(|| FONT_SETTINGS.iter().find(|(k, _)| *k == key))
-            .flatten();
-        if namespace == WM_NAMESPACE && key == BUTTON_LAYOUT_KEY {
-            Ok(button_layout_value())
-        } else if let Some(&(_, value)) = font_value {
-            Ok(str_value(value))
-        } else {
-            Err(PortalError::NotFound(format!(
-                "Requested setting {namespace}.{key} not found"
-            )))
-        }
+        store().read(namespace, key).ok_or_else(|| {
+            PortalError::NotFound(format!("Requested setting {namespace}.{key} not found"))
+        })
     }
 
     #[zbus(property)]
@@ -122,16 +203,15 @@ impl SettingsPortal {
     }
 }
 
-/// Claim the backend's bus name on the isolated session bus and start serving
-/// `button_layout`. Must run before xdg-desktop-portal starts.
-pub fn start(dbus_address: &str, button_layout: &str) -> Result<()> {
+/// Claim the backend's bus name on the isolated session bus and start serving the
+/// settings last passed to [`update`]. Must run before xdg-desktop-portal starts.
+pub fn start(dbus_address: &str) -> Result<()> {
     if CONNECTION.get().is_some() {
         // A second connection would be dropped right away (releasing the bus name);
         // keep serving from the first one.
         warn!("settings portal backend already running; not starting another");
         return Ok(());
     }
-    *BUTTON_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = button_layout.to_string();
     let conn = zbus::blocking::connection::Builder::address(dbus_address)
         .context("invalid isolated D-Bus address")?
         .name(BUS_NAME)?
@@ -148,33 +228,35 @@ pub fn start(dbus_address: &str, button_layout: &str) -> Result<()> {
     Ok(())
 }
 
-/// Update the served `button-layout` and notify xdg-desktop-portal (and through it,
-/// running apps) of the change.
-pub fn set_button_layout(layout: &str) {
-    {
-        let mut current = BUTTON_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
-        if *current == layout {
-            return;
-        }
-        *current = layout.to_string();
-    }
+/// Serve `desktop` and notify xdg-desktop-portal (and through it, running apps) of every
+/// key that changed.
+pub fn update(desktop: &DesktopSettings) {
+    let changed = store().update(desktop);
     let Some(conn) = CONNECTION.get() else {
         return;
     };
-    if let Err(err) = conn.emit_signal(
-        None::<()>,
-        OBJECT_PATH,
-        INTERFACE,
-        "SettingChanged",
-        &(WM_NAMESPACE, BUTTON_LAYOUT_KEY, Value::from(layout)),
-    ) {
-        warn!(error = %err, "failed to emit settings portal SettingChanged");
+    for ((namespace, key), value) in changed {
+        if let Err(err) = conn.emit_signal(
+            None::<()>,
+            OBJECT_PATH,
+            INTERFACE,
+            "SettingChanged",
+            &(namespace, key, value.to_value()),
+        ) {
+            warn!(error = %err, namespace, key, "failed to emit settings portal SettingChanged");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn str_value(value: &str) -> OwnedValue {
+        OwnedValue::from(Str::from(value))
+    }
+
+    const LAYOUT: &str = "appmenu:minimize,maximize,close";
 
     #[test]
     fn namespace_matches_supports_globs() {
@@ -191,21 +273,65 @@ mod tests {
     }
 
     #[test]
-    fn serves_font_rendering_keys() {
-        let all = SettingsPortal.read_all(vec![INTERFACE_NAMESPACE.to_string()]);
+    fn serves_fonts_and_layout_before_a_color_scheme_syncs() {
+        let mut store = SettingsStore::default();
+        store.update(&DesktopSettings {
+            appearance: None,
+            button_layout: LAYOUT,
+        });
+        let all = store.read_all(&[INTERFACE_NAMESPACE.to_string()]);
         assert_eq!(
             all[INTERFACE_NAMESPACE]["font-antialiasing"],
             str_value("grayscale")
         );
+        assert!(!all[INTERFACE_NAMESPACE].contains_key("gtk-theme"));
         assert!(!all.contains_key(WM_NAMESPACE));
         assert_eq!(
-            SettingsPortal
-                .read(INTERFACE_NAMESPACE, "font-hinting")
-                .unwrap(),
-            str_value("slight")
+            store.read(WM_NAMESPACE, "button-layout"),
+            Some(str_value(LAYOUT))
         );
-        assert!(SettingsPortal
-            .read(INTERFACE_NAMESPACE, "font-name")
-            .is_err());
+        assert_eq!(
+            store.read(INTERFACE_NAMESPACE, "font-hinting"),
+            Some(str_value("slight"))
+        );
+        assert_eq!(store.read(APPEARANCE_NAMESPACE, "color-scheme"), None);
+        assert_eq!(store.read(INTERFACE_NAMESPACE, "font-name"), None);
+    }
+
+    #[test]
+    fn update_reports_only_changed_keys() {
+        let mut store = SettingsStore::default();
+        let dark = DesktopSettings {
+            appearance: Some(Appearance {
+                color_scheme: 1,
+                gnome_color_scheme: "prefer-dark",
+                gtk_theme: "Breeze-Dark",
+            }),
+            button_layout: LAYOUT,
+        };
+        assert_eq!(store.update(&dark).len(), 7);
+        assert_eq!(
+            store.read(APPEARANCE_NAMESPACE, "color-scheme"),
+            Some(OwnedValue::from(1u32))
+        );
+        assert!(store.update(&dark).is_empty());
+
+        let light = DesktopSettings {
+            appearance: Some(Appearance {
+                color_scheme: 2,
+                gnome_color_scheme: "prefer-light",
+                gtk_theme: "Breeze",
+            }),
+            button_layout: LAYOUT,
+        };
+        let changed: Vec<Key> = store.update(&light).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            changed,
+            vec![
+                (APPEARANCE_NAMESPACE, "color-scheme"),
+                (INTERFACE_NAMESPACE, "color-scheme"),
+                (INTERFACE_NAMESPACE, "gtk-theme"),
+            ]
+        );
     }
 }

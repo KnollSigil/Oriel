@@ -276,12 +276,9 @@ impl SessionGuard {
             );
 
             // Our own Settings backend must own its bus name before the frontend starts.
+            // It serves what `write_desktop_settings` last wrote.
             let portal_dir = self.dbus_address.as_deref().and_then(|addr| {
-                let layout = SESSION_INFO
-                    .get()
-                    .and_then(|lock| lock.lock().ok()?.button_layout.clone())
-                    .unwrap_or_else(|| DEFAULT_BUTTON_LAYOUT.to_string());
-                match crate::settings_portal::start(addr, &layout) {
+                match crate::settings_portal::start(addr) {
                     Ok(()) => prepare_portal_definitions_dir(&portal_config_dir),
                     Err(err) => {
                         warn!(error = %err, "settings portal backend not started");
@@ -583,11 +580,11 @@ fn prepare_portal_config_dir(portal_config_dir: &Path, backend: Option<&PortalBa
             Some(PortalBackend::Gtk(_)) => "gtk;kde",
             _ => "kde;gtk",
         };
-        // Route org.freedesktop.impl.portal.Settings to gtk first when available so our
-        // isolated GSettings keyfile drives live `color-scheme` and `gtk-theme` updates
-        // for GTK3/GTK4/Chromium/Firefox, while KDE handles FileChooser/OpenURI/etc.
-        // Our own backend comes last: it only fills in the titlebar `button-layout`, which
-        // the KDE portal does not serve (see `settings_portal`).
+        // Our own Settings backend comes first: xdg-desktop-portal takes each key from the
+        // first backend that has it, so the settings RemoteWayland decides (color scheme,
+        // titlebar buttons, font rendering) are the same on every server (see
+        // `settings_portal`). gtk then kde serve every other key, while KDE handles
+        // FileChooser/OpenURI/etc.
         let settings_pref = if find_gtk_portal_backend().is_some() {
             "gtk;kde"
         } else {
@@ -595,7 +592,7 @@ fn prepare_portal_config_dir(portal_config_dir: &Path, backend: Option<&PortalBa
         };
         let ours = crate::settings_portal::PORTAL_ID;
         let conf = format!(
-            "[preferred]\ndefault={pref}\norg.freedesktop.impl.portal.Settings={settings_pref};{ours}\n"
+            "[preferred]\ndefault={pref}\norg.freedesktop.impl.portal.Settings={ours};{settings_pref}\n"
         );
         if let Err(err) = write_file_atomic(&portal_conf_dir.join("portals.conf"), conf.as_bytes())
         {
@@ -836,6 +833,19 @@ fn start_xdg_desktop_portal(
     )
 }
 
+/// GNOME's `color-scheme` and `gtk-theme` for a client color scheme (`0` = no preference,
+/// `1` = prefer dark, `2` = prefer light).
+fn gnome_appearance(scheme: u32, has_breeze_gtk: bool) -> (&'static str, &'static str) {
+    match (scheme, has_breeze_gtk) {
+        (1, true) => ("prefer-dark", "Breeze-Dark"),
+        (1, false) => ("prefer-dark", "Adwaita-dark"),
+        (2, true) => ("prefer-light", "Breeze"),
+        (2, false) => ("prefer-light", "Adwaita"),
+        (_, true) => ("default", "Breeze"),
+        (_, false) => ("default", "Adwaita"),
+    }
+}
+
 /// Build the isolated GSettings keyfile. `scheme` is `None` until the client syncs a
 /// color scheme, in which case the interface keys are left at their schema defaults.
 fn format_gsettings_keyfile(
@@ -845,14 +855,7 @@ fn format_gsettings_keyfile(
 ) -> String {
     let mut out = String::new();
     if let Some(scheme) = scheme {
-        let (cs, theme) = match (scheme, has_breeze_gtk) {
-            (1, true) => ("prefer-dark", "Breeze-Dark"),
-            (1, false) => ("prefer-dark", "Adwaita-dark"),
-            (2, true) => ("prefer-light", "Breeze"),
-            (2, false) => ("prefer-light", "Adwaita"),
-            (_, true) => ("default", "Breeze"),
-            (_, false) => ("default", "Adwaita"),
-        };
+        let (cs, theme) = gnome_appearance(scheme, has_breeze_gtk);
         out.push_str(&format!(
             "[org/gnome/desktop/interface]\ncolor-scheme='{cs}'\ngtk-theme='{theme}'\n\n"
         ));
@@ -868,15 +871,28 @@ fn format_gsettings_keyfile(
 /// hides minimize and maximize; RemoteWayland windows support both, so show them.
 const DEFAULT_BUTTON_LAYOUT: &str = "appmenu:minimize,maximize,close";
 
-/// Write the isolated GTK settings that carry the color scheme and titlebar button layout:
-/// - the GSettings keyfile that xdg-desktop-portal-gtk serves to portal-using apps
-///   (GTK3 with `GTK_USE_PORTAL=1`, sandboxed apps, Chromium, Firefox);
+/// Apply the color scheme and titlebar button layout to everything that carries them:
+/// - our settings portal backend, which serves them to portal-using apps (GTK3 with
+///   `GTK_USE_PORTAL=1`, sandboxed apps, Chromium, Firefox) ahead of the other backends;
+/// - the GSettings keyfile that xdg-desktop-portal-gtk serves; it must agree with our
+///   backend, since xdg-desktop-portal forwards both backends' change signals;
 /// - `gtk-3.0`/`gtk-4.0` `settings.ini` (the dir is on apps' `XDG_CONFIG_DIRS`) for GTK
 ///   apps that read settings directly instead of through the portal.
 fn write_desktop_settings(portal_config_dir: &Path, scheme: Option<u32>, button_layout: &str) {
+    let has_breeze_gtk = find_xdg_data_path("themes/Breeze-Dark").is_some();
+    crate::settings_portal::update(&crate::settings_portal::DesktopSettings {
+        appearance: scheme.map(|scheme| {
+            let (gnome_color_scheme, gtk_theme) = gnome_appearance(scheme, has_breeze_gtk);
+            crate::settings_portal::Appearance {
+                color_scheme: scheme,
+                gnome_color_scheme,
+                gtk_theme,
+            }
+        }),
+        button_layout,
+    });
     let glib_dir = portal_config_dir.join("glib-2.0/settings");
     if create_private_dir(&glib_dir).is_ok() {
-        let has_breeze_gtk = find_xdg_data_path("themes/Breeze-Dark").is_some();
         let keyfile = format_gsettings_keyfile(scheme, has_breeze_gtk, button_layout);
         if let Err(err) = write_file_atomic(&glib_dir.join("keyfile"), keyfile.as_bytes()) {
             warn!(error = %err, "failed to update isolated GSettings keyfile");
@@ -1010,8 +1026,8 @@ pub fn apply_color_scheme(scheme: u32) {
         )
     };
 
-    // Update GSettings keyfile atomically for xdg-desktop-portal-gtk
-    // (drives live `color-scheme` and `gtk-theme` over org.freedesktop.portal.Settings).
+    // Serve `color-scheme` and `gtk-theme` from our settings portal backend (live over
+    // org.freedesktop.portal.Settings) and the GSettings keyfile for xdg-desktop-portal-gtk.
     write_desktop_settings(
         &portal_config_dir,
         Some(scheme),
@@ -1101,7 +1117,6 @@ pub fn apply_button_layout(layout: Option<&str>) {
 
     let effective = layout.unwrap_or(DEFAULT_BUTTON_LAYOUT);
     write_desktop_settings(&portal_config_dir, scheme, effective);
-    crate::settings_portal::set_button_layout(effective);
     info!(
         layout = effective,
         from_client = layout.is_some(),
