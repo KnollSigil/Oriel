@@ -1581,10 +1581,12 @@ impl AppState {
         let geometry = clamp_window_geometry(xdg_geo, root_log_w, root_log_h);
         let input_bounds = self.tree_input_bounds(root_surface, root_log_w, root_log_h);
         let (win_log_w, win_log_h) = (geometry.width, geometry.height);
-        let (win_phys_w, win_phys_h) = (surf_w, surf_h);
 
         let mut sub_info = Vec::new();
         let mut has_subsurfaces = false;
+        // Whether some subsurface renders at another scale than the root surface (Firefox:
+        // an integer-scale root surface for the shadow, fractional-scale content on top).
+        let mut mixed_scale = false;
         with_surface_tree_downward(
             root_surface,
             (0, 0),
@@ -1601,6 +1603,12 @@ impl AppState {
                     let dst_y = (ny as f64 * root_sy).round() as i32;
                     if surf != root_surface {
                         has_subsurfaces = true;
+                        let (log_w, log_h) = surface_logical_size_from_states(states, *sw, *sh);
+                        let sub_sx = *sw as f64 / log_w as f64;
+                        let sub_sy = *sh as f64 / log_h as f64;
+                        if (sub_sx - root_sx).abs() > 0.01 || (sub_sy - root_sy).abs() > 0.01 {
+                            mixed_scale = true;
+                        }
                     }
                     sub_info.push((surf == root_surface, *sw, *sh, dst_x, dst_y));
                 }
@@ -1609,6 +1617,28 @@ impl AppState {
             |_, _, _| {},
             |_, _, _| true,
         );
+
+        // Surfaces at mixed scales are composited at the client's display scale, so each
+        // is resampled at most once: the client shows the frame at that scale. Otherwise
+        // the root's own scale needs no resampling at all.
+        let (comp_sx, comp_sy) = if mixed_scale {
+            let scale = self
+                .windows
+                .get(&window_id)
+                .map(|w| w.scale_factor)
+                .unwrap_or(self.display_scale);
+            (scale, scale)
+        } else {
+            (root_sx, root_sy)
+        };
+        let (win_phys_w, win_phys_h) = if mixed_scale {
+            (
+                ((root_log_w as f64 * comp_sx).round() as u32).max(1),
+                ((root_log_h as f64 * comp_sy).round() as u32).max(1),
+            )
+        } else {
+            (surf_w, surf_h)
+        };
 
         let composite: Arc<Vec<u8>> = if !has_subsurfaces {
             // Zero-copy fast path for single-surface windows (most Wayland apps).
@@ -1629,14 +1659,14 @@ impl AppState {
                     if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id()) {
                         let (sub_log_w, sub_log_h) =
                             surface_logical_size_from_states(states, *sw, *sh);
-                        let dst_x = (nx as f64 * root_sx).round() as i32;
-                        let dst_y = (ny as f64 * root_sy).round() as i32;
+                        let dst_x = (nx as f64 * comp_sx).round() as i32;
+                        let dst_y = (ny as f64 * comp_sy).round() as i32;
                         let (dst_w, dst_h) = if surf == root_surface {
-                            (*sw, *sh)
+                            (win_phys_w, win_phys_h)
                         } else {
                             (
-                                ((sub_log_w as f64 * root_sx).round() as u32).max(1),
-                                ((sub_log_h as f64 * root_sy).round() as u32).max(1),
+                                ((sub_log_w as f64 * comp_sx).round() as u32).max(1),
+                                ((sub_log_h as f64 * comp_sy).round() as u32).max(1),
                             )
                         };
                         if dst_w == *sw && dst_h == *sh {
