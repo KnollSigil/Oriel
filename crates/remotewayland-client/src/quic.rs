@@ -10,10 +10,11 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use quinn::{ClientConfig, ConnectionError, Endpoint, TransportConfig, VarInt};
 use remotewayland_proto::{
-    read_audio_packet, read_control_message, read_stream_header, read_video_frame,
-    write_audio_packet, write_control_message, write_protocol_preamble, write_stream_header,
-    AudioPacketHeader, ClientRole, ControlMessage, LaunchState, RemoteAppEntry, StreamHeader,
-    VideoCodec, WindowId, CLOSE_CODE_PROTOCOL_MISMATCH, CLOSE_CODE_SUPERSEDED,
+    is_valid_button_layout, read_audio_packet, read_control_message, read_stream_header,
+    read_video_frame, write_audio_packet, write_control_message, write_protocol_preamble,
+    write_stream_header, AudioPacketHeader, ClientRole, ControlMessage, LaunchState,
+    RemoteAppEntry, StreamHeader, VideoCodec, WindowId, CLOSE_CODE_PROTOCOL_MISMATCH,
+    CLOSE_CODE_SUPERSEDED,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -340,9 +341,10 @@ pub async fn run_client(
         })
     });
 
-    // Task: query and monitor local XDG portal `color-scheme` and forward changes to the server.
-    let (theme_tx, mut theme_rx) = mpsc::unbounded_channel::<u32>();
-    let color_scheme_task = tokio::spawn(watch_local_color_scheme(theme_tx));
+    // Task: query and monitor local desktop settings (`color-scheme`, titlebar `button-layout`)
+    // and forward changes to the server.
+    let (theme_tx, mut theme_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    let color_scheme_task = tokio::spawn(watch_local_desktop_settings(theme_tx));
 
     // Per-window decoded video frame acknowledgments for end-to-end in-flight frame pacing.
     let (frame_ack_tx, mut frame_ack_rx) = mpsc::unbounded_channel::<(WindowId, u64)>();
@@ -356,7 +358,7 @@ pub async fn run_client(
                     Some(m) => m,
                     None => break,
                 },
-                Some(scheme) = theme_rx.recv() => ControlMessage::ColorScheme { scheme },
+                Some(msg) = theme_rx.recv() => msg,
                 Some((window_id, pts_ns)) = frame_ack_rx.recv() => ControlMessage::FrameAck {
                     window_id,
                     pts_ns,
@@ -844,11 +846,53 @@ fn find_on_path(binary: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-async fn query_local_color_scheme() -> Option<u32> {
-    use tokio::process::Command;
+/// Parse a GNOME `button-layout` string from `gdbus call` (`(<<'a:b,c'>>,)`) or
+/// `gsettings get` (`'a:b,c'`) output. Returns `None` unless it looks like a layout.
+fn parse_button_layout(text: &str) -> Option<String> {
+    let start = text.find('\'')? + 1;
+    let len = text[start..].find('\'')?;
+    let layout = &text[start..start + len];
+    is_valid_button_layout(layout).then(|| layout.to_string())
+}
 
-    let fut = Command::new("gdbus")
-        .args([
+/// GNOME's `org.gnome.desktop.wm.preferences` `button-layout` schema default.
+const GNOME_DEFAULT_BUTTON_LAYOUT: &str = "appmenu:close";
+
+/// Whether `XDG_CURRENT_DESKTOP` (a `:`-separated list) names GNOME.
+fn is_gnome_desktop(current_desktop: Option<&str>) -> bool {
+    current_desktop.is_some_and(|d| d.split(':').any(|e| e.eq_ignore_ascii_case("gnome")))
+}
+
+/// Decide whether a locally read layout reflects the user's desktop. Outside GNOME, the
+/// portal and `gsettings` report GNOME's schema default when nothing set the key; that
+/// value would hide minimize/maximize on the server, so treat it as "no preference" and
+/// keep the server default.
+fn effective_button_layout(layout: String, gnome: bool) -> Option<String> {
+    (gnome || layout != GNOME_DEFAULT_BUTTON_LAYOUT).then_some(layout)
+}
+
+/// Run a short-lived command and return its stdout if it exits successfully within 5s.
+async fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let fut = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .ok()?
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn read_portal_setting(namespace: &str, key: &str) -> Option<String> {
+    command_stdout(
+        "gdbus",
+        &[
             "call",
             "--session",
             "--dest",
@@ -857,42 +901,143 @@ async fn query_local_color_scheme() -> Option<u32> {
             "/org/freedesktop/portal/desktop",
             "--method",
             "org.freedesktop.portal.Settings.Read",
-            "org.freedesktop.appearance",
-            "color-scheme",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
+            namespace,
+            key,
+        ],
+    )
+    .await
+}
 
-    let output = tokio::time::timeout(Duration::from_secs(5), fut)
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+async fn query_local_color_scheme() -> Option<u32> {
+    let stdout = read_portal_setting("org.freedesktop.appearance", "color-scheme").await?;
     parse_gdbus_color_scheme(&stdout)
 }
 
-async fn watch_local_color_scheme(tx: mpsc::UnboundedSender<u32>) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::process::Command;
+/// Read the local titlebar button layout from the settings portal, else straight from
+/// GSettings. Returns `None` if neither could be read, and `Some(None)` when the desktop
+/// has no real preference (see [`effective_button_layout`]).
+async fn query_local_button_layout() -> Option<Option<String>> {
+    const SCHEMA: &str = "org.gnome.desktop.wm.preferences";
+    let layout = match read_portal_setting(SCHEMA, "button-layout")
+        .await
+        .as_deref()
+        .and_then(parse_button_layout)
+    {
+        Some(layout) => layout,
+        None => command_stdout("gsettings", &["get", SCHEMA, "button-layout"])
+            .await
+            .as_deref()
+            .and_then(parse_button_layout)?,
+    };
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+    Some(effective_button_layout(
+        layout,
+        is_gnome_desktop(desktop.as_deref()),
+    ))
+}
 
-    // 1. Query initial color-scheme from the local session portal.
-    let mut last_sent_scheme: Option<u32> = None;
-    if let Some(scheme) = query_local_color_scheme().await {
-        info!(scheme, "syncing initial local color-scheme to server");
-        if tx.send(scheme).is_err() {
-            return;
+/// Tracks the last desktop settings sent to the server and sends only changes.
+#[derive(Default)]
+struct DesktopSettingsSync {
+    scheme: Option<u32>,
+    /// Last layout sent: `None` until the first send, `Some(None)` for "no preference".
+    button_layout: Option<Option<String>>,
+}
+
+impl DesktopSettingsSync {
+    /// Send `scheme` if it changed. Returns `false` once the receiver is gone.
+    fn send_scheme(&mut self, tx: &mpsc::UnboundedSender<ControlMessage>, scheme: u32) -> bool {
+        if self.scheme == Some(scheme) {
+            return true;
         }
-        last_sent_scheme = Some(scheme);
+        info!(scheme, "syncing local color-scheme to server");
+        self.scheme = Some(scheme);
+        tx.send(ControlMessage::ColorScheme { scheme }).is_ok()
     }
 
-    // 2. Watch for live theme/palette changes on the local session D-Bus:
-    //    - `org.freedesktop.portal.Settings.SettingChanged` (GNOME / KDE / standard XDG portal)
-    //    - `org.kde.KGlobalSettings.notifyChange` (KDE Plasma palette/color-scheme switches)
+    /// Send `layout` (`None` = no preference) if it changed. Returns `false` once the
+    /// receiver is gone.
+    fn send_button_layout(
+        &mut self,
+        tx: &mpsc::UnboundedSender<ControlMessage>,
+        layout: Option<String>,
+    ) -> bool {
+        if self.button_layout.as_ref() == Some(&layout) {
+            return true;
+        }
+        match &layout {
+            Some(layout) => info!(%layout, "syncing local titlebar button layout to server"),
+            None => info!("no local titlebar button layout preference; using server default"),
+        }
+        self.button_layout = Some(layout.clone());
+        tx.send(ControlMessage::ButtonLayout { layout }).is_ok()
+    }
+
+    /// Re-query the requested settings (concurrently) and send those that changed.
+    /// On the `initial` sync an unreadable button layout counts as "no preference", so
+    /// the server drops any layout a previous client synced. Returns `false` once the
+    /// receiver is gone.
+    async fn sync(
+        &mut self,
+        tx: &mpsc::UnboundedSender<ControlMessage>,
+        scheme: bool,
+        button_layout: bool,
+        initial: bool,
+    ) -> bool {
+        let (new_scheme, new_layout) = tokio::join!(
+            async {
+                if scheme {
+                    query_local_color_scheme().await
+                } else {
+                    None
+                }
+            },
+            async {
+                if button_layout {
+                    query_local_button_layout().await
+                } else {
+                    None
+                }
+            },
+        );
+        if let Some(scheme) = new_scheme {
+            if !self.send_scheme(tx, scheme) {
+                return false;
+            }
+        }
+        let new_layout = if initial && button_layout {
+            Some(new_layout.flatten())
+        } else {
+            new_layout
+        };
+        if let Some(layout) = new_layout {
+            if !self.send_button_layout(tx, layout) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Which settings a line of `dbus-monitor` / `gdbus monitor` output says changed,
+/// as `(color_scheme, button_layout)`.
+fn monitor_line_triggers(line: &str, using_dbus_monitor: bool) -> (bool, bool) {
+    let layout = line.contains("button-layout");
+    let scheme = if using_dbus_monitor {
+        // dbus-monitor prints signal arguments on separate lines.
+        line.contains("member=notifyChange") || line.contains("color-scheme")
+    } else {
+        line.contains("org.freedesktop.appearance") && line.contains("color-scheme")
+    };
+    (scheme, layout)
+}
+
+fn spawn_settings_monitor() -> Option<(tokio::process::Child, bool)> {
+    use tokio::process::Command;
+
+    // Watch for live setting changes on the local session D-Bus:
+    // - `org.freedesktop.portal.Settings.SettingChanged` (GNOME / KDE / standard XDG portal)
+    // - `org.kde.KGlobalSettings.notifyChange` (KDE Plasma palette/color-scheme switches)
     let dbus_monitor = find_on_path("dbus-monitor");
     let stdbuf = find_on_path("stdbuf");
     let using_dbus_monitor = dbus_monitor.is_some();
@@ -932,28 +1077,46 @@ async fn watch_local_color_scheme(tx: mpsc::UnboundedSender<u32>) {
         }
     };
 
-    let mut child = match cmd
+    match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
     {
-        Ok(c) => c,
+        Ok(child) => Some((child, using_dbus_monitor)),
         Err(err) => {
-            warn!(error = %err, "local color-scheme watcher unavailable");
-            return;
+            warn!(error = %err, "local desktop-settings watcher unavailable");
+            None
         }
-    };
+    }
+}
 
+async fn watch_local_desktop_settings(tx: mpsc::UnboundedSender<ControlMessage>) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // 1. Start the change monitor before the initial query so a change made while the
+    //    query runs is still seen (its line is buffered in the pipe until we read it).
+    let monitor = spawn_settings_monitor();
+
+    // 2. Query and send the initial settings.
+    let mut synced = DesktopSettingsSync::default();
+    if !synced.sync(&tx, true, true, true).await {
+        return;
+    }
+
+    let Some((mut child, using_dbus_monitor)) = monitor else {
+        return;
+    };
     let Some(stdout) = child.stdout.take() else {
         return;
     };
     let mut lines = BufReader::new(stdout).lines();
 
     // Trailing-edge debounce: wait 80ms after the last trigger line so KDE/portal
-    // finishes updating its cached color-scheme before we re-query.
-    let mut pending_sync = false;
+    // finishes updating its cached settings before we re-query.
+    let mut pending_scheme = false;
+    let mut pending_layout = false;
     let debounce = tokio::time::sleep(Duration::from_secs(3600));
     tokio::pin!(debounce);
 
@@ -962,39 +1125,31 @@ async fn watch_local_color_scheme(tx: mpsc::UnboundedSender<u32>) {
             line_res = lines.next_line() => {
                 match line_res {
                     Ok(Some(line)) => {
-                        let triggered = if using_dbus_monitor {
-                            line.contains("member=notifyChange") || line.contains("color-scheme")
-                        } else {
-                            line.contains("org.freedesktop.appearance")
-                                && line.contains("color-scheme")
-                        };
-                        if triggered {
-                            pending_sync = true;
+                        let (scheme, layout) = monitor_line_triggers(&line, using_dbus_monitor);
+                        if scheme || layout {
+                            pending_scheme |= scheme;
+                            pending_layout |= layout;
                             debounce
                                 .as_mut()
                                 .reset(tokio::time::Instant::now() + Duration::from_millis(80));
                         }
                     }
                     Ok(None) => {
-                        tracing::debug!("local color-scheme watcher stream closed");
+                        tracing::debug!("local desktop-settings watcher stream closed");
                         break;
                     }
                     Err(err) => {
-                        warn!(error = %err, "local color-scheme watcher read error");
+                        warn!(error = %err, "local desktop-settings watcher read error");
                         break;
                     }
                 }
             }
-            () = &mut debounce, if pending_sync => {
-                pending_sync = false;
-                if let Some(scheme) = query_local_color_scheme().await {
-                    if last_sent_scheme != Some(scheme) {
-                        last_sent_scheme = Some(scheme);
-                        info!(scheme, "local color-scheme/palette changed; syncing to server");
-                        if tx.send(scheme).is_err() {
-                            break;
-                        }
-                    }
+            () = &mut debounce, if pending_scheme || pending_layout => {
+                let (scheme, layout) = (pending_scheme, pending_layout);
+                pending_scheme = false;
+                pending_layout = false;
+                if !synced.sync(&tx, scheme, layout, false).await {
+                    break;
                 }
             }
         }
@@ -1019,5 +1174,80 @@ mod tests {
         assert_eq!(parse_gdbus_color_scheme("(<<2>>,)"), Some(2));
         assert_eq!(parse_gdbus_color_scheme("(<<uint32 9>>,)"), None);
         assert_eq!(parse_gdbus_color_scheme("unrelated"), None);
+    }
+
+    #[test]
+    fn parse_button_layout_accepts_portal_and_gsettings_output() {
+        assert_eq!(
+            parse_button_layout("(<<'appmenu:minimize,maximize,close'>>,)\n").as_deref(),
+            Some("appmenu:minimize,maximize,close")
+        );
+        assert_eq!(
+            parse_button_layout("'icon:minimize,maximize,close'\n").as_deref(),
+            Some("icon:minimize,maximize,close")
+        );
+        assert_eq!(
+            parse_button_layout("'close,minimize:'").as_deref(),
+            Some("close,minimize:")
+        );
+        assert_eq!(parse_button_layout("(<<''>>,)"), None);
+        assert_eq!(parse_button_layout("'evil\ninjection:close'"), None);
+        assert_eq!(parse_button_layout("unrelated"), None);
+    }
+
+    #[test]
+    fn effective_button_layout_drops_gnome_default_outside_gnome() {
+        assert!(is_gnome_desktop(Some("GNOME")));
+        assert!(is_gnome_desktop(Some("ubuntu:GNOME")));
+        assert!(!is_gnome_desktop(Some("KDE")));
+        assert!(!is_gnome_desktop(Some("sway")));
+        assert!(!is_gnome_desktop(None));
+
+        let default = || GNOME_DEFAULT_BUTTON_LAYOUT.to_string();
+        assert_eq!(effective_button_layout(default(), true), Some(default()));
+        assert_eq!(effective_button_layout(default(), false), None);
+        assert_eq!(
+            effective_button_layout("icon:minimize,maximize,close".into(), false).as_deref(),
+            Some("icon:minimize,maximize,close")
+        );
+    }
+
+    #[test]
+    fn monitor_line_triggers_only_the_changed_setting() {
+        // dbus-monitor: arguments arrive on their own lines.
+        assert_eq!(
+            monitor_line_triggers("   string \"color-scheme\"", true),
+            (true, false)
+        );
+        assert_eq!(
+            monitor_line_triggers("   string \"button-layout\"", true),
+            (false, true)
+        );
+        assert_eq!(
+            monitor_line_triggers(
+                "signal time=1 sender=:1.5 -> destination=(null destination) path=/KGlobalSettings; interface=org.kde.KGlobalSettings; member=notifyChange",
+                true
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            monitor_line_triggers("   string \"gtk-theme\"", true),
+            (false, false)
+        );
+        // gdbus monitor: one line per signal.
+        assert_eq!(
+            monitor_line_triggers(
+                "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged ('org.gnome.desktop.wm.preferences', 'button-layout', <'close:'>)",
+                false
+            ),
+            (false, true)
+        );
+        assert_eq!(
+            monitor_line_triggers(
+                "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged ('org.freedesktop.appearance', 'color-scheme', <uint32 1>)",
+                false
+            ),
+            (true, false)
+        );
     }
 }

@@ -650,6 +650,20 @@ async fn run_display_session(
             }
         }
     });
+    // Same for ButtonLayout updates.
+    let (button_layout_tx, mut button_layout_rx) =
+        tokio::sync::watch::channel::<Option<Option<String>>>(None);
+    tokio::spawn(async move {
+        while button_layout_rx.changed().await.is_ok() {
+            let layout_opt = button_layout_rx.borrow_and_update().clone();
+            if let Some(layout) = layout_opt {
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::session::apply_button_layout(layout.as_deref());
+                })
+                .await;
+            }
+        }
+    });
 
     // Dedicated control-stream reader task: `read_control_message` performs multiple
     // `read_exact` calls and is NOT cancel-safe inside `tokio::select!`. Running it in its
@@ -818,6 +832,9 @@ async fn run_display_session(
                     }
                     Some(ControlMessage::ColorScheme { scheme }) => {
                         let _ = color_scheme_tx.send(Some(scheme));
+                    }
+                    Some(ControlMessage::ButtonLayout { layout }) => {
+                        let _ = button_layout_tx.send(Some(layout));
                     }
                     Some(ControlMessage::FrameAck { window_id, pts_ns }) => {
                         fwd.ack_frame(window_id, pts_ns);

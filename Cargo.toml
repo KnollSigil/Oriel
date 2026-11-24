@@ -43,4 +43,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wgpu = { version = "30.0", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl"] }
+zbus = "5"
 remotewayland-proto = { path = "crates/remotewayland-proto" }

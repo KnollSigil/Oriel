@@ -7,7 +7,19 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 11;
+
+/// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
+/// or `close,minimize` with no `:` for left-side buttons only) for
+/// [`ControlMessage::ButtonLayout`]. The allowed characters keep the value safe to embed in
+/// GSettings keyfile and GTK `settings.ini` values (no quotes, escapes or newlines).
+pub fn is_valid_button_layout(layout: &str) -> bool {
+    !layout.is_empty()
+        && layout.len() <= 256
+        && layout
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | ',' | '-' | '_'))
+}
 
 /// Magic bytes that open the control-stream preamble (see [`write_protocol_preamble`]).
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"RWLD";
@@ -428,6 +440,11 @@ pub enum ControlMessage {
     /// Client -> Server: updates the session's active display scale factor (>= 1.0)
     /// used for virtual `wl_output` fallback and global XWayland HiDPI scaling.
     DisplayScale { scale_factor: f64 },
+    /// Client -> Server: GNOME `org.gnome.desktop.wm.preferences` `button-layout`
+    /// (e.g. `appmenu:minimize,maximize,close`) so remote apps draw the same
+    /// titlebar buttons as local ones. `None` means the client's desktop has no
+    /// preference, and the server uses its default layout.
+    ButtonLayout { layout: Option<String> },
 }
 
 /// Header preceding each encoded video access unit on a per-window video stream.
@@ -829,6 +846,10 @@ mod tests {
             pts_ns: 123_456_789,
         };
         let display_scale = ControlMessage::DisplayScale { scale_factor: 1.5 };
+        let button_layout = ControlMessage::ButtonLayout {
+            layout: Some("appmenu:minimize,maximize,close".to_string()),
+        };
+        let no_button_layout = ControlMessage::ButtonLayout { layout: None };
 
         write_control_message(&mut tx, &primary).await.unwrap();
         write_control_message(&mut tx, &cursor).await.unwrap();
@@ -837,6 +858,12 @@ mod tests {
         write_control_message(&mut tx, &kbd_leave).await.unwrap();
         write_control_message(&mut tx, &frame_ack).await.unwrap();
         write_control_message(&mut tx, &display_scale)
+            .await
+            .unwrap();
+        write_control_message(&mut tx, &button_layout)
+            .await
+            .unwrap();
+        write_control_message(&mut tx, &no_button_layout)
             .await
             .unwrap();
         drop(tx);
@@ -869,7 +896,29 @@ mod tests {
             read_control_message(&mut rx).await.unwrap().unwrap(),
             display_scale
         );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            button_layout
+        );
+        assert_eq!(
+            read_control_message(&mut rx).await.unwrap().unwrap(),
+            no_button_layout
+        );
         assert!(read_control_message(&mut rx).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn is_valid_button_layout_rejects_unsafe_values() {
+        assert!(is_valid_button_layout("appmenu:minimize,maximize,close"));
+        assert!(is_valid_button_layout("close,minimize:"));
+        assert!(is_valid_button_layout(":"));
+        assert!(is_valid_button_layout("close,minimize,maximize"));
+        assert!(!is_valid_button_layout(""));
+        assert!(!is_valid_button_layout("x:close'\n[evil]"));
+        assert!(!is_valid_button_layout(&format!(
+            "{}:close",
+            "a".repeat(300)
+        )));
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ mod media;
 mod pty;
 mod quic;
 mod session;
+mod settings_portal;
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;

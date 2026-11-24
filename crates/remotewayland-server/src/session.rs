@@ -30,7 +30,12 @@ pub struct SessionEnvInfo {
     pub xdg_current_desktop: Option<String>,
     pub gtk_modules: Option<String>,
     pub color_scheme: Option<u32>,
+    /// Client-synced `org.gnome.desktop.wm.preferences` `button-layout`.
+    pub button_layout: Option<String>,
 }
+
+/// Serializes writers of the isolated portal config files (GSettings keyfile, kdeglobals).
+static PORTAL_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 static SESSION_INFO: OnceLock<Mutex<SessionEnvInfo>> = OnceLock::new();
 
@@ -188,6 +193,7 @@ impl SessionGuard {
             xdg_current_desktop: xdg_current_desktop.clone(),
             gtk_modules: gtk_modules.clone(),
             color_scheme: None,
+            button_layout: None,
         };
         let _ = SESSION_INFO.set(Mutex::new(info));
 
@@ -269,7 +275,27 @@ impl SessionGuard {
                 Duration::from_millis(800),
             );
 
-            match start_xdg_desktop_portal(&self.runtime_dir, &portal_config_dir, socket_name) {
+            // Our own Settings backend must own its bus name before the frontend starts.
+            let portal_dir = self.dbus_address.as_deref().and_then(|addr| {
+                let layout = SESSION_INFO
+                    .get()
+                    .and_then(|lock| lock.lock().ok()?.button_layout.clone())
+                    .unwrap_or_else(|| DEFAULT_BUTTON_LAYOUT.to_string());
+                match crate::settings_portal::start(addr, &layout) {
+                    Ok(()) => prepare_portal_definitions_dir(&portal_config_dir),
+                    Err(err) => {
+                        warn!(error = %err, "settings portal backend not started");
+                        None
+                    }
+                }
+            });
+
+            match start_xdg_desktop_portal(
+                &self.runtime_dir,
+                &portal_config_dir,
+                socket_name,
+                portal_dir.as_deref(),
+            ) {
                 Ok(child) => self.children.push(child),
                 Err(err) => {
                     warn!(
@@ -546,6 +572,11 @@ fn prepare_portal_config_dir(portal_config_dir: &Path, backend: Option<&PortalBa
         }
     }
 
+    // Seed the titlebar button layout before the portal starts so apps get minimize and
+    // maximize even if the client never syncs its own layout. The color scheme and theme
+    // stay unset (schema defaults) until the client syncs one.
+    write_desktop_settings(portal_config_dir, None, DEFAULT_BUTTON_LAYOUT);
+
     let portal_conf_dir = portal_config_dir.join("xdg-desktop-portal");
     if create_private_dir(&portal_conf_dir).is_ok() {
         let pref = match backend {
@@ -555,13 +586,16 @@ fn prepare_portal_config_dir(portal_config_dir: &Path, backend: Option<&PortalBa
         // Route org.freedesktop.impl.portal.Settings to gtk first when available so our
         // isolated GSettings keyfile drives live `color-scheme` and `gtk-theme` updates
         // for GTK3/GTK4/Chromium/Firefox, while KDE handles FileChooser/OpenURI/etc.
+        // Our own backend comes last: it only fills in the titlebar `button-layout`, which
+        // the KDE portal does not serve (see `settings_portal`).
         let settings_pref = if find_gtk_portal_backend().is_some() {
             "gtk;kde"
         } else {
             pref
         };
+        let ours = crate::settings_portal::PORTAL_ID;
         let conf = format!(
-            "[preferred]\ndefault={pref}\norg.freedesktop.impl.portal.Settings={settings_pref}\n"
+            "[preferred]\ndefault={pref}\norg.freedesktop.impl.portal.Settings={settings_pref};{ours}\n"
         );
         if let Err(err) = write_file_atomic(&portal_conf_dir.join("portals.conf"), conf.as_bytes())
         {
@@ -682,34 +716,182 @@ fn find_portal_binary() -> Option<PathBuf> {
     ])
 }
 
+/// Directories to search for system `.portal` backend definitions, most preferred first:
+/// the data dir of the xdg-desktop-portal install that will run (`<prefix>/share`, derived
+/// from its binary path), then `XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`).
+fn portal_definition_search_dirs(
+    portal_binary: Option<&Path>,
+    xdg_data_dirs: Option<&str>,
+) -> Vec<PathBuf> {
+    let prefix_share = portal_binary.and_then(|bin| {
+        bin.ancestors()
+            .find(|a| {
+                matches!(
+                    a.file_name().and_then(|n| n.to_str()),
+                    Some("libexec" | "lib" | "lib64")
+                )
+            })?
+            .parent()
+            .map(|prefix| prefix.join("share"))
+    });
+    let data_dirs = xdg_data_dirs
+        .filter(|v| !v.is_empty())
+        .unwrap_or("/usr/local/share:/usr/share");
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for share in prefix_share.into_iter().chain(
+        data_dirs
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from),
+    ) {
+        let dir = share.join("xdg-desktop-portal/portals");
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Build an isolated `.portal` definitions dir (for `XDG_DESKTOP_PORTAL_DIR`): links to every
+/// system backend definition, our own settings backend, and a copy of `portals.conf`.
+/// Returns `None` (leave `XDG_DESKTOP_PORTAL_DIR` unset) if no system definitions were
+/// found, since the frontend would then lose every other backend.
+fn prepare_portal_definitions_dir(portal_config_dir: &Path) -> Option<PathBuf> {
+    let dir = portal_config_dir.join("portals");
+    if let Err(err) = create_private_dir(&dir) {
+        warn!(error = %err, "failed to create isolated portal definitions dir");
+        return None;
+    }
+    let search_dirs = portal_definition_search_dirs(
+        find_portal_binary().as_deref(),
+        std::env::var("XDG_DATA_DIRS").ok().as_deref(),
+    );
+    let mut linked = std::collections::HashSet::new();
+    for search_dir in &search_dirs {
+        let Ok(entries) = fs::read_dir(search_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.extension().is_none_or(|e| e != "portal") || linked.contains(&name) {
+                continue;
+            }
+            let link = dir.join(&name);
+            let _ = fs::remove_file(&link);
+            match std::os::unix::fs::symlink(&path, &link) {
+                Ok(()) => {
+                    linked.insert(name);
+                }
+                Err(err) => {
+                    warn!(error = %err, path = %path.display(), "failed to link portal definition");
+                }
+            }
+        }
+    }
+    if linked.is_empty() {
+        warn!(
+            ?search_dirs,
+            "no system portal definitions found; settings portal backend not registered"
+        );
+        return None;
+    }
+    // With XDG_DESKTOP_PORTAL_DIR set, xdg-desktop-portal reads `portals.conf` only from
+    // that dir (not XDG_CONFIG_HOME), so the backend preferences must be copied there.
+    let conf = portal_config_dir.join("xdg-desktop-portal/portals.conf");
+    if let Err(err) = fs::copy(&conf, dir.join("portals.conf")) {
+        warn!(error = %err, "failed to copy portals.conf into portal definitions dir");
+        return None;
+    }
+    let ours = dir.join(format!("{}.portal", crate::settings_portal::PORTAL_ID));
+    if let Err(err) = write_file_atomic(&ours, crate::settings_portal::PORTAL_FILE.as_bytes()) {
+        warn!(error = %err, "failed to write settings portal definition");
+        return None;
+    }
+    Some(dir)
+}
+
 fn start_xdg_desktop_portal(
     runtime_dir: &Path,
     portal_config_dir: &Path,
     wayland_socket: &OsStr,
+    portal_definitions_dir: Option<&Path>,
 ) -> Result<Child> {
     let Some(bin) = find_portal_binary() else {
         bail!("xdg-desktop-portal binary not found in /usr/libexec or /usr/lib");
     };
+    let definitions_dir = portal_definitions_dir.map(|d| d.to_string_lossy().into_owned());
+    let extra_env: Vec<(&str, &str)> = definitions_dir
+        .as_deref()
+        .map(|d| ("XDG_DESKTOP_PORTAL_DIR", d))
+        .into_iter()
+        .collect();
     spawn_portal_process(
         &bin,
         runtime_dir,
         portal_config_dir,
         wayland_socket,
-        &[],
+        &extra_env,
         "isolated xdg-desktop-portal started",
     )
 }
 
-fn format_gsettings_color_scheme_keyfile(scheme: u32, has_breeze_gtk: bool) -> String {
-    let (cs, theme) = match (scheme, has_breeze_gtk) {
-        (1, true) => ("prefer-dark", "Breeze-Dark"),
-        (1, false) => ("prefer-dark", "Adwaita-dark"),
-        (2, true) => ("prefer-light", "Breeze"),
-        (2, false) => ("prefer-light", "Adwaita"),
-        (_, true) => ("default", "Breeze"),
-        (_, false) => ("default", "Adwaita"),
-    };
-    format!("[org/gnome/desktop/interface]\ncolor-scheme='{cs}'\ngtk-theme='{theme}'\n")
+/// Build the isolated GSettings keyfile. `scheme` is `None` until the client syncs a
+/// color scheme, in which case the interface keys are left at their schema defaults.
+fn format_gsettings_keyfile(
+    scheme: Option<u32>,
+    has_breeze_gtk: bool,
+    button_layout: &str,
+) -> String {
+    let mut out = String::new();
+    if let Some(scheme) = scheme {
+        let (cs, theme) = match (scheme, has_breeze_gtk) {
+            (1, true) => ("prefer-dark", "Breeze-Dark"),
+            (1, false) => ("prefer-dark", "Adwaita-dark"),
+            (2, true) => ("prefer-light", "Breeze"),
+            (2, false) => ("prefer-light", "Adwaita"),
+            (_, true) => ("default", "Breeze"),
+            (_, false) => ("default", "Adwaita"),
+        };
+        out.push_str(&format!(
+            "[org/gnome/desktop/interface]\ncolor-scheme='{cs}'\ngtk-theme='{theme}'\n\n"
+        ));
+    }
+    out.push_str(&format!(
+        "[org/gnome/desktop/wm/preferences]\nbutton-layout='{button_layout}'\n"
+    ));
+    out
+}
+
+/// Titlebar button layout served to GTK/Chromium/Firefox through the isolated portal
+/// until the client syncs its own. GNOME's schema default is `appmenu:close`, which
+/// hides minimize and maximize; RemoteWayland windows support both, so show them.
+const DEFAULT_BUTTON_LAYOUT: &str = "appmenu:minimize,maximize,close";
+
+/// Write the isolated GTK settings that carry the color scheme and titlebar button layout:
+/// - the GSettings keyfile that xdg-desktop-portal-gtk serves to portal-using apps
+///   (GTK3 with `GTK_USE_PORTAL=1`, sandboxed apps, Chromium, Firefox);
+/// - `gtk-3.0`/`gtk-4.0` `settings.ini` (the dir is on apps' `XDG_CONFIG_DIRS`) for GTK
+///   apps that read settings directly instead of through the portal.
+fn write_desktop_settings(portal_config_dir: &Path, scheme: Option<u32>, button_layout: &str) {
+    let glib_dir = portal_config_dir.join("glib-2.0/settings");
+    if create_private_dir(&glib_dir).is_ok() {
+        let has_breeze_gtk = find_xdg_data_path("themes/Breeze-Dark").is_some();
+        let keyfile = format_gsettings_keyfile(scheme, has_breeze_gtk, button_layout);
+        if let Err(err) = write_file_atomic(&glib_dir.join("keyfile"), keyfile.as_bytes()) {
+            warn!(error = %err, "failed to update isolated GSettings keyfile");
+        }
+    }
+    let settings_ini = format!("[Settings]\ngtk-decoration-layout={button_layout}\n");
+    for gtk_dir in ["gtk-3.0", "gtk-4.0"] {
+        let dir = portal_config_dir.join(gtk_dir);
+        if create_private_dir(&dir).is_ok() {
+            if let Err(err) = write_file_atomic(&dir.join("settings.ini"), settings_ini.as_bytes())
+            {
+                warn!(error = %err, gtk_dir, "failed to update isolated GTK settings.ini");
+            }
+        }
+    }
 }
 
 /// Update `[General]` `ColorScheme` and `[Colors:Window]` `BackgroundNormal` / `ForegroundNormal`
@@ -807,15 +989,13 @@ const KGLOBAL_SETTINGS_CHANGED: &str = "4";
 /// (`0` = no preference, `1` = prefer dark, `2` = prefer light) to the isolated
 /// portal configuration and notify the isolated portal backend live.
 pub fn apply_color_scheme(scheme: u32) {
-    static APPLY_LOCK: Mutex<()> = Mutex::new(());
-
     if scheme > 2 {
         warn!(scheme, "ignoring invalid client color-scheme value");
         return;
     }
-    let _apply_guard = APPLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _apply_guard = PORTAL_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let (portal_config_dir, has_dbus) = {
+    let (portal_config_dir, has_dbus, button_layout) = {
         let Some(lock) = SESSION_INFO.get() else {
             return;
         };
@@ -823,19 +1003,20 @@ pub fn apply_color_scheme(scheme: u32) {
             return;
         };
         info.color_scheme = Some(scheme);
-        (info.portal_config_dir.clone(), info.dbus_address.is_some())
+        (
+            info.portal_config_dir.clone(),
+            info.dbus_address.is_some(),
+            info.button_layout.clone(),
+        )
     };
 
     // Update GSettings keyfile atomically for xdg-desktop-portal-gtk
     // (drives live `color-scheme` and `gtk-theme` over org.freedesktop.portal.Settings).
-    let glib_dir = portal_config_dir.join("glib-2.0/settings");
-    if create_private_dir(&glib_dir).is_ok() {
-        let has_breeze_gtk = find_xdg_data_path("themes/Breeze-Dark").is_some();
-        let keyfile = format_gsettings_color_scheme_keyfile(scheme, has_breeze_gtk);
-        if let Err(err) = write_file_atomic(&glib_dir.join("keyfile"), keyfile.as_bytes()) {
-            warn!(error = %err, "failed to update isolated GSettings keyfile");
-        }
-    }
+    write_desktop_settings(
+        &portal_config_dir,
+        Some(scheme),
+        button_layout.as_deref().unwrap_or(DEFAULT_BUTTON_LAYOUT),
+    );
 
     // Update isolated kdeglobals atomically for xdg-desktop-portal-kde and Qt/KDE apps.
     let kdeglobals_path = portal_config_dir.join("kdeglobals");
@@ -892,6 +1073,39 @@ pub fn apply_color_scheme(scheme: u32) {
     info!(
         scheme,
         "applied synced client color-scheme to isolated portal"
+    );
+}
+
+/// Apply the client-synced titlebar `button-layout` (`None` = the client has no preference,
+/// use [`DEFAULT_BUTTON_LAYOUT`]) to the isolated GTK settings and our settings portal
+/// backend, which notify GTK/Chromium/Firefox live.
+pub fn apply_button_layout(layout: Option<&str>) {
+    if let Some(layout) = layout {
+        if !remotewayland_proto::is_valid_button_layout(layout) {
+            warn!(layout, "ignoring invalid client button-layout value");
+            return;
+        }
+    }
+    let _apply_guard = PORTAL_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (portal_config_dir, scheme) = {
+        let Some(lock) = SESSION_INFO.get() else {
+            return;
+        };
+        let Ok(mut info) = lock.lock() else {
+            return;
+        };
+        info.button_layout = layout.map(str::to_string);
+        (info.portal_config_dir.clone(), info.color_scheme)
+    };
+
+    let effective = layout.unwrap_or(DEFAULT_BUTTON_LAYOUT);
+    write_desktop_settings(&portal_config_dir, scheme, effective);
+    crate::settings_portal::set_button_layout(effective);
+    info!(
+        layout = effective,
+        from_client = layout.is_some(),
+        "applied titlebar button-layout to isolated portal"
     );
 }
 
@@ -1303,22 +1517,65 @@ mod tests {
     }
 
     #[test]
-    fn format_gsettings_color_scheme_keyfile_selects_expected_themes() {
+    fn format_gsettings_keyfile_selects_expected_themes() {
+        const WM: &str =
+            "[org/gnome/desktop/wm/preferences]\nbutton-layout='appmenu:minimize,maximize,close'\n";
+        let cases = [
+            (
+                1,
+                true,
+                "color-scheme='prefer-dark'\ngtk-theme='Breeze-Dark'",
+            ),
+            (
+                1,
+                false,
+                "color-scheme='prefer-dark'\ngtk-theme='Adwaita-dark'",
+            ),
+            (2, true, "color-scheme='prefer-light'\ngtk-theme='Breeze'"),
+            (0, false, "color-scheme='default'\ngtk-theme='Adwaita'"),
+        ];
+        for (scheme, breeze, interface) in cases {
+            assert_eq!(
+                format_gsettings_keyfile(Some(scheme), breeze, DEFAULT_BUTTON_LAYOUT),
+                format!("[org/gnome/desktop/interface]\n{interface}\n\n{WM}")
+            );
+        }
+    }
+
+    #[test]
+    fn format_gsettings_keyfile_without_scheme_leaves_theme_unset() {
         assert_eq!(
-            format_gsettings_color_scheme_keyfile(1, true),
-            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-dark'\ngtk-theme='Breeze-Dark'\n"
+            format_gsettings_keyfile(None, true, "icon:minimize,maximize,close"),
+            "[org/gnome/desktop/wm/preferences]\nbutton-layout='icon:minimize,maximize,close'\n"
+        );
+    }
+
+    #[test]
+    fn portal_definition_search_dirs_prefers_binary_prefix() {
+        let dirs = portal_definition_search_dirs(
+            Some(Path::new("/opt/xdp/libexec/xdg-desktop-portal")),
+            Some("/usr/share:/opt/xdp/share::/usr/local/share"),
         );
         assert_eq!(
-            format_gsettings_color_scheme_keyfile(1, false),
-            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-dark'\ngtk-theme='Adwaita-dark'\n"
+            dirs,
+            [
+                "/opt/xdp/share/xdg-desktop-portal/portals",
+                "/usr/share/xdg-desktop-portal/portals",
+                "/usr/local/share/xdg-desktop-portal/portals",
+            ]
+            .map(PathBuf::from)
+        );
+        let dirs = portal_definition_search_dirs(
+            Some(Path::new("/usr/lib/xdg-desktop-portal/xdg-desktop-portal")),
+            None,
         );
         assert_eq!(
-            format_gsettings_color_scheme_keyfile(2, true),
-            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-light'\ngtk-theme='Breeze'\n"
-        );
-        assert_eq!(
-            format_gsettings_color_scheme_keyfile(0, false),
-            "[org/gnome/desktop/interface]\ncolor-scheme='default'\ngtk-theme='Adwaita'\n"
+            dirs,
+            [
+                "/usr/share/xdg-desktop-portal/portals",
+                "/usr/local/share/xdg-desktop-portal/portals",
+            ]
+            .map(PathBuf::from)
         );
     }
 
