@@ -282,6 +282,54 @@ fn unpack_i16_hi(packed: i32) -> i32 {
     return packed >> 16u;
 }
 
+fn sample_pred_rgb_hpel(
+    base_sx: u32,
+    base_sy: u32,
+    px: u32,
+    py: u32,
+    max_x: u32,
+    max_y: u32,
+    hx: u32,
+    hy: u32,
+    fb_w: u32,
+) -> vec3<i32> {
+    let cx0 = min(px, max_x);
+    let cy0 = min(py, max_y);
+    let p00 = tb_pred_bgra[(base_sy + cy0) * fb_w + (base_sx + cx0)];
+    let b00 = i32(p00 & 0xFFu);
+    let g00 = i32((p00 >> 8u) & 0xFFu);
+    let r00 = i32((p00 >> 16u) & 0xFFu);
+    if (hx == 0u && hy == 0u) {
+        return vec3<i32>(r00, g00, b00);
+    }
+    let cx1 = min(cx0 + hx, max_x);
+    let cy1 = min(cy0 + hy, max_y);
+    if (hx == 1u && hy == 0u) {
+        let p01 = tb_pred_bgra[(base_sy + cy0) * fb_w + (base_sx + cx1)];
+        return vec3<i32>(
+            (r00 + i32((p01 >> 16u) & 0xFFu) + 1) >> 1u,
+            (g00 + i32((p01 >> 8u) & 0xFFu) + 1) >> 1u,
+            (b00 + i32(p01 & 0xFFu) + 1) >> 1u,
+        );
+    }
+    if (hx == 0u && hy == 1u) {
+        let p10 = tb_pred_bgra[(base_sy + cy1) * fb_w + (base_sx + cx0)];
+        return vec3<i32>(
+            (r00 + i32((p10 >> 16u) & 0xFFu) + 1) >> 1u,
+            (g00 + i32((p10 >> 8u) & 0xFFu) + 1) >> 1u,
+            (b00 + i32(p10 & 0xFFu) + 1) >> 1u,
+        );
+    }
+    let p01 = tb_pred_bgra[(base_sy + cy0) * fb_w + (base_sx + cx1)];
+    let p10 = tb_pred_bgra[(base_sy + cy1) * fb_w + (base_sx + cx0)];
+    let p11 = tb_pred_bgra[(base_sy + cy1) * fb_w + (base_sx + cx1)];
+    return vec3<i32>(
+        (r00 + i32((p01 >> 16u) & 0xFFu) + i32((p10 >> 16u) & 0xFFu) + i32((p11 >> 16u) & 0xFFu) + 2) >> 2u,
+        (g00 + i32((p01 >> 8u) & 0xFFu) + i32((p10 >> 8u) & 0xFFu) + i32((p11 >> 8u) & 0xFFu) + 2) >> 2u,
+        (b00 + i32(p01 & 0xFFu) + i32(p10 & 0xFFu) + i32(p11 & 0xFFu) + 2) >> 2u,
+    );
+}
+
 // Total workgroup shared memory:
 // - `wg_y_packed`: 4096 i32s (16 KB) -> low 16 bits = cur_y, high 16 bits = ref_y
 // - `wg_c_packed`: 1024 i32s (4 KB)  -> byte 0 = cur_cb, byte 1 = cur_cr, byte 2 = ref_cb, byte 3 = ref_cr
@@ -365,19 +413,18 @@ fn encode_fullres_tiles_batch(
         let cb_cur = (rgb_to_cb(r00, g00, b00) + rgb_to_cb(r01, g01, b01) + rgb_to_cb(r10, g10, b10) + rgb_to_cb(r11, g11, b11) + 2) >> 2u;
         let cr_cur = (rgb_to_cr(r00, g00, b00) + rgb_to_cr(r01, g01, b01) + rgb_to_cr(r10, g10, b10) + rgb_to_cr(r11, g11, b11) + 2) >> 2u;
 
-        let rsy0 = desc.pred_y + min(py0, max_y);
-        let rsy1 = desc.pred_y + min(py1, max_y);
-        let rsx0 = desc.pred_x + min(px0, max_x);
-        let rsx1 = desc.pred_x + min(px1, max_x);
-        let rp00 = tb_pred_bgra[rsy0 * tb_params.fb_w + rsx0];
-        let rp01 = tb_pred_bgra[rsy0 * tb_params.fb_w + rsx1];
-        let rp10 = tb_pred_bgra[rsy1 * tb_params.fb_w + rsx0];
-        let rp11 = tb_pred_bgra[rsy1 * tb_params.fb_w + rsx1];
-
-        let rb00 = i32(rp00 & 0xFFu); let rg00 = i32((rp00 >> 8u) & 0xFFu); let rr00 = i32((rp00 >> 16u) & 0xFFu);
-        let rb01 = i32(rp01 & 0xFFu); let rg01 = i32((rp01 >> 8u) & 0xFFu); let rr01 = i32((rp01 >> 16u) & 0xFFu);
-        let rb10 = i32(rp10 & 0xFFu); let rg10 = i32((rp10 >> 8u) & 0xFFu); let rr10 = i32((rp10 >> 16u) & 0xFFu);
-        let rb11 = i32(rp11 & 0xFFu); let rg11 = i32((rp11 >> 8u) & 0xFFu); let rr11 = i32((rp11 >> 16u) & 0xFFu);
+        let base_sx = desc.pred_x >> 1u;
+        let base_sy = desc.pred_y >> 1u;
+        let hx = desc.pred_x & 1u;
+        let hy = desc.pred_y & 1u;
+        let rgb00 = sample_pred_rgb_hpel(base_sx, base_sy, px0, py0, max_x, max_y, hx, hy, tb_params.fb_w);
+        let rgb01 = sample_pred_rgb_hpel(base_sx, base_sy, px1, py0, max_x, max_y, hx, hy, tb_params.fb_w);
+        let rgb10 = sample_pred_rgb_hpel(base_sx, base_sy, px0, py1, max_x, max_y, hx, hy, tb_params.fb_w);
+        let rgb11 = sample_pred_rgb_hpel(base_sx, base_sy, px1, py1, max_x, max_y, hx, hy, tb_params.fb_w);
+        let rr00 = rgb00.x; let rg00 = rgb00.y; let rb00 = rgb00.z;
+        let rr01 = rgb01.x; let rg01 = rgb01.y; let rb01 = rgb01.z;
+        let rr10 = rgb10.x; let rg10 = rgb10.y; let rb10 = rgb10.z;
+        let rr11 = rgb11.x; let rg11 = rgb11.y; let rb11 = rgb11.z;
 
         let ry00 = rgb_to_y(rr00, rg00, rb00);
         let ry01 = rgb_to_y(rr01, rg01, rb01);
@@ -685,6 +732,202 @@ fn encode_fullres_tiles_batch(
         }
         workgroupBarrier();
     }
+
+    // 2b. In-loop 4-tap 8x8 boundary deblocking filter across reconstructed Y (`wg_y_packed`) and Cb/Cr (`wg_c_packed`).
+    let luma_q0 = get_luma_q(0u);
+    let beta_y = clamp(luma_q0 + 4, 6, 36);
+    let tc_y = clamp((luma_q0 + 3) >> 2u, 1, 10);
+    let chroma_q0 = get_chroma_q(0u);
+    let beta_c = clamp(chroma_q0 + 4, 6, 36);
+    let tc_c = clamp((chroma_q0 + 3) >> 2u, 1, 10);
+
+    // Vertical 8x8 boundaries on Y (lane = row `0..63`) and Cb/Cr (lane `0..31` = row `0..31`)
+    let active_yh = min(luma_by * 8u, 64u);
+    if (lane < active_yh) {
+        let row_off = lane * 64u;
+        for (var bx = 1u; bx < luma_bx; bx = bx + 1u) {
+            let x = bx * 8u;
+            let p1 = wg_y_packed[row_off + x - 2u];
+            let p0 = wg_y_packed[row_off + x - 1u];
+            let q0 = wg_y_packed[row_off + x];
+            let q1 = wg_y_packed[row_off + x + 1u];
+            if (abs(p0 - q0) < beta_y && abs(p1 - p0) < (beta_y >> 1u) && abs(q1 - q0) < (beta_y >> 1u)) {
+                let delta = clamp(((q0 - p0) * 3 + (p1 - q1) + 4) >> 3u, -tc_y, tc_y);
+                let delta1 = clamp(delta >> 1u, -(tc_y >> 1u), tc_y >> 1u);
+                wg_y_packed[row_off + x - 2u] = clamp(p1 + delta1, 0, 255);
+                wg_y_packed[row_off + x - 1u] = clamp(p0 + delta, 0, 255);
+                wg_y_packed[row_off + x]      = clamp(q0 - delta, 0, 255);
+                wg_y_packed[row_off + x + 1u] = clamp(q1 - delta1, 0, 255);
+            }
+        }
+    }
+    let active_ch = min(chroma_by * 8u, 32u);
+    if (lane < active_ch) {
+        let row_off = lane * 32u;
+        for (var bx = 1u; bx < chroma_bx; bx = bx + 1u) {
+            let x = bx * 8u;
+            let cp_p1 = wg_c_packed[row_off + x - 2u];
+            let cp_p0 = wg_c_packed[row_off + x - 1u];
+            let cp_q0 = wg_c_packed[row_off + x];
+            let cp_q1 = wg_c_packed[row_off + x + 1u];
+
+            var cb_p1 = i32(cp_p1 & 0xFFu); var cr_p1 = i32((cp_p1 >> 8u) & 0xFFu);
+            var cb_p0 = i32(cp_p0 & 0xFFu); var cr_p0 = i32((cp_p0 >> 8u) & 0xFFu);
+            var cb_q0 = i32(cp_q0 & 0xFFu); var cr_q0 = i32((cp_q0 >> 8u) & 0xFFu);
+            var cb_q1 = i32(cp_q1 & 0xFFu); var cr_q1 = i32((cp_q1 >> 8u) & 0xFFu);
+
+            if (abs(cb_p0 - cb_q0) < beta_c && abs(cb_p1 - cb_p0) < (beta_c >> 1u) && abs(cb_q1 - cb_q0) < (beta_c >> 1u)) {
+                let d = clamp(((cb_q0 - cb_p0) * 3 + (cb_p1 - cb_q1) + 4) >> 3u, -tc_c, tc_c);
+                let d1 = clamp(d >> 1u, -(tc_c >> 1u), tc_c >> 1u);
+                cb_p1 = clamp(cb_p1 + d1, 0, 255);
+                cb_p0 = clamp(cb_p0 + d, 0, 255);
+                cb_q0 = clamp(cb_q0 - d, 0, 255);
+                cb_q1 = clamp(cb_q1 - d1, 0, 255);
+            }
+            if (abs(cr_p0 - cr_q0) < beta_c && abs(cr_p1 - cr_p0) < (beta_c >> 1u) && abs(cr_q1 - cr_q0) < (beta_c >> 1u)) {
+                let d = clamp(((cr_q0 - cr_p0) * 3 + (cr_p1 - cr_q1) + 4) >> 3u, -tc_c, tc_c);
+                let d1 = clamp(d >> 1u, -(tc_c >> 1u), tc_c >> 1u);
+                cr_p1 = clamp(cr_p1 + d1, 0, 255);
+                cr_p0 = clamp(cr_p0 + d, 0, 255);
+                cr_q0 = clamp(cr_q0 - d, 0, 255);
+                cr_q1 = clamp(cr_q1 - d1, 0, 255);
+            }
+            wg_c_packed[row_off + x - 2u] = u32(cb_p1) | (u32(cr_p1) << 8u);
+            wg_c_packed[row_off + x - 1u] = u32(cb_p0) | (u32(cr_p0) << 8u);
+            wg_c_packed[row_off + x]      = u32(cb_q0) | (u32(cr_q0) << 8u);
+            wg_c_packed[row_off + x + 1u] = u32(cb_q1) | (u32(cr_q1) << 8u);
+        }
+    }
+    workgroupBarrier();
+
+    // Horizontal 8x8 boundaries on Y (lane = col `0..63`) and Cb/Cr (lane `0..31` = col `0..31`)
+    let active_yw = min(luma_bx * 8u, 64u);
+    if (lane < active_yw) {
+        let x = lane;
+        for (var by = 1u; by < luma_by; by = by + 1u) {
+            let y = by * 8u;
+            let p1 = wg_y_packed[(y - 2u) * 64u + x];
+            let p0 = wg_y_packed[(y - 1u) * 64u + x];
+            let q0 = wg_y_packed[y * 64u + x];
+            let q1 = wg_y_packed[(y + 1u) * 64u + x];
+            if (abs(p0 - q0) < beta_y && abs(p1 - p0) < (beta_y >> 1u) && abs(q1 - q0) < (beta_y >> 1u)) {
+                let delta = clamp(((q0 - p0) * 3 + (p1 - q1) + 4) >> 3u, -tc_y, tc_y);
+                let delta1 = clamp(delta >> 1u, -(tc_y >> 1u), tc_y >> 1u);
+                wg_y_packed[(y - 2u) * 64u + x] = clamp(p1 + delta1, 0, 255);
+                wg_y_packed[(y - 1u) * 64u + x] = clamp(p0 + delta, 0, 255);
+                wg_y_packed[y * 64u + x]        = clamp(q0 - delta, 0, 255);
+                wg_y_packed[(y + 1u) * 64u + x] = clamp(q1 - delta1, 0, 255);
+            }
+        }
+    }
+    let active_cw = min(chroma_bx * 8u, 32u);
+    if (lane < active_cw) {
+        let x = lane;
+        for (var by = 1u; by < chroma_by; by = by + 1u) {
+            let y = by * 8u;
+            let cp_p1 = wg_c_packed[(y - 2u) * 32u + x];
+            let cp_p0 = wg_c_packed[(y - 1u) * 32u + x];
+            let cp_q0 = wg_c_packed[y * 32u + x];
+            let cp_q1 = wg_c_packed[(y + 1u) * 32u + x];
+
+            var cb_p1 = i32(cp_p1 & 0xFFu); var cr_p1 = i32((cp_p1 >> 8u) & 0xFFu);
+            var cb_p0 = i32(cp_p0 & 0xFFu); var cr_p0 = i32((cp_p0 >> 8u) & 0xFFu);
+            var cb_q0 = i32(cp_q0 & 0xFFu); var cr_q0 = i32((cp_q0 >> 8u) & 0xFFu);
+            var cb_q1 = i32(cp_q1 & 0xFFu); var cr_q1 = i32((cp_q1 >> 8u) & 0xFFu);
+
+            if (abs(cb_p0 - cb_q0) < beta_c && abs(cb_p1 - cb_p0) < (beta_c >> 1u) && abs(cb_q1 - cb_q0) < (beta_c >> 1u)) {
+                let d = clamp(((cb_q0 - cb_p0) * 3 + (cb_p1 - cb_q1) + 4) >> 3u, -tc_c, tc_c);
+                let d1 = clamp(d >> 1u, -(tc_c >> 1u), tc_c >> 1u);
+                cb_p1 = clamp(cb_p1 + d1, 0, 255);
+                cb_p0 = clamp(cb_p0 + d, 0, 255);
+                cb_q0 = clamp(cb_q0 - d, 0, 255);
+                cb_q1 = clamp(cb_q1 - d1, 0, 255);
+            }
+            if (abs(cr_p0 - cr_q0) < beta_c && abs(cr_p1 - cr_p0) < (beta_c >> 1u) && abs(cr_q1 - cr_q0) < (beta_c >> 1u)) {
+                let d = clamp(((cr_q0 - cr_p0) * 3 + (cr_p1 - cr_q1) + 4) >> 3u, -tc_c, tc_c);
+                let d1 = clamp(d >> 1u, -(tc_c >> 1u), tc_c >> 1u);
+                cr_p1 = clamp(cr_p1 + d1, 0, 255);
+                cr_p0 = clamp(cr_p0 + d, 0, 255);
+                cr_q0 = clamp(cr_q0 - d, 0, 255);
+                cr_q1 = clamp(cr_q1 - d1, 0, 255);
+            }
+            wg_c_packed[(y - 2u) * 32u + x] = u32(cb_p1) | (u32(cr_p1) << 8u);
+            wg_c_packed[(y - 1u) * 32u + x] = u32(cb_p0) | (u32(cr_p0) << 8u);
+            wg_c_packed[y * 32u + x]        = u32(cb_q0) | (u32(cr_q0) << 8u);
+            wg_c_packed[(y + 1u) * 32u + x] = u32(cb_q1) | (u32(cr_q1) << 8u);
+        }
+    }
+    workgroupBarrier();
+
+    // 2c. Edge-preserving Sample Adaptive Offset (SAO) 1D Edge Offset anti-ringing damping
+    //     along each 8-pixel line inside 8x8 blocks (Y on lanes 0..63, Cb/Cr on lanes 0..31).
+    let sao_thresh_y = max(beta_y >> 1u, 3);
+    if (lane < active_yh) {
+        let row_off = lane * 64u;
+        for (var bx = 0u; bx < luma_bx; bx = bx + 1u) {
+            let base = row_off + bx * 8u;
+            var line: array<i32, 8>;
+            for (var c = 0u; c < 8u; c = c + 1u) {
+                line[c] = wg_y_packed[base + c];
+            }
+            for (var c = 1u; c < 7u; c = c + 1u) {
+                let cur = line[c];
+                let d_left = cur - line[c - 1u];
+                let d_right = cur - line[c + 1u];
+                if (abs(d_left) < sao_thresh_y && abs(d_right) < sao_thresh_y) {
+                    if (d_left > 0 && d_right > 0) {
+                        let step = clamp((min(d_left, d_right) + 1) >> 2u, 1, 2);
+                        wg_y_packed[base + c] = clamp(cur - step, 0, 255);
+                    } else if (d_left < 0 && d_right < 0) {
+                        let step = clamp((min(-d_left, -d_right) + 1) >> 2u, 1, 2);
+                        wg_y_packed[base + c] = clamp(cur + step, 0, 255);
+                    }
+                }
+            }
+        }
+    }
+    let sao_thresh_c = max(beta_c >> 1u, 3);
+    if (lane < active_ch) {
+        let row_off = lane * 32u;
+        for (var bx = 0u; bx < chroma_bx; bx = bx + 1u) {
+            let base = row_off + bx * 8u;
+            var cb_line: array<i32, 8>;
+            var cr_line: array<i32, 8>;
+            for (var c = 0u; c < 8u; c = c + 1u) {
+                let cp = wg_c_packed[base + c];
+                cb_line[c] = i32(cp & 0xFFu);
+                cr_line[c] = i32((cp >> 8u) & 0xFFu);
+            }
+            for (var c = 1u; c < 7u; c = c + 1u) {
+                var cb_out = cb_line[c];
+                let cb_dl = cb_out - cb_line[c - 1u];
+                let cb_dr = cb_out - cb_line[c + 1u];
+                if (abs(cb_dl) < sao_thresh_c && abs(cb_dr) < sao_thresh_c) {
+                    if (cb_dl > 0 && cb_dr > 0) {
+                        let step = clamp((min(cb_dl, cb_dr) + 1) >> 2u, 1, 2);
+                        cb_out = clamp(cb_out - step, 0, 255);
+                    } else if (cb_dl < 0 && cb_dr < 0) {
+                        let step = clamp((min(-cb_dl, -cb_dr) + 1) >> 2u, 1, 2);
+                        cb_out = clamp(cb_out + step, 0, 255);
+                    }
+                }
+                var cr_out = cr_line[c];
+                let cr_dl = cr_out - cr_line[c - 1u];
+                let cr_dr = cr_out - cr_line[c + 1u];
+                if (abs(cr_dl) < sao_thresh_c && abs(cr_dr) < sao_thresh_c) {
+                    if (cr_dl > 0 && cr_dr > 0) {
+                        let step = clamp((min(cr_dl, cr_dr) + 1) >> 2u, 1, 2);
+                        cr_out = clamp(cr_out - step, 0, 255);
+                    } else if (cr_dl < 0 && cr_dr < 0) {
+                        let step = clamp((min(-cr_dl, -cr_dr) + 1) >> 2u, 1, 2);
+                        cr_out = clamp(cr_out + step, 0, 255);
+                    }
+                }
+                wg_c_packed[base + c] = u32(cb_out) | (u32(cr_out) << 8u);
+            }
+        }
+    }
+    workgroupBarrier();
 
     // 3. Reconstruct 64x64 BGRA tile into `tb_recon_bgra[tidx * 4096 + py * 64 + px]`
     let tile_px_base = tidx * 4096u;

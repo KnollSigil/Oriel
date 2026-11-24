@@ -22,6 +22,9 @@ pub mod simd;
 #[path = "smart_tile_gpu.rs"]
 pub mod gpu;
 
+#[path = "smart_tile_rans.rs"]
+pub mod rans;
+
 static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
 static FORCE_DISABLE_GPU: AtomicBool = AtomicBool::new(false);
 
@@ -105,7 +108,19 @@ pub fn validate_frame_dims(width: u32, height: u32) -> Result<usize> {
     Ok(bytes)
 }
 
-/// Decompress a size-prepended LZ4 payload while enforcing `max_uncompressed` BEFORE allocating.
+/// Compress a `SmartTile` packet using Zstd-style two-stage `LZ4 + 4-way interleaved rANS`
+/// (plus direct 4-way rANS fallback on small lossy payloads) and emit whichever representation is smallest.
+fn compress_packet_adaptive(raw: &[u8], used_lossy: bool) -> Vec<u8> {
+    let lz4 = lz4_flex::compress_prepend_size(raw);
+    if used_lossy && raw.len() >= 128 && raw.len() < (rans::RANS_MAGIC_BIT as usize) {
+        if let Some(lz4_rans) = rans::compress_lz4_body_with_rans(raw.len(), &lz4) {
+            return lz4_rans;
+        }
+    }
+    lz4
+}
+
+/// Decompress a size-prepended LZ4 or 4-way interleaved rANS payload while enforcing `max_uncompressed` BEFORE allocating.
 pub fn decompress_lz4_bounded(payload: &[u8], max_uncompressed: usize) -> Result<Vec<u8>> {
     if payload.len() < 4 {
         bail!(
@@ -113,7 +128,11 @@ pub fn decompress_lz4_bounded(payload: &[u8], max_uncompressed: usize) -> Result
             payload.len()
         );
     }
-    let declared = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let header_word = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if (header_word & rans::RANS_MAGIC_BIT) != 0 {
+        return rans::decompress_rans_bounded(payload, max_uncompressed);
+    }
+    let declared = header_word as usize;
     if declared > max_uncompressed {
         bail!("LZ4 declared uncompressed size {declared} exceeds limit {max_uncompressed}");
     }
@@ -401,6 +420,36 @@ fn bgra_tile_to_ycbcr420(
     simd::bgra_tile_to_ycbcr420_scalar(bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane);
 }
 
+/// Extract a motion-predicted tile `(x0_hpel, y0_hpel)` (half-pixel units: `2 * sx + hx`, `2 * sy + hy`)
+/// into padded 64x64 Y and 32x32 Cb/Cr planes using bit-exact integer bilinear interpolation.
+#[allow(clippy::too_many_arguments)]
+fn bgra_tile_to_ycbcr420_hpel(
+    bgra: &[u8],
+    fb_w: u32,
+    x0_hpel: u32,
+    y0_hpel: u32,
+    tw: u32,
+    th: u32,
+    y_plane: &mut [i32; 64 * 64],
+    cb_plane: &mut [i32; 32 * 32],
+    cr_plane: &mut [i32; 32 * 32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::bgra_tile_to_ycbcr420_hpel(
+                    bgra, fb_w, x0_hpel, y0_hpel, tw, th, y_plane, cb_plane, cr_plane,
+                );
+            }
+            return;
+        }
+    }
+    simd::bgra_tile_to_ycbcr420_hpel_scalar(
+        bgra, fb_w, x0_hpel, y0_hpel, tw, th, y_plane, cb_plane, cr_plane,
+    );
+}
+
 /// Write reconstructed 64x64 Y + 32x32 Cb/Cr (+ optional 64x64 Alpha) planes back into a BGRA tile.
 /// When `a_plane` is `Some`, RGB channels are clamped to `<= A` to preserve valid premultiplied ARGB8888.
 #[allow(clippy::too_many_arguments)]
@@ -463,6 +512,48 @@ fn bgra_tile_to_alpha(
         for px in 0..64usize {
             let sx = (x0 as usize) + px.min(max_x);
             a_plane[py * 64 + px] = bgra[row_base + sx * 4 + 3] as i32;
+        }
+    }
+}
+
+/// Extract the alpha channel of a motion-predicted tile `(x0_hpel, y0_hpel)` into a padded 64x64 plane.
+fn bgra_tile_to_alpha_hpel(
+    bgra: &[u8],
+    fb_w: u32,
+    x0_hpel: u32,
+    y0_hpel: u32,
+    tw: u32,
+    th: u32,
+    a_plane: &mut [i32; 64 * 64],
+) {
+    let sx = x0_hpel >> 1;
+    let sy = y0_hpel >> 1;
+    let hx = (x0_hpel & 1) as usize;
+    let hy = (y0_hpel & 1) as usize;
+    if hx == 0 && hy == 0 {
+        bgra_tile_to_alpha(bgra, fb_w, sx, sy, tw, th, a_plane);
+        return;
+    }
+    let stride = fb_w as usize * 4;
+    let max_x = tw as usize - 1;
+    let max_y = th as usize - 1;
+    for py in 0..64usize {
+        let cy0 = py.min(max_y);
+        let cy1 = (cy0 + hy).min(max_y);
+        let row0 = (sy as usize + cy0) * stride;
+        let row1 = (sy as usize + cy1) * stride;
+        for px in 0..64usize {
+            let cx0 = px.min(max_x);
+            let cx1 = (cx0 + hx).min(max_x);
+            let a00 = bgra[row0 + (sx as usize + cx0) * 4 + 3] as i32;
+            let a01 = bgra[row0 + (sx as usize + cx1) * 4 + 3] as i32;
+            let a10 = bgra[row1 + (sx as usize + cx0) * 4 + 3] as i32;
+            let a11 = bgra[row1 + (sx as usize + cx1) * 4 + 3] as i32;
+            a_plane[py * 64 + px] = match (hx, hy) {
+                (1, 0) => (a00 + a01 + 1) >> 1,
+                (0, 1) => (a00 + a10 + 1) >> 1,
+                _ => (a00 + a01 + a10 + a11 + 2) >> 2,
+            };
         }
     }
 }
@@ -780,33 +871,117 @@ fn encode_rle_block(q_block: &[i32; 64], prev_dc: &mut i32, out: &mut Vec<u8>) {
     }
 }
 
-/// Deserialize one quantized 8x8 block.
-fn decode_rle_block(data: &[u8], pos: &mut usize, prev_dc: &mut i32) -> Result<[i32; 64]> {
-    let mut q_block = [0i32; 64];
-    let dc_delta = read_coeff(data, pos)?;
-    let dc = prev_dc.saturating_add(dc_delta);
-    *prev_dc = dc;
-    q_block[0] = dc;
+/// Reversible integer 2x2 lifting Walsh-Hadamard transform over 4 quantized 8x8 DC coefficients
+/// `(d00, d01, d10, d11)` representing a 16x16 superblock.
+/// Maps identical `[c, c, c, c]` blocks to `(c, 0, 0, 0)` with zero dynamic-range expansion and 100% lossless inverse!
+#[inline]
+fn fwd_wht_2x2_reversible(d00: i32, d01: i32, d10: i32, d11: i32) -> (i32, i32, i32, i32) {
+    let h0 = d01 - d00;
+    let l0 = d00 + (h0 >> 1);
+    let h1 = d11 - d10;
+    let l1 = d10 + (h1 >> 1);
+    let w10 = l1 - l0;
+    let w00 = l0 + (w10 >> 1);
+    let w11 = h1 - h0;
+    let w01 = h0 + (w11 >> 1);
+    (w00, w01, w10, w11)
+}
 
-    let mut zi = 1usize;
-    while zi < 64 {
-        if *pos >= data.len() {
-            bail!("unexpected EOF reading DCT RLE token");
+#[inline]
+fn inv_wht_2x2_reversible(w00: i32, w01: i32, w10: i32, w11: i32) -> (i32, i32, i32, i32) {
+    let h0 = w01.wrapping_sub(w11 >> 1);
+    let h1 = h0.wrapping_add(w11);
+    let l0 = w00.wrapping_sub(w10 >> 1);
+    let l1 = l0.wrapping_add(w10);
+    let d00 = l0.wrapping_sub(h0 >> 1);
+    let d01 = d00.wrapping_add(h0);
+    let d10 = l1.wrapping_sub(h1 >> 1);
+    let d11 = d10.wrapping_add(h1);
+    (d00, d01, d10, d11)
+}
+
+#[inline]
+fn apply_fwd_superblock_wht_dcs(dcs: &mut [i32], blocks_x: usize, blocks_y: usize) {
+    let sb_x = blocks_x / 2;
+    let sb_y = blocks_y / 2;
+    for sy in 0..sb_y {
+        let r0 = (sy * 2) * blocks_x;
+        let r1 = r0 + blocks_x;
+        for sx in 0..sb_x {
+            let c0 = sx * 2;
+            let (w00, w01, w10, w11) = fwd_wht_2x2_reversible(
+                dcs[r0 + c0],
+                dcs[r0 + c0 + 1],
+                dcs[r1 + c0],
+                dcs[r1 + c0 + 1],
+            );
+            dcs[r0 + c0] = w00;
+            dcs[r0 + c0 + 1] = w01;
+            dcs[r1 + c0] = w10;
+            dcs[r1 + c0 + 1] = w11;
         }
-        let tok = data[*pos];
-        *pos += 1;
-        if tok == 0 {
-            break; // EOB
-        }
-        let run = (tok - 1) as usize;
-        zi += run;
-        if zi >= 64 {
-            bail!("DCT RLE run overflow");
-        }
-        q_block[ZIGZAG[zi]] = read_coeff(data, pos)?;
-        zi += 1;
     }
-    Ok(q_block)
+}
+
+#[inline]
+fn apply_inv_superblock_wht_dcs(dcs: &mut [i32], blocks_x: usize, blocks_y: usize) {
+    let sb_x = blocks_x / 2;
+    let sb_y = blocks_y / 2;
+    for sy in 0..sb_y {
+        let r0 = (sy * 2) * blocks_x;
+        let r1 = r0 + blocks_x;
+        for sx in 0..sb_x {
+            let c0 = sx * 2;
+            let (d00, d01, d10, d11) = inv_wht_2x2_reversible(
+                dcs[r0 + c0],
+                dcs[r0 + c0 + 1],
+                dcs[r1 + c0],
+                dcs[r1 + c0 + 1],
+            );
+            dcs[r0 + c0] = d00;
+            dcs[r0 + c0 + 1] = d01;
+            dcs[r1 + c0] = d10;
+            dcs[r1 + c0 + 1] = d11;
+        }
+    }
+}
+
+#[inline]
+fn encode_plane_qblocks(
+    q_blocks: &mut [[i32; 64]],
+    blocks_x: usize,
+    blocks_y: usize,
+    out: &mut Vec<u8>,
+) {
+    let count = blocks_x * blocks_y;
+    let mut dcs = [0i32; 64];
+    for i in 0..count {
+        dcs[i] = q_blocks[i][0];
+    }
+    apply_fwd_superblock_wht_dcs(&mut dcs[..count], blocks_x, blocks_y);
+
+    let mut prev_dc = 0i32;
+    let sb_x = blocks_x / 2;
+    let sb_y = blocks_y / 2;
+    for i in 0..count {
+        let by = i / blocks_x;
+        let bx = i % blocks_x;
+        let in_sb = by < sb_y * 2 && bx < sb_x * 2;
+        if in_sb && (by & 1) == 0 && (bx & 1) == 0 {
+            let dc = dcs[i];
+            q_blocks[i][0] = dc;
+            encode_rle_block(&q_blocks[i], &mut prev_dc, out);
+        } else if in_sb {
+            // Superblock WHT detail coefficient (w01, w10, w11) is already zero-centered!
+            let mut zero_pred = 0i32;
+            q_blocks[i][0] = dcs[i];
+            encode_rle_block(&q_blocks[i], &mut zero_pred, out);
+        } else {
+            let dc = dcs[i];
+            q_blocks[i][0] = dc;
+            encode_rle_block(&q_blocks[i], &mut prev_dc, out);
+        }
+    }
 }
 
 /// Encode a single plane (`plane_w x plane_w`, 64 or 32) of 8x8 DCT blocks and reconstruct
@@ -822,47 +997,88 @@ fn encode_and_reconstruct_plane(
     quant: &[i32; 64],
     out: &mut Vec<u8>,
 ) {
-    let mut prev_dc = 0i32;
-    let is_inter = ref_plane.is_some();
+    let count = blocks_x * blocks_y;
+    let mut q_blocks_uninit: [std::mem::MaybeUninit<[i32; 64]>; 64] =
+        [const { std::mem::MaybeUninit::uninit() }; 64];
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
             let mut block = [0i32; 64];
-            for r in 0..8 {
-                let row_off = (by * 8 + r) * plane_dim + bx * 8;
-                for c in 0..8 {
-                    let idx = row_off + c;
-                    block[r * 8 + c] = if let Some(ref_p) = ref_plane {
-                        cur_plane[idx] - ref_p[idx]
-                    } else {
-                        cur_plane[idx] - 128
-                    };
+            if let Some(ref_p) = ref_plane {
+                for r in 0..8 {
+                    let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                    for c in 0..8 {
+                        let idx = row_off + c;
+                        block[r * 8 + c] = cur_plane[idx] - ref_p[idx];
+                    }
+                }
+            } else {
+                for r in 0..8 {
+                    let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                    for c in 0..8 {
+                        block[r * 8 + c] = cur_plane[row_off + c] - 128;
+                    }
                 }
             }
             let dct = dct_8x8(&block);
-            let mut q_block = [0i32; 64];
+            let q_slot = q_blocks_uninit[by * blocks_x + bx].write([0i32; 64]);
             let mut dequant = [0i32; 64];
-            for i in 0..64 {
+            let q0 = quantize_div(dct[0], quant[0]);
+            q_slot[0] = q0;
+            dequant[0] = q0 * quant[0];
+            let mut has_ac = false;
+            for i in 1..64 {
                 let qv = quantize_div(dct[i], quant[i]);
-                q_block[i] = qv;
-                dequant[i] = qv * quant[i];
+                q_slot[i] = qv;
+                if qv != 0 {
+                    has_ac = true;
+                    dequant[i] = qv * quant[i];
+                }
             }
-            encode_rle_block(&q_block, &mut prev_dc, out);
 
-            let idct = idct_8x8(&dequant);
-            for r in 0..8 {
-                let row_off = (by * 8 + r) * plane_dim + bx * 8;
-                for c in 0..8 {
-                    let idx = row_off + c;
-                    let val = if is_inter {
-                        ref_plane.unwrap()[idx] + idct[r * 8 + c]
-                    } else {
-                        idct[r * 8 + c] + 128
-                    };
-                    recon_plane[idx] = val.clamp(0, 255);
+            if !has_ac {
+                let col0 = dequant[0].wrapping_mul(C4).wrapping_add(1 << 10) >> 11;
+                let dc_spatial = col0.wrapping_mul(C4).wrapping_add(1 << 16) >> 17;
+                if let Some(ref_p) = ref_plane {
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        for c in 0..8 {
+                            let idx = row_off + c;
+                            recon_plane[idx] = (ref_p[idx] + dc_spatial).clamp(0, 255);
+                        }
+                    }
+                } else {
+                    let v = (dc_spatial + 128).clamp(0, 255);
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        recon_plane[row_off..row_off + 8].fill(v);
+                    }
+                }
+            } else {
+                let idct = idct_8x8(&dequant);
+                if let Some(ref_p) = ref_plane {
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        for c in 0..8 {
+                            let idx = row_off + c;
+                            recon_plane[idx] = (ref_p[idx] + idct[r * 8 + c]).clamp(0, 255);
+                        }
+                    }
+                } else {
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        for c in 0..8 {
+                            recon_plane[row_off + c] = (idct[r * 8 + c] + 128).clamp(0, 255);
+                        }
+                    }
                 }
             }
         }
     }
+    let q_blocks_init = unsafe {
+        std::slice::from_raw_parts_mut(q_blocks_uninit.as_mut_ptr() as *mut [i32; 64], count)
+    };
+    encode_plane_qblocks(q_blocks_init, blocks_x, blocks_y, out);
+    deblock_and_sao_plane(recon_plane, plane_dim, blocks_x, blocks_y, quant[0]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -877,31 +1093,133 @@ fn decode_plane(
     quant: &[i32; 64],
 ) -> Result<()> {
     let mut prev_dc = 0i32;
-    let is_inter = ref_plane.is_some();
-    for by in 0..blocks_y {
-        for bx in 0..blocks_x {
-            let q_block = decode_rle_block(data, pos, &mut prev_dc)?;
-            let mut dequant = [0i32; 64];
-            for i in 0..64 {
-                // Clamp dequantized coefficients so crafted streams cannot overflow `idct_1d` i32 math.
-                dequant[i] = q_block[i].saturating_mul(quant[i]).clamp(-32_768, 32_768);
-            }
-            let idct = idct_8x8(&dequant);
-            for r in 0..8 {
-                let row_off = (by * 8 + r) * plane_dim + bx * 8;
-                for c in 0..8 {
-                    let idx = row_off + c;
-                    let val = if is_inter {
-                        ref_plane.unwrap()[idx] + idct[r * 8 + c]
-                    } else {
-                        idct[r * 8 + c] + 128
-                    };
-                    recon_plane[idx] = val.clamp(0, 255);
+    let count = blocks_x * blocks_y;
+    let sb_x = blocks_x / 2;
+    let sb_y = blocks_y / 2;
+    let mut ac_blocks: [std::mem::MaybeUninit<[i32; 64]>; 64] =
+        [const { std::mem::MaybeUninit::uninit() }; 64];
+    let mut has_ac = [false; 64];
+    let mut dcs = [0i32; 64];
+
+    for i in 0..count {
+        let by = i / blocks_x;
+        let bx = i % blocks_x;
+        let in_sb = by < sb_y * 2 && bx < sb_x * 2;
+        let dc_delta = read_coeff(data, pos)?;
+        let dc = if in_sb && !((by & 1) == 0 && (bx & 1) == 0) {
+            dc_delta
+        } else {
+            let v = prev_dc.saturating_add(dc_delta);
+            prev_dc = v;
+            v
+        };
+        dcs[i] = dc;
+
+        if *pos >= data.len() {
+            bail!("unexpected EOF reading DCT RLE token");
+        }
+        let first_tok = data[*pos];
+        *pos += 1;
+        if first_tok != 0 {
+            let blk = ac_blocks[i].write([0i32; 64]);
+            has_ac[i] = true;
+            let mut tok = first_tok;
+            let mut zi = 1usize;
+            loop {
+                let run = (tok - 1) as usize;
+                zi += run;
+                if zi >= 64 {
+                    bail!("DCT RLE run overflow");
+                }
+                let zz = ZIGZAG[zi];
+                let c = read_coeff(data, pos)?;
+                blk[zz] = c.saturating_mul(quant[zz]).clamp(-32_768, 32_768);
+                zi += 1;
+                if zi >= 64 {
+                    break;
+                }
+                if *pos >= data.len() {
+                    bail!("unexpected EOF reading DCT RLE token");
+                }
+                tok = data[*pos];
+                *pos += 1;
+                if tok == 0 {
+                    break;
                 }
             }
         }
     }
+    apply_inv_superblock_wht_dcs(&mut dcs[..count], blocks_x, blocks_y);
+
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let b_idx = by * blocks_x + bx;
+            let deq0 = dcs[b_idx].saturating_mul(quant[0]).clamp(-32_768, 32_768);
+            if !has_ac[b_idx] {
+                let col0 = deq0.wrapping_mul(C4).wrapping_add(1 << 10) >> 11;
+                let dc_spatial = col0.wrapping_mul(C4).wrapping_add(1 << 16) >> 17;
+                if let Some(ref_p) = ref_plane {
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        for c in 0..8 {
+                            let idx = row_off + c;
+                            recon_plane[idx] = (ref_p[idx] + dc_spatial).clamp(0, 255);
+                        }
+                    }
+                } else {
+                    let v = (dc_spatial + 128).clamp(0, 255);
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        recon_plane[row_off..row_off + 8].fill(v);
+                    }
+                }
+            } else {
+                let dequant = unsafe { ac_blocks[b_idx].assume_init_mut() };
+                dequant[0] = deq0;
+                let idct = idct_8x8(dequant);
+                if let Some(ref_p) = ref_plane {
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        for c in 0..8 {
+                            let idx = row_off + c;
+                            recon_plane[idx] = (ref_p[idx] + idct[r * 8 + c]).clamp(0, 255);
+                        }
+                    }
+                } else {
+                    for r in 0..8 {
+                        let row_off = (by * 8 + r) * plane_dim + bx * 8;
+                        for c in 0..8 {
+                            recon_plane[row_off + c] = (idct[r * 8 + c] + 128).clamp(0, 255);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    deblock_and_sao_plane(recon_plane, plane_dim, blocks_x, blocks_y, quant[0]);
     Ok(())
+}
+
+/// HEVC-style in-loop 4-tap 8x8 boundary deblocking filter (`[p1, p0 | q0, q1]`) combined with
+/// edge-preserving Sample Adaptive Offset (SAO) anti-ringing damping.
+/// Eliminates 8x8 block grid edges inside the temporal reference loop while preserving sharp 1-px UI text.
+fn deblock_and_sao_plane(
+    plane: &mut [i32],
+    plane_dim: usize,
+    blocks_x: usize,
+    blocks_y: usize,
+    q_dc: i32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::deblock_and_sao_plane(plane, plane_dim, blocks_x, blocks_y, q_dc);
+            }
+            return;
+        }
+    }
+    simd::deblock_and_sao_plane_scalar(plane, plane_dim, blocks_x, blocks_y, q_dc);
 }
 
 // ---------------------------------------------------------------------------
@@ -1962,7 +2280,7 @@ impl SmartTileEncoder {
             self.source_bgra.copy_from_slice(bgra);
         }
 
-        let payload = lz4_flex::compress_prepend_size(&self.scratch_packet);
+        let payload = compress_packet_adaptive(&self.scratch_packet, used_lossy);
         SmartTilePacket {
             is_keyframe,
             used_lossy,
@@ -2178,14 +2496,15 @@ fn encode_tiles_with_gpu(
         }
 
         // Perform 2D motion estimation across up to 4 parallel bands when `gpu_descs.len() >= 48`.
+        // `pred_x` and `pred_y` are in half-pixel (1/2-pel) units (`2 * sx + hx`, `2 * sy + hy`).
         let batch_idx = gpu_descs.len();
         gpu_descs.push(gpu::GpuTileDesc {
             x0,
             y0,
             tw,
             th,
-            pred_x: x0,
-            pred_y: y0,
+            pred_x: x0 * 2,
+            pred_y: y0 * 2,
             has_alpha: 0,
             use_inter: 1,
         });
@@ -2244,8 +2563,8 @@ fn encode_tiles_with_gpu(
                                 desc.tw, desc.th,
                             );
                             if mv_sad < zero_sad {
-                                desc.pred_x = sx as u32;
-                                desc.pred_y = sy as u32;
+                                desc.pred_x = (sx as u32) * 2;
+                                desc.pred_y = (sy as u32) * 2;
                                 desc.has_alpha = MODE_FLAG_MV as u32;
                             }
                         }
@@ -2408,27 +2727,37 @@ fn encode_tiles_with_gpu(
                     }
 
                     let mut seq_blk = 0usize;
-                    let mut prev_dc_y = 0i32;
-                    for _ in 0..num_luma {
+                    let mut plane_blks = [[0i32; 64]; 64];
+                    for blk_dst in plane_blks.iter_mut().take(num_luma) {
                         let s = q_blocks_base + seq_blk * 32;
-                        let blk = unpack_blk(&qblocks_flat[s..s + 32]);
-                        encode_rle_block(&blk, &mut prev_dc_y, out_buf);
+                        *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
                         seq_blk += 1;
                     }
-                    let mut prev_dc_cb = 0i32;
-                    for _ in 0..num_chroma {
+                    encode_plane_qblocks(&mut plane_blks[..num_luma], luma_bx, luma_by, out_buf);
+
+                    for blk_dst in plane_blks.iter_mut().take(num_chroma) {
                         let s = q_blocks_base + seq_blk * 32;
-                        let blk = unpack_blk(&qblocks_flat[s..s + 32]);
-                        encode_rle_block(&blk, &mut prev_dc_cb, out_buf);
+                        *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
                         seq_blk += 1;
                     }
-                    let mut prev_dc_cr = 0i32;
-                    for _ in 0..num_chroma {
+                    encode_plane_qblocks(
+                        &mut plane_blks[..num_chroma],
+                        chroma_bx,
+                        chroma_by,
+                        out_buf,
+                    );
+
+                    for blk_dst in plane_blks.iter_mut().take(num_chroma) {
                         let s = q_blocks_base + seq_blk * 32;
-                        let blk = unpack_blk(&qblocks_flat[s..s + 32]);
-                        encode_rle_block(&blk, &mut prev_dc_cr, out_buf);
+                        *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
                         seq_blk += 1;
                     }
+                    encode_plane_qblocks(
+                        &mut plane_blks[..num_chroma],
+                        chroma_bx,
+                        chroma_by,
+                        out_buf,
+                    );
 
                     // Scatter reconstructed 64x64 BGRA tile back into `ref_chunk`.
                     let tile_byte_base = batch_idx * 4096 * 4;
@@ -2688,43 +3017,56 @@ fn encode_tile_batch(
 
         // Pick the best temporal predictor:
         // 1. Frame scroll MV `(sx, sy)` if a scroll was detected, else
-        // 2. Lightweight per-tile 2D diamond search `(local_dx, local_dy)` for panning video / moving objects.
-        let (pred_buf, pred_x, pred_y, mv_flag, local_mv): (&[u8], u32, u32, u8, Option<(i8, i8)>) =
-            if wants_lossy {
-                if let (Some(prev_full), Some((sx, sy))) = (prev_ref_full, mv_src) {
-                    let mv_sad =
-                        tile_bgra_sad(prev_full, cur_bgra, fb_w, sx, sy, x0, local_y0, tw, th);
-                    let zero_sad =
-                        tile_bgra_sad(ref_bgra, cur_bgra, fb_w, x0, local_y0, x0, local_y0, tw, th);
-                    if mv_sad < zero_sad {
-                        (prev_full, sx, sy, MODE_FLAG_MV, None)
-                    } else {
-                        (ref_bgra, x0, local_y0, 0, None)
-                    }
-                } else if let Some(prev_full) = prev_ref_full {
-                    if let Some((ldx, ldy, sx, sy)) = search_local_mv_2d(
-                        prev_full,
-                        cur_bgra,
-                        fb_w,
-                        fb_h,
-                        x0,
-                        y0,
-                        local_y0,
-                        tw,
-                        th,
-                        last_local_mv,
-                    ) {
-                        last_local_mv = (ldx, ldy);
-                        (prev_full, sx, sy, MODE_FLAG_LOCAL_MV, Some((ldx, ldy)))
-                    } else {
-                        (ref_bgra, x0, local_y0, 0, None)
-                    }
+        // 2. Lightweight per-tile 2D diamond search + 1/2-pel refinement `(local_dx_hpel, local_dy_hpel)`.
+        // `pred_x_hpel` and `pred_y_hpel` are in half-pixel units (`2 * sx + hx`, `2 * sy + hy`).
+        let (pred_buf, pred_x_hpel, pred_y_hpel, mv_flag, local_mv): (
+            &[u8],
+            u32,
+            u32,
+            u8,
+            Option<(i8, i8)>,
+        ) = if wants_lossy {
+            if let (Some(prev_full), Some((sx, sy))) = (prev_ref_full, mv_src) {
+                let mv_sad = tile_bgra_sad(prev_full, cur_bgra, fb_w, sx, sy, x0, local_y0, tw, th);
+                let zero_sad =
+                    tile_bgra_sad(ref_bgra, cur_bgra, fb_w, x0, local_y0, x0, local_y0, tw, th);
+                if mv_sad < zero_sad {
+                    (prev_full, sx * 2, sy * 2, MODE_FLAG_MV, None)
                 } else {
-                    (ref_bgra, x0, local_y0, 0, None)
+                    (ref_bgra, x0 * 2, local_y0 * 2, 0, None)
+                }
+            } else if let Some(prev_full) = prev_ref_full {
+                if let Some((ldx_h, ldy_h, sx_h, sy_h)) = search_local_mv_2d(
+                    prev_full,
+                    cur_bgra,
+                    fb_w,
+                    fb_h,
+                    x0,
+                    y0,
+                    local_y0,
+                    tw,
+                    th,
+                    last_local_mv,
+                ) {
+                    last_local_mv = (ldx_h, ldy_h);
+                    (
+                        prev_full,
+                        sx_h,
+                        sy_h,
+                        MODE_FLAG_LOCAL_MV,
+                        Some((ldx_h, ldy_h)),
+                    )
+                } else {
+                    (ref_bgra, x0 * 2, local_y0 * 2, 0, None)
                 }
             } else {
-                (ref_bgra, x0, local_y0, 0, None)
-            };
+                (ref_bgra, x0 * 2, local_y0 * 2, 0, None)
+            }
+        } else {
+            (ref_bgra, x0 * 2, local_y0 * 2, 0, None)
+        };
+        let pred_x = pred_x_hpel >> 1;
+        let pred_y = pred_y_hpel >> 1;
 
         if wants_lossy && prefer_quarter_res {
             *used_lossy = true;
@@ -3029,11 +3371,11 @@ fn encode_tile_batch(
                 &mut cur_cb,
                 &mut cur_cr,
             );
-            bgra_tile_to_ycbcr420(
+            bgra_tile_to_ycbcr420_hpel(
                 pred_buf,
                 fb_w,
-                pred_x,
-                pred_y,
+                pred_x_hpel,
+                pred_y_hpel,
                 tw,
                 th,
                 &mut ref_y,
@@ -3042,7 +3384,15 @@ fn encode_tile_batch(
             );
             if has_alpha {
                 bgra_tile_to_alpha(cur_bgra, fb_w, x0, local_y0, tw, th, &mut cur_a);
-                bgra_tile_to_alpha(pred_buf, fb_w, pred_x, pred_y, tw, th, &mut ref_a);
+                bgra_tile_to_alpha_hpel(
+                    pred_buf,
+                    fb_w,
+                    pred_x_hpel,
+                    pred_y_hpel,
+                    tw,
+                    th,
+                    &mut ref_a,
+                );
             }
 
             let use_inter = should_use_inter_tile(&cur_y, &ref_y);
@@ -3330,8 +3680,90 @@ fn tile_bgra_sad_fast(
     sad
 }
 
-/// Lightweight 4-step 8-neighbor Three-Step Search (`±24 px` range) seeded from
-/// `(0, 0)` and the left-neighbor tile's MV `seed_mv`. Returns `Some((dx, dy, sx, sy))` only
+/// Sampled 8x8-grid RGB SAD at half-pixel reference coordinates `(x0_hpel, y0_hpel)`
+/// (`2 * sx + hx`, `2 * sy + hy`, `hx, hy in {0, 1}`).
+#[allow(clippy::too_many_arguments)]
+fn tile_bgra_sad_hpel_fast(
+    src_fb: &[u8],
+    dst_fb: &[u8],
+    fb_w: u32,
+    x0_hpel: u32,
+    y0_hpel: u32,
+    dx: u32,
+    dy: u32,
+    tw: u32,
+    th: u32,
+) -> u64 {
+    let sx = x0_hpel >> 1;
+    let sy = y0_hpel >> 1;
+    let hx = (x0_hpel & 1) as usize;
+    let hy = (y0_hpel & 1) as usize;
+    if hx == 0 && hy == 0 {
+        return tile_bgra_sad_fast(src_fb, dst_fb, fb_w, sx, sy, dx, dy, tw, th);
+    }
+    let stride = fb_w as usize * 4;
+    let max_x = tw as usize - 1;
+    let max_y = th as usize - 1;
+    let mut sad = 0u64;
+    let mut py = 4usize.min(max_y);
+    while py < th as usize {
+        let cy1 = (py + hy).min(max_y);
+        let s_row0 = (sy as usize + py) * stride;
+        let s_row1 = (sy as usize + cy1) * stride;
+        let d_row = (dy as usize + py) * stride + (dx as usize) * 4;
+        let mut px = 4usize.min(max_x);
+        while px < tw as usize {
+            let cx1 = (px + hx).min(max_x);
+            let i00 = s_row0 + (sx as usize + px) * 4;
+            let i01 = s_row0 + (sx as usize + cx1) * 4;
+            let i10 = s_row1 + (sx as usize + px) * 4;
+            let i11 = s_row1 + (sx as usize + cx1) * 4;
+            let (sb, sg, sr) = match (hx, hy) {
+                (1, 0) => (
+                    (src_fb[i00] as i32 + src_fb[i01] as i32 + 1) >> 1,
+                    (src_fb[i00 + 1] as i32 + src_fb[i01 + 1] as i32 + 1) >> 1,
+                    (src_fb[i00 + 2] as i32 + src_fb[i01 + 2] as i32 + 1) >> 1,
+                ),
+                (0, 1) => (
+                    (src_fb[i00] as i32 + src_fb[i10] as i32 + 1) >> 1,
+                    (src_fb[i00 + 1] as i32 + src_fb[i10 + 1] as i32 + 1) >> 1,
+                    (src_fb[i00 + 2] as i32 + src_fb[i10 + 2] as i32 + 1) >> 1,
+                ),
+                _ => (
+                    (src_fb[i00] as i32
+                        + src_fb[i01] as i32
+                        + src_fb[i10] as i32
+                        + src_fb[i11] as i32
+                        + 2)
+                        >> 2,
+                    (src_fb[i00 + 1] as i32
+                        + src_fb[i01 + 1] as i32
+                        + src_fb[i10 + 1] as i32
+                        + src_fb[i11 + 1] as i32
+                        + 2)
+                        >> 2,
+                    (src_fb[i00 + 2] as i32
+                        + src_fb[i01 + 2] as i32
+                        + src_fb[i10 + 2] as i32
+                        + src_fb[i11 + 2] as i32
+                        + 2)
+                        >> 2,
+                ),
+            };
+            let dp = d_row + px * 4;
+            sad += (sb - dst_fb[dp] as i32).unsigned_abs() as u64
+                + (sg - dst_fb[dp + 1] as i32).unsigned_abs() as u64
+                + (sr - dst_fb[dp + 2] as i32).unsigned_abs() as u64;
+            px += 8;
+        }
+        py += 8;
+    }
+    sad
+}
+
+/// Lightweight 4-step 8-neighbor Three-Step Search (`±24 px` integer range, refined to `1/2-pel`
+/// sub-pixel precision in half-pixel units `[-48, +48]`) seeded from `(0, 0)` and the left-neighbor
+/// tile's half-pel MV `seed_mv_hpel`. Returns `Some((dx_hpel, dy_hpel, sx_hpel, sy_hpel))` only
 /// when the motion-compensated match beats zero-MV by at least 20%.
 #[allow(clippy::too_many_arguments)]
 fn search_local_mv_2d(
@@ -3344,53 +3776,68 @@ fn search_local_mv_2d(
     local_y0: u32,
     tw: u32,
     th: u32,
-    seed_mv: (i8, i8),
+    seed_mv_hpel: (i8, i8),
 ) -> Option<(i8, i8, u32, u32)> {
-    const MAX_RANGE: i32 = 24;
+    const MAX_RANGE_INT: i32 = 24;
+    const MAX_RANGE_HPEL: i32 = 48;
     let zero_sad = tile_bgra_sad_fast(prev_full, cur_band, fb_w, x0, y0, x0, local_y0, tw, th);
     // Skip search on near-stationary tiles (mean RGB diff < ~2/channel across 64 samples).
     if zero_sad < 384 {
         return None;
     }
 
-    let mut best_dx = 0i32;
-    let mut best_dy = 0i32;
+    let mut best_dx_hpel = 0i32;
+    let mut best_dy_hpel = 0i32;
     let mut best_sad = zero_sad;
 
-    let eval = |dx: i32, dy: i32| -> Option<(u64, u32, u32)> {
-        if dx.abs() > MAX_RANGE || dy.abs() > MAX_RANGE {
+    let eval_hpel = |dx_h: i32, dy_h: i32| -> Option<(u64, u32, u32)> {
+        if dx_h.abs() > MAX_RANGE_HPEL || dy_h.abs() > MAX_RANGE_HPEL {
             return None;
         }
-        let sx = x0 as i32 - dx;
-        let sy = y0 as i32 - dy;
-        if sx < 0 || sy < 0 || (sx as u32) + tw > fb_w || (sy as u32) + th > fb_h {
+        let sx_h = (x0 as i32) * 2 - dx_h;
+        let sy_h = (y0 as i32) * 2 - dy_h;
+        if sx_h < 0 || sy_h < 0 {
             return None;
         }
-        let sad = tile_bgra_sad_fast(
-            prev_full, cur_band, fb_w, sx as u32, sy as u32, x0, local_y0, tw, th,
+        let sx = (sx_h as u32) >> 1;
+        let sy = (sy_h as u32) >> 1;
+        if sx + tw > fb_w || sy + th > fb_h {
+            return None;
+        }
+        let sad = tile_bgra_sad_hpel_fast(
+            prev_full,
+            cur_band,
+            fb_w,
+            sx_h as u32,
+            sy_h as u32,
+            x0,
+            local_y0,
+            tw,
+            th,
         );
-        Some((sad, sx as u32, sy as u32))
+        Some((sad, sx_h as u32, sy_h as u32))
     };
 
-    // Test spatial neighbor MV predictor first (immediately nails uniform camera pans).
-    if seed_mv != (0, 0) {
-        if let Some((sad, _, _)) = eval(seed_mv.0 as i32, seed_mv.1 as i32) {
+    // Test spatial neighbor MV predictor first (including its half-pel fractional phase!).
+    if seed_mv_hpel != (0, 0) {
+        if let Some((sad, _, _)) = eval_hpel(seed_mv_hpel.0 as i32, seed_mv_hpel.1 as i32) {
             if sad < best_sad {
                 best_sad = sad;
-                best_dx = seed_mv.0 as i32;
-                best_dy = seed_mv.1 as i32;
+                best_dx_hpel = seed_mv_hpel.0 as i32;
+                best_dy_hpel = seed_mv_hpel.1 as i32;
             }
         }
     }
 
-    // 4-step logarithmic 8-neighbor search (Three-Step Search: cardinal + diagonal): 8 -> 4 -> 2 -> 1 px.
+    // 4-step logarithmic 8-neighbor integer search (8 -> 4 -> 2 -> 1 px, i.e., 16 -> 8 -> 4 -> 2 hpel).
+    let mut best_int_dx = best_dx_hpel / 2;
+    let mut best_int_dy = best_dy_hpel / 2;
     for step in [8i32, 4, 2, 1] {
         if best_sad * 5 <= zero_sad && step >= 4 {
-            // Spatial predictor already found a great match; skip coarse steps and refine finely.
             continue;
         }
-        let cx = best_dx;
-        let cy = best_dy;
+        let cx = best_int_dx;
+        let cy = best_int_dy;
         for (ndx, ndy) in [
             (cx - step, cy),
             (cx + step, cy),
@@ -3401,20 +3848,46 @@ fn search_local_mv_2d(
             (cx - step, cy + step),
             (cx + step, cy + step),
         ] {
-            if let Some((sad, _, _)) = eval(ndx, ndy) {
-                if sad < best_sad {
-                    best_sad = sad;
-                    best_dx = ndx;
-                    best_dy = ndy;
+            if ndx.abs() <= MAX_RANGE_INT && ndy.abs() <= MAX_RANGE_INT {
+                if let Some((sad, _, _)) = eval_hpel(ndx * 2, ndy * 2) {
+                    if sad < best_sad {
+                        best_sad = sad;
+                        best_int_dx = ndx;
+                        best_int_dy = ndy;
+                        best_dx_hpel = ndx * 2;
+                        best_dy_hpel = ndy * 2;
+                    }
                 }
             }
         }
     }
 
-    if (best_dx != 0 || best_dy != 0) && best_sad * 10 <= zero_sad * 8 {
-        let sx = (x0 as i32 - best_dx) as u32;
-        let sy = (y0 as i32 - best_dy) as u32;
-        Some((best_dx as i8, best_dy as i8, sx, sy))
+    // Sub-pixel 1/2-pel refinement step (`±1` half-pel unit around the winning integer/seed vector).
+    let cx_h = best_dx_hpel;
+    let cy_h = best_dy_hpel;
+    for (nhx, nhy) in [
+        (cx_h - 1, cy_h),
+        (cx_h + 1, cy_h),
+        (cx_h, cy_h - 1),
+        (cx_h, cy_h + 1),
+        (cx_h - 1, cy_h - 1),
+        (cx_h + 1, cy_h - 1),
+        (cx_h - 1, cy_h + 1),
+        (cx_h + 1, cy_h + 1),
+    ] {
+        if let Some((sad, _, _)) = eval_hpel(nhx, nhy) {
+            if sad < best_sad {
+                best_sad = sad;
+                best_dx_hpel = nhx;
+                best_dy_hpel = nhy;
+            }
+        }
+    }
+
+    if (best_dx_hpel != 0 || best_dy_hpel != 0) && best_sad * 10 <= zero_sad * 8 {
+        let sx_hpel = ((x0 as i32) * 2 - best_dx_hpel) as u32;
+        let sy_hpel = ((y0 as i32) * 2 - best_dy_hpel) as u32;
+        Some((best_dx_hpel as i8, best_dy_hpel as i8, sx_hpel, sy_hpel))
     } else {
         None
     }
@@ -4046,22 +4519,27 @@ impl SmartTileDecoder {
                 }
                 Ok((sx as u32, sy as u32))
             };
-            let read_local_mv_src = |pos: &mut usize| -> Result<(u32, u32)> {
+            let read_local_mv_hpel_src = |pos: &mut usize| -> Result<(u32, u32)> {
                 if !has_prev_snapshot {
                     bail!("tile uses LOCAL_MV without FLAG_PREV_REF");
                 }
                 if *pos + 2 > raw.len() {
                     bail!("unexpected EOF reading SmartTile local MV");
                 }
-                let dx = raw[*pos] as i8 as i32;
-                let dy = raw[*pos + 1] as i8 as i32;
+                let dx_h = raw[*pos] as i8 as i32;
+                let dy_h = raw[*pos + 1] as i8 as i32;
                 *pos += 2;
-                let sx = x0 as i32 - dx;
-                let sy = y0 as i32 - dy;
-                if sx < 0 || sy < 0 || (sx as u32) + tw > width || (sy as u32) + th > height {
-                    bail!("SmartTile local MV ({dx}, {dy}) out of bounds at ({x0}, {y0})");
+                let sx_h = (x0 as i32) * 2 - dx_h;
+                let sy_h = (y0 as i32) * 2 - dy_h;
+                if sx_h < 0 || sy_h < 0 {
+                    bail!("SmartTile local MV ({dx_h}, {dy_h}) out of bounds at ({x0}, {y0})");
                 }
-                Ok((sx as u32, sy as u32))
+                let sx = (sx_h as u32) >> 1;
+                let sy = (sy_h as u32) >> 1;
+                if sx + tw > width || sy + th > height {
+                    bail!("SmartTile local MV ({dx_h}, {dy_h}) out of bounds at ({x0}, {y0})");
+                }
+                Ok((sx_h as u32, sy_h as u32))
             };
             match base_mode {
                 MODE_LOSSLESS_RAW if !has_alpha && !use_mv && !use_local_mv => {
@@ -4167,20 +4645,20 @@ impl SmartTileDecoder {
                     let luma_by = (th as usize).div_ceil(8);
                     let chroma_bx = ((tw as usize).div_ceil(2)).div_ceil(8);
                     let chroma_by = ((th as usize).div_ceil(2)).div_ceil(8);
-                    let (pred_buf, px0, py0): (&[u8], u32, u32) = if use_mv {
+                    let (pred_buf, px0_hpel, py0_hpel): (&[u8], u32, u32) = if use_mv {
                         let (sx, sy) = mv_src(x0, y0, tw, th)?;
-                        (&self.prev_bgra, sx, sy)
+                        (&self.prev_bgra, sx * 2, sy * 2)
                     } else if use_local_mv {
-                        let (sx, sy) = read_local_mv_src(&mut pos)?;
-                        (&self.prev_bgra, sx, sy)
+                        let (sx_h, sy_h) = read_local_mv_hpel_src(&mut pos)?;
+                        (&self.prev_bgra, sx_h, sy_h)
                     } else {
-                        (&*bgra_mut, x0, y0)
+                        (&*bgra_mut, x0 * 2, y0 * 2)
                     };
-                    bgra_tile_to_ycbcr420(
+                    bgra_tile_to_ycbcr420_hpel(
                         pred_buf,
                         width,
-                        px0,
-                        py0,
+                        px0_hpel,
+                        py0_hpel,
                         tw,
                         th,
                         &mut sc.ref_y,
@@ -4188,7 +4666,15 @@ impl SmartTileDecoder {
                         &mut sc.ref_cr,
                     );
                     if has_alpha {
-                        bgra_tile_to_alpha(pred_buf, width, px0, py0, tw, th, &mut sc.ref_a);
+                        bgra_tile_to_alpha_hpel(
+                            pred_buf,
+                            width,
+                            px0_hpel,
+                            py0_hpel,
+                            tw,
+                            th,
+                            &mut sc.ref_a,
+                        );
                     }
                     decode_plane(
                         &raw,
@@ -4322,8 +4808,8 @@ impl SmartTileDecoder {
                         let (sx, sy) = mv_src(x0, y0, tw, th)?;
                         (&self.prev_bgra, sx, sy)
                     } else if use_local_mv {
-                        let (sx, sy) = read_local_mv_src(&mut pos)?;
-                        (&self.prev_bgra, sx, sy)
+                        let (sx_h, sy_h) = read_local_mv_hpel_src(&mut pos)?;
+                        (&self.prev_bgra, sx_h >> 1, sy_h >> 1)
                     } else {
                         (&*bgra_mut, x0, y0)
                     };
@@ -4473,8 +4959,8 @@ impl SmartTileDecoder {
                         let (sx, sy) = mv_src(x0, y0, tw, th)?;
                         (&self.prev_bgra, sx, sy)
                     } else if use_local_mv {
-                        let (sx, sy) = read_local_mv_src(&mut pos)?;
-                        (&self.prev_bgra, sx, sy)
+                        let (sx_h, sy_h) = read_local_mv_hpel_src(&mut pos)?;
+                        (&self.prev_bgra, sx_h >> 1, sy_h >> 1)
                     } else {
                         (&*bgra_mut, x0, y0)
                     };
@@ -5183,7 +5669,7 @@ mod tests {
             "diagonal pan should not trigger 1D scroll MV"
         );
         assert!(p1.used_lossy);
-        let raw1 = lz4_flex::decompress_size_prepended(&p1.payload).unwrap();
+        let raw1 = decompress_lz4_bounded(&p1.payload, MAX_DECODED_FRAME_BYTES).unwrap();
         assert_ne!(
             raw1[1] & FLAG_PREV_REF,
             0,
@@ -5539,6 +6025,28 @@ mod tests {
             assert_eq!(&dec_simd[..], cur);
         }
 
+        // Test deblock_and_sao_plane SIMD vs Scalar across full-res, half-res, quarter-res, and partial block grids
+        for &(pdim, bx, by, q_dc) in &[
+            (64usize, 8usize, 8usize, 8i32),
+            (64, 7, 5, 24),
+            (32, 4, 4, 16),
+            (32, 3, 2, 32),
+            (16, 2, 2, 40),
+            (8, 1, 1, 12),
+        ] {
+            let mut p_simd = vec![0i32; pdim * pdim];
+            for (k, v) in p_simd.iter_mut().enumerate() {
+                *v = (((k * 37) ^ ((k >> 3) * 19)) & 0xFF) as i32;
+            }
+            let mut p_scal = p_simd.clone();
+            deblock_and_sao_plane(&mut p_simd, pdim, bx, by, q_dc);
+            simd::deblock_and_sao_plane_scalar(&mut p_scal, pdim, bx, by, q_dc);
+            assert_eq!(
+                p_simd, p_scal,
+                "deblock_and_sao_plane SIMD vs Scalar mismatch for pdim={pdim} {bx}x{by} q_dc={q_dc}"
+            );
+        }
+
         // Quick throughput sanity check comparing SIMD vs Scalar kernels.
         let iters = 2000usize;
         let sample_block = [42i32; 64];
@@ -5779,39 +6287,53 @@ mod tests {
             })
             .collect();
 
-        let run_e2e =
-            |force_scalar: bool, disable_gpu: bool, quality: u8| -> (Duration, Duration, Vec<u8>) {
-                FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
-                FORCE_DISABLE_GPU.store(disable_gpu, Ordering::Relaxed);
-                let mut enc = SmartTileEncoder::new();
-                let mut dec = SmartTileDecoder::new();
-                // Prime with keyframe + first motion frame
-                let p0 = enc.encode(w, h, &frames[0], quality);
-                let _ = dec.decode(w, h, &p0.payload).unwrap();
-                let p1 = enc.encode(w, h, &frames[1], quality);
-                let _ = dec.decode(w, h, &p1.payload).unwrap();
+        let run_e2e = |force_scalar: bool,
+                       disable_gpu: bool,
+                       quality: u8|
+         -> (Duration, Duration, usize, usize, Vec<u8>) {
+            FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
+            FORCE_DISABLE_GPU.store(disable_gpu, Ordering::Relaxed);
+            let mut enc = SmartTileEncoder::new();
+            let mut dec = SmartTileDecoder::new();
+            // Prime with keyframe + first motion frame
+            let p0 = enc.encode(w, h, &frames[0], quality);
+            let _ = dec.decode(w, h, &p0.payload).unwrap();
+            let p1 = enc.encode(w, h, &frames[1], quality);
+            let _ = dec.decode(w, h, &p1.payload).unwrap();
 
-                let mut enc_time = Duration::ZERO;
-                let mut dec_time = Duration::ZERO;
-                let mut last_dec = Vec::new();
-                for f in &frames[2..6] {
-                    let t_e = Instant::now();
-                    let pkt = enc.encode(w, h, f, quality);
-                    enc_time += t_e.elapsed();
+            let mut enc_time = Duration::ZERO;
+            let mut dec_time = Duration::ZERO;
+            let mut total_pkt_bytes = 0usize;
+            let mut total_lz4_only_bytes = 0usize;
+            let mut last_dec = Vec::new();
+            for f in &frames[2..6] {
+                let t_e = Instant::now();
+                let pkt = enc.encode(w, h, f, quality);
+                enc_time += t_e.elapsed();
+                total_pkt_bytes += pkt.payload.len();
+                let raw = decompress_lz4_bounded(&pkt.payload, MAX_DECODED_FRAME_BYTES).unwrap();
+                total_lz4_only_bytes += lz4_flex::compress_prepend_size(&raw).len();
 
-                    let t_d = Instant::now();
-                    let (buf, _) = dec.decode_with_damage(w, h, &pkt.payload).unwrap();
-                    dec_time += t_d.elapsed();
-                    last_dec = (*buf).clone();
-                }
-                FORCE_SCALAR.store(false, Ordering::Relaxed);
-                FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
-                (enc_time / 4, dec_time / 4, last_dec)
-            };
+                let t_d = Instant::now();
+                let (buf, _) = dec.decode_with_damage(w, h, &pkt.payload).unwrap();
+                dec_time += t_d.elapsed();
+                last_dec = (*buf).clone();
+            }
+            FORCE_SCALAR.store(false, Ordering::Relaxed);
+            FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
+            (
+                enc_time / 4,
+                dec_time / 4,
+                total_pkt_bytes / 4,
+                total_lz4_only_bytes / 4,
+                last_dec,
+            )
+        };
 
-        let (e_full_gpu, _d_full_gpu, out_full_gpu) = run_e2e(false, false, 75);
-        let (e_full_simd, d_full_simd, out_full_simd) = run_e2e(false, true, 75);
-        let (e_full_scal, d_full_scal, out_full_scal) = run_e2e(true, true, 75);
+        let (e_full_gpu, _d_full_gpu, pkt_full_bytes, lz4_full_bytes, out_full_gpu) =
+            run_e2e(false, false, 75);
+        let (e_full_simd, d_full_simd, _, _, out_full_simd) = run_e2e(false, true, 75);
+        let (e_full_scal, d_full_scal, _, _, out_full_scal) = run_e2e(true, true, 75);
         assert_eq!(
             out_full_simd, out_full_scal,
             "end-to-end 1080p full-res SIMD vs Scalar must be bit-identical"
@@ -5821,8 +6343,9 @@ mod tests {
             "end-to-end 1080p full-res GPU vs SIMD must be bit-identical"
         );
 
-        let (e_half_simd, d_half_simd, out_half_simd) = run_e2e(false, true, 50);
-        let (e_half_scal, d_half_scal, out_half_scal) = run_e2e(true, true, 50);
+        let (e_half_simd, d_half_simd, pkt_half_bytes, lz4_half_bytes, out_half_simd) =
+            run_e2e(false, true, 50);
+        let (e_half_scal, d_half_scal, _, _, out_half_scal) = run_e2e(true, true, 50);
         assert_eq!(
             out_half_simd, out_half_scal,
             "end-to-end 1080p half-res must be bit-identical"
@@ -5837,14 +6360,16 @@ mod tests {
             }
         }
         println!(
-            "1080p Full-Res Motion (per frame): Encode GPU {:?} | SIMD {:?} | Scalar {:?} (GPU {:.2}x vs Scalar, {:.2}x vs SIMD) | Decode SIMD {:?} vs Scalar {:?} ({:.2}x)\n\
-             1080p Half-Res Motion (per frame): Encode SIMD {:?} vs Scalar {:?} ({:.2}x) | Decode SIMD {:?} vs Scalar {:?} ({:.2}x)",
+            "1080p Full-Res Motion (per frame): Encode GPU {:?} | SIMD {:?} | Scalar {:?} (GPU {:.2}x vs Scalar, {:.2}x vs SIMD) | Decode SIMD {:?} vs Scalar {:?} ({:.2}x) | Bandwidth: {} B (rANS) vs {} B (LZ4)\n\
+             1080p Half-Res Motion (per frame): Encode SIMD {:?} vs Scalar {:?} ({:.2}x) | Decode SIMD {:?} vs Scalar {:?} ({:.2}x) | Bandwidth: {} B (rANS) vs {} B (LZ4)",
             e_full_gpu, e_full_simd, e_full_scal,
             e_full_scal.as_secs_f64() / e_full_gpu.as_secs_f64().max(1e-9),
             e_full_simd.as_secs_f64() / e_full_gpu.as_secs_f64().max(1e-9),
             d_full_simd, d_full_scal, d_full_scal.as_secs_f64() / d_full_simd.as_secs_f64().max(1e-9),
+            pkt_full_bytes, lz4_full_bytes,
             e_half_simd, e_half_scal, e_half_scal.as_secs_f64() / e_half_simd.as_secs_f64().max(1e-9),
             d_half_simd, d_half_scal, d_half_scal.as_secs_f64() / d_half_simd.as_secs_f64().max(1e-9),
+            pkt_half_bytes, lz4_half_bytes,
         );
     }
 
@@ -6001,7 +6526,7 @@ mod tests {
             let cq = build_quant_table(&BASE_CHROMA_QUANT, 75);
             let mut raw_pkt = vec![PACKET_VERSION, 0, 75, 0];
             raw_pkt.extend_from_slice(&(dirty.len() as u32).to_le_bytes());
-            let (_, used_lmv) = encode_tiles_with_gpu(
+            let (used_lossy_gpu, used_lmv) = encode_tiles_with_gpu(
                 &engine,
                 &mut enc_gpu.ref_bgra,
                 &mut enc_gpu.prev_ref_bgra,
@@ -6022,7 +6547,7 @@ mod tests {
             if used_lmv {
                 raw_pkt[1] |= FLAG_PREV_REF;
             }
-            let gpu_payload = lz4_flex::compress_prepend_size(&raw_pkt);
+            let gpu_payload = compress_packet_adaptive(&raw_pkt, used_lossy_gpu);
             assert_eq!(
                 gpu_payload, cpu_pkt.payload,
                 "GPU compute shader encoded packet must be 100% bit-identical to CPU!"
@@ -6031,6 +6556,164 @@ mod tests {
         assert_eq!(
             enc_gpu.ref_bgra, enc_cpu.ref_bgra,
             "GPU and CPU reference framebuffers must match bit-for-bit!"
+        );
+    }
+
+    #[test]
+    fn subpixel_hpel_motion_and_rans_entropy_coding_are_bit_exact() {
+        // 1. Verify 4-way interleaved rANS roundtrip across empty, constant, sparse, and dense random payloads.
+        assert_eq!(
+            rans::decompress_rans_bounded(&rans::compress_rans_prepend_size(&[]), 1024).unwrap(),
+            Vec::<u8>::new()
+        );
+        let const_buf = vec![42u8; 777];
+        assert_eq!(
+            rans::decompress_rans_bounded(&rans::compress_rans_prepend_size(&const_buf), 1024)
+                .unwrap(),
+            const_buf
+        );
+
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut skew_buf = Vec::with_capacity(8195);
+        for _ in 0..8195 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let r = (rng >> 56) as u8;
+            // Realistic skewed DCT RLE symbol distribution (zeros & small tokens dominate)
+            skew_buf.push(if r < 150 {
+                0
+            } else if r < 210 {
+                1
+            } else if r < 240 {
+                255
+            } else {
+                r
+            });
+        }
+        let rans_comp = rans::compress_rans_prepend_size(&skew_buf);
+        let lz4_comp = lz4_flex::compress_prepend_size(&skew_buf);
+        assert!(
+            rans_comp.len() < lz4_comp.len(),
+            "expected rANS ({} B) to compress skewed DCT distribution smaller than LZ4 ({} B)",
+            rans_comp.len(),
+            lz4_comp.len()
+        );
+        assert_eq!(
+            rans::decompress_rans_bounded(&rans_comp, 16384).unwrap(),
+            skew_buf
+        );
+
+        // 2. Verify fractional half-pixel (`1.5 px`, `-2.5 px`) diagonal panning video across GPU, AVX2 SIMD, and Scalar!
+        let w = 640u32;
+        let h = 512u32;
+        let world_w = (w * 2 + 128) as usize;
+        let world_h = (h * 2 + 128) as usize;
+        let mut world = vec![0u8; world_w * world_h * 3];
+        for wy in 0..world_h {
+            for wx in 0..world_w {
+                let idx = (wy * world_w + wx) * 3;
+                let v0 = (((wx * 3 + wy * 5) >> 1) & 0xFF) as u8;
+                let v1 = (((wx ^ wy) >> 1) & 0xFF) as u8;
+                let v2 = (((wx * 7).wrapping_sub(wy * 3) >> 2) & 0xFF) as u8;
+                world[idx] = v0;
+                world[idx + 1] = v1;
+                world[idx + 2] = v2;
+            }
+        }
+        // Sample `world` at half-pixel shifts `(step * 3, step * 5)` (i.e. +1.5 px, +2.5 px per frame!)
+        let sample_hpel_frame = |step: usize| -> Vec<u8> {
+            let ox = 32 + step * 3;
+            let oy = 32 + step * 5;
+            let mut fb = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let wx = ox + x * 2;
+                    let wy = oy + y * 2;
+                    let widx = (wy * world_w + wx) * 3;
+                    let didx = (y * w as usize + x) * 4;
+                    fb[didx] = world[widx];
+                    fb[didx + 1] = world[widx + 1];
+                    fb[didx + 2] = world[widx + 2];
+                    fb[didx + 3] = 255;
+                }
+            }
+            fb
+        };
+
+        let f0 = sample_hpel_frame(0);
+        let f1 = sample_hpel_frame(1);
+        let f2 = sample_hpel_frame(2);
+
+        FORCE_SCALAR.store(true, Ordering::Relaxed);
+        FORCE_DISABLE_GPU.store(true, Ordering::Relaxed);
+        let mut enc_scal = SmartTileEncoder::new();
+        let _ = enc_scal.encode(w, h, &f0, 75);
+        let p1_scal = enc_scal.encode(w, h, &f1, 75);
+        let p2_scal = enc_scal.encode(w, h, &f2, 75);
+        FORCE_SCALAR.store(false, Ordering::Relaxed);
+
+        let mut enc_simd = SmartTileEncoder::new();
+        let _ = enc_simd.encode(w, h, &f0, 75);
+        let p1_simd = enc_simd.encode(w, h, &f1, 75);
+        let p2_simd = enc_simd.encode(w, h, &f2, 75);
+        FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
+
+        assert_eq!(
+            p1_simd.payload, p1_scal.payload,
+            "Half-pel SIMD vs Scalar packet 1 mismatch"
+        );
+        assert_eq!(
+            p2_simd.payload, p2_scal.payload,
+            "Half-pel SIMD vs Scalar packet 2 mismatch"
+        );
+        assert_eq!(enc_simd.ref_bgra, enc_scal.ref_bgra);
+
+        let mut dec_clean = SmartTileDecoder::new();
+        let mut enc_gpu = SmartTileEncoder::new();
+        let p0_gpu = enc_gpu.encode(w, h, &f0, 75);
+        let d0 = dec_clean.decode(w, h, &p0_gpu.payload).unwrap();
+        assert_eq!(
+            d0, enc_gpu.ref_bgra,
+            "Decoded frame 0 must match GPU encoder reference"
+        );
+
+        let p1_gpu = enc_gpu.encode(w, h, &f1, 75);
+        let d1 = dec_clean.decode(w, h, &p1_gpu.payload).unwrap();
+        assert_eq!(
+            d1, enc_gpu.ref_bgra,
+            "Decoded frame 1 must match GPU encoder reference"
+        );
+
+        let p2_gpu = enc_gpu.encode(w, h, &f2, 75);
+        let d2 = dec_clean.decode(w, h, &p2_gpu.payload).unwrap();
+
+        assert_eq!(
+            p1_gpu.payload, p1_simd.payload,
+            "Half-pel GPU vs SIMD packet 1 mismatch"
+        );
+        assert_eq!(
+            p2_gpu.payload, p2_simd.payload,
+            "Half-pel GPU vs SIMD packet 2 mismatch"
+        );
+        assert_eq!(
+            d2, enc_gpu.ref_bgra,
+            "Decoded frame 2 must match GPU encoder reference"
+        );
+        assert_eq!(
+            d2, enc_scal.ref_bgra,
+            "Decoded frame 2 must match Scalar encoder reference"
+        );
+
+        // Verify that the lossy half-pel packets actually engaged two-stage LZ4 + rANS entropy coding!
+        let hdr1 = u32::from_le_bytes([
+            p1_gpu.payload[0],
+            p1_gpu.payload[1],
+            p1_gpu.payload[2],
+            p1_gpu.payload[3],
+        ]);
+        assert_ne!(
+            hdr1 & rans::RANS_MAGIC_BIT,
+            0,
+            "Expected lossy SmartTilePacket to select LZ4 + 4-way rANS compression"
         );
     }
 }

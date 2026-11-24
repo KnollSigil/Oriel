@@ -145,6 +145,102 @@ pub fn bgra_tile_to_ycbcr420_scalar(
     }
 }
 
+/// Extract a motion-predicted tile from `bgra` at half-pixel coordinates `(x0_hpel, y0_hpel)`
+/// (where `x0_hpel = 2 * sx + hx`, `y0_hpel = 2 * sy + hy`, `hx, hy in {0, 1}`) into padded
+/// 64x64 Y and 32x32 Cb/Cr planes using bit-exact integer bilinear interpolation.
+#[allow(clippy::too_many_arguments)]
+pub fn bgra_tile_to_ycbcr420_hpel_scalar(
+    bgra: &[u8],
+    fb_w: u32,
+    x0_hpel: u32,
+    y0_hpel: u32,
+    tw: u32,
+    th: u32,
+    y_plane: &mut [i32; 64 * 64],
+    cb_plane: &mut [i32; 32 * 32],
+    cr_plane: &mut [i32; 32 * 32],
+) {
+    let sx = x0_hpel >> 1;
+    let sy = y0_hpel >> 1;
+    let hx = (x0_hpel & 1) as usize;
+    let hy = (y0_hpel & 1) as usize;
+    if hx == 0 && hy == 0 {
+        bgra_tile_to_ycbcr420_scalar(bgra, fb_w, sx, sy, tw, th, y_plane, cb_plane, cr_plane);
+        return;
+    }
+
+    let stride = fb_w as usize * 4;
+    let max_x = tw as usize - 1;
+    let max_y = th as usize - 1;
+    let mut cb_full = [0i32; 64 * 64];
+    let mut cr_full = [0i32; 64 * 64];
+
+    for py in 0..64usize {
+        let cy0 = py.min(max_y);
+        let cy1 = (cy0 + hy).min(max_y);
+        let row0 = (sy as usize + cy0) * stride;
+        let row1 = (sy as usize + cy1) * stride;
+        for px in 0..64usize {
+            let cx0 = px.min(max_x);
+            let cx1 = (cx0 + hx).min(max_x);
+            let col0 = (sx as usize + cx0) * 4;
+            let col1 = (sx as usize + cx1) * 4;
+            let i00 = row0 + col0;
+            let i01 = row0 + col1;
+            let i10 = row1 + col0;
+            let i11 = row1 + col1;
+            let (b, g, r) = match (hx, hy) {
+                (1, 0) => (
+                    (bgra[i00] as i32 + bgra[i01] as i32 + 1) >> 1,
+                    (bgra[i00 + 1] as i32 + bgra[i01 + 1] as i32 + 1) >> 1,
+                    (bgra[i00 + 2] as i32 + bgra[i01 + 2] as i32 + 1) >> 1,
+                ),
+                (0, 1) => (
+                    (bgra[i00] as i32 + bgra[i10] as i32 + 1) >> 1,
+                    (bgra[i00 + 1] as i32 + bgra[i10 + 1] as i32 + 1) >> 1,
+                    (bgra[i00 + 2] as i32 + bgra[i10 + 2] as i32 + 1) >> 1,
+                ),
+                _ => (
+                    (bgra[i00] as i32 + bgra[i01] as i32 + bgra[i10] as i32 + bgra[i11] as i32 + 2)
+                        >> 2,
+                    (bgra[i00 + 1] as i32
+                        + bgra[i01 + 1] as i32
+                        + bgra[i10 + 1] as i32
+                        + bgra[i11 + 1] as i32
+                        + 2)
+                        >> 2,
+                    (bgra[i00 + 2] as i32
+                        + bgra[i01 + 2] as i32
+                        + bgra[i10 + 2] as i32
+                        + bgra[i11 + 2] as i32
+                        + 2)
+                        >> 2,
+                ),
+            };
+            let (y, cb, cr) = rgb_to_ycbcr(r, g, b);
+            let out_idx = py * 64 + px;
+            y_plane[out_idx] = y;
+            cb_full[out_idx] = cb;
+            cr_full[out_idx] = cr;
+        }
+    }
+
+    for cy in 0..32usize {
+        let y2 = cy * 2;
+        for cx in 0..32usize {
+            let x2 = cx * 2;
+            let i00 = y2 * 64 + x2;
+            let i01 = i00 + 1;
+            let i10 = i00 + 64;
+            let i11 = i10 + 1;
+            cb_plane[cy * 32 + cx] =
+                (cb_full[i00] + cb_full[i01] + cb_full[i10] + cb_full[i11] + 2) >> 2;
+            cr_plane[cy * 32 + cx] =
+                (cr_full[i00] + cr_full[i01] + cr_full[i10] + cr_full[i11] + 2) >> 2;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn ycbcr420_to_bgra_tile_scalar(
     y_plane: &[i32; 64 * 64],
@@ -404,6 +500,106 @@ pub fn xor_encode_row_scalar(ref_row: &mut [u8], cur_row: &[u8], out: &mut Vec<u
 pub fn xor_decode_row_scalar(dst_row: &mut [u8], src_row: &[u8]) {
     for (d, &s) in dst_row.iter_mut().zip(src_row.iter()) {
         *d ^= s;
+    }
+}
+
+pub fn deblock_and_sao_plane_scalar(
+    plane: &mut [i32],
+    plane_dim: usize,
+    blocks_x: usize,
+    blocks_y: usize,
+    q_dc: i32,
+) {
+    let beta = (q_dc + 4).clamp(6, 36);
+    let tc = ((q_dc + 3) >> 2).clamp(1, 10);
+    let active_w = (blocks_x * 8).min(plane_dim);
+    let active_h = (blocks_y * 8).min(plane_dim);
+
+    for by in 0..blocks_y {
+        for r in 0..8 {
+            let y = by * 8 + r;
+            if y >= active_h {
+                continue;
+            }
+            let row_off = y * plane_dim;
+            for bx in 1..blocks_x {
+                let x = bx * 8;
+                let p1 = plane[row_off + x - 2];
+                let p0 = plane[row_off + x - 1];
+                let q0 = plane[row_off + x];
+                let q1 = plane[row_off + x + 1];
+                if (p0 - q0).abs() < beta
+                    && (p1 - p0).abs() < (beta >> 1)
+                    && (q1 - q0).abs() < (beta >> 1)
+                {
+                    let delta = (((q0 - p0) * 3 + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                    plane[row_off + x - 1] = (p0 + delta).clamp(0, 255);
+                    plane[row_off + x] = (q0 - delta).clamp(0, 255);
+                    let delta1 = (delta >> 1).clamp(-(tc >> 1), tc >> 1);
+                    plane[row_off + x - 2] = (p1 + delta1).clamp(0, 255);
+                    plane[row_off + x + 1] = (q1 - delta1).clamp(0, 255);
+                }
+            }
+        }
+    }
+
+    for bx in 0..blocks_x {
+        for c in 0..8 {
+            let x = bx * 8 + c;
+            if x >= active_w {
+                continue;
+            }
+            for by in 1..blocks_y {
+                let y = by * 8;
+                let p1 = plane[(y - 2) * plane_dim + x];
+                let p0 = plane[(y - 1) * plane_dim + x];
+                let q0 = plane[y * plane_dim + x];
+                let q1 = plane[(y + 1) * plane_dim + x];
+                if (p0 - q0).abs() < beta
+                    && (p1 - p0).abs() < (beta >> 1)
+                    && (q1 - q0).abs() < (beta >> 1)
+                {
+                    let delta = (((q0 - p0) * 3 + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                    plane[(y - 1) * plane_dim + x] = (p0 + delta).clamp(0, 255);
+                    plane[y * plane_dim + x] = (q0 - delta).clamp(0, 255);
+                    let delta1 = (delta >> 1).clamp(-(tc >> 1), tc >> 1);
+                    plane[(y - 2) * plane_dim + x] = (p1 + delta1).clamp(0, 255);
+                    plane[(y + 1) * plane_dim + x] = (q1 - delta1).clamp(0, 255);
+                }
+            }
+        }
+    }
+
+    let sao_thresh = (beta >> 1).max(3);
+    for by in 0..blocks_y {
+        for r in 0..8 {
+            let y = by * 8 + r;
+            if y >= active_h {
+                continue;
+            }
+            let row_off = y * plane_dim;
+            for bx in 0..blocks_x {
+                let base = row_off + bx * 8;
+                let mut line = [0i32; 8];
+                line.copy_from_slice(&plane[base..base + 8]);
+                for c in 1..7usize {
+                    let prev = line[c - 1];
+                    let cur = line[c];
+                    let next = line[c + 1];
+                    let d_left = cur - prev;
+                    let d_right = cur - next;
+                    if d_left.abs() < sao_thresh && d_right.abs() < sao_thresh {
+                        if d_left > 0 && d_right > 0 {
+                            let step = ((d_left.min(d_right) + 1) >> 2).clamp(1, 2);
+                            plane[base + c] = (cur - step).clamp(0, 255);
+                        } else if d_left < 0 && d_right < 0 {
+                            let step = (((-d_left).min(-d_right) + 1) >> 2).clamp(1, 2);
+                            plane[base + c] = (cur + step).clamp(0, 255);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -822,6 +1018,178 @@ pub mod avx2 {
                 let src_off1 = r1 + cx * 2;
 
                 // Load 16 horizontal samples as two 8-lane vectors and sum adjacent pairs via hadd + permute.
+                let cb_0a = _mm256_loadu_si256(cb_full.as_ptr().add(src_off0) as *const __m256i);
+                let cb_0b =
+                    _mm256_loadu_si256(cb_full.as_ptr().add(src_off0 + 8) as *const __m256i);
+                let cb_1a = _mm256_loadu_si256(cb_full.as_ptr().add(src_off1) as *const __m256i);
+                let cb_1b =
+                    _mm256_loadu_si256(cb_full.as_ptr().add(src_off1 + 8) as *const __m256i);
+                let cb_v0 = _mm256_add_epi32(cb_0a, cb_1a);
+                let cb_v1 = _mm256_add_epi32(cb_0b, cb_1b);
+                let cb_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cb_v0, cb_v1), 0xD8);
+                let cb_avg = _mm256_srai_epi32(_mm256_add_epi32(cb_h, two), 2);
+                _mm256_storeu_si256(
+                    cb_plane.as_mut_ptr().add(out_base + cx) as *mut __m256i,
+                    cb_avg,
+                );
+
+                let cr_0a = _mm256_loadu_si256(cr_full.as_ptr().add(src_off0) as *const __m256i);
+                let cr_0b =
+                    _mm256_loadu_si256(cr_full.as_ptr().add(src_off0 + 8) as *const __m256i);
+                let cr_1a = _mm256_loadu_si256(cr_full.as_ptr().add(src_off1) as *const __m256i);
+                let cr_1b =
+                    _mm256_loadu_si256(cr_full.as_ptr().add(src_off1 + 8) as *const __m256i);
+                let cr_v0 = _mm256_add_epi32(cr_0a, cr_1a);
+                let cr_v1 = _mm256_add_epi32(cr_0b, cr_1b);
+                let cr_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cr_v0, cr_v1), 0xD8);
+                let cr_avg = _mm256_srai_epi32(_mm256_add_epi32(cr_h, two), 2);
+                _mm256_storeu_si256(
+                    cr_plane.as_mut_ptr().add(out_base + cx) as *mut __m256i,
+                    cr_avg,
+                );
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn bgra_tile_to_ycbcr420_hpel(
+        bgra: &[u8],
+        fb_w: u32,
+        x0_hpel: u32,
+        y0_hpel: u32,
+        tw: u32,
+        th: u32,
+        y_plane: &mut [i32; 64 * 64],
+        cb_plane: &mut [i32; 32 * 32],
+        cr_plane: &mut [i32; 32 * 32],
+    ) {
+        let sx = x0_hpel >> 1;
+        let sy = y0_hpel >> 1;
+        let hx = (x0_hpel & 1) as usize;
+        let hy = (y0_hpel & 1) as usize;
+        if hx == 0 && hy == 0 {
+            bgra_tile_to_ycbcr420(bgra, fb_w, sx, sy, tw, th, y_plane, cb_plane, cr_plane);
+            return;
+        }
+        if tw < 64 || th < 64 {
+            bgra_tile_to_ycbcr420_hpel_scalar(
+                bgra, fb_w, x0_hpel, y0_hpel, tw, th, y_plane, cb_plane, cr_plane,
+            );
+            return;
+        }
+        let stride = fb_w as usize * 4;
+        let mask_ff = _mm256_set1_epi32(0xFF);
+        let one = _mm256_set1_epi32(1);
+        let two = _mm256_set1_epi32(2);
+        let mut cb_full = [0i32; 64 * 64];
+        let mut cr_full = [0i32; 64 * 64];
+
+        for py in 0..64usize {
+            let cy1 = (py + hy).min(63);
+            let row0_ptr = bgra
+                .as_ptr()
+                .add((sy as usize + py) * stride + (sx as usize) * 4);
+            let row1_ptr = bgra
+                .as_ptr()
+                .add((sy as usize + cy1) * stride + (sx as usize) * 4);
+            let out_row = py * 64;
+            for chunk in 0..8usize {
+                let px = chunk * 8;
+                let pix00 = _mm256_loadu_si256(row0_ptr.add(px * 4) as *const __m256i);
+                let b00 = _mm256_and_si256(pix00, mask_ff);
+                let g00 = _mm256_and_si256(_mm256_srli_epi32(pix00, 8), mask_ff);
+                let r00 = _mm256_and_si256(_mm256_srli_epi32(pix00, 16), mask_ff);
+
+                let (b, g, r) = if hx == 1 && hy == 0 {
+                    let pix01 = if chunk < 7 {
+                        _mm256_loadu_si256(row0_ptr.add((px + 1) * 4) as *const __m256i)
+                    } else {
+                        let perm = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7);
+                        _mm256_permutevar8x32_epi32(pix00, perm)
+                    };
+                    let b01 = _mm256_and_si256(pix01, mask_ff);
+                    let g01 = _mm256_and_si256(_mm256_srli_epi32(pix01, 8), mask_ff);
+                    let r01 = _mm256_and_si256(_mm256_srli_epi32(pix01, 16), mask_ff);
+                    (
+                        _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(b00, b01), one), 1),
+                        _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(g00, g01), one), 1),
+                        _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(r00, r01), one), 1),
+                    )
+                } else if hx == 0 && hy == 1 {
+                    let pix10 = _mm256_loadu_si256(row1_ptr.add(px * 4) as *const __m256i);
+                    let b10 = _mm256_and_si256(pix10, mask_ff);
+                    let g10 = _mm256_and_si256(_mm256_srli_epi32(pix10, 8), mask_ff);
+                    let r10 = _mm256_and_si256(_mm256_srli_epi32(pix10, 16), mask_ff);
+                    (
+                        _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(b00, b10), one), 1),
+                        _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(g00, g10), one), 1),
+                        _mm256_srai_epi32(_mm256_add_epi32(_mm256_add_epi32(r00, r10), one), 1),
+                    )
+                } else {
+                    let pix10 = _mm256_loadu_si256(row1_ptr.add(px * 4) as *const __m256i);
+                    let (pix01, pix11) = if chunk < 7 {
+                        (
+                            _mm256_loadu_si256(row0_ptr.add((px + 1) * 4) as *const __m256i),
+                            _mm256_loadu_si256(row1_ptr.add((px + 1) * 4) as *const __m256i),
+                        )
+                    } else {
+                        let perm = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7);
+                        (
+                            _mm256_permutevar8x32_epi32(pix00, perm),
+                            _mm256_permutevar8x32_epi32(pix10, perm),
+                        )
+                    };
+                    let b01 = _mm256_and_si256(pix01, mask_ff);
+                    let g01 = _mm256_and_si256(_mm256_srli_epi32(pix01, 8), mask_ff);
+                    let r01 = _mm256_and_si256(_mm256_srli_epi32(pix01, 16), mask_ff);
+                    let b10 = _mm256_and_si256(pix10, mask_ff);
+                    let g10 = _mm256_and_si256(_mm256_srli_epi32(pix10, 8), mask_ff);
+                    let r10 = _mm256_and_si256(_mm256_srli_epi32(pix10, 16), mask_ff);
+                    let b11 = _mm256_and_si256(pix11, mask_ff);
+                    let g11 = _mm256_and_si256(_mm256_srli_epi32(pix11, 8), mask_ff);
+                    let r11 = _mm256_and_si256(_mm256_srli_epi32(pix11, 16), mask_ff);
+                    (
+                        _mm256_srai_epi32(
+                            _mm256_add_epi32(
+                                _mm256_add_epi32(b00, b01),
+                                _mm256_add_epi32(_mm256_add_epi32(b10, b11), two),
+                            ),
+                            2,
+                        ),
+                        _mm256_srai_epi32(
+                            _mm256_add_epi32(
+                                _mm256_add_epi32(g00, g01),
+                                _mm256_add_epi32(_mm256_add_epi32(g10, g11), two),
+                            ),
+                            2,
+                        ),
+                        _mm256_srai_epi32(
+                            _mm256_add_epi32(
+                                _mm256_add_epi32(r00, r01),
+                                _mm256_add_epi32(_mm256_add_epi32(r10, r11), two),
+                            ),
+                            2,
+                        ),
+                    )
+                };
+                let (y, cb, cr) = rgb_to_ycbcr_8px(b, g, r);
+                let dst_off = out_row + px;
+                _mm256_storeu_si256(y_plane.as_mut_ptr().add(dst_off) as *mut __m256i, y);
+                _mm256_storeu_si256(cb_full.as_mut_ptr().add(dst_off) as *mut __m256i, cb);
+                _mm256_storeu_si256(cr_full.as_mut_ptr().add(dst_off) as *mut __m256i, cr);
+            }
+        }
+
+        for cy in 0..32usize {
+            let r0 = (cy * 2) * 64;
+            let r1 = r0 + 64;
+            let out_base = cy * 32;
+            for chunk in 0..4usize {
+                let cx = chunk * 8;
+                let src_off0 = r0 + cx * 2;
+                let src_off1 = r1 + cx * 2;
+
                 let cb_0a = _mm256_loadu_si256(cb_full.as_ptr().add(src_off0) as *const __m256i);
                 let cb_0b =
                     _mm256_loadu_si256(cb_full.as_ptr().add(src_off0 + 8) as *const __m256i);
@@ -1373,6 +1741,285 @@ pub mod avx2 {
         }
         for i in (chunks32 * 32)..len {
             dst_row[i] ^= src_row[i];
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn transpose_2x4x4_epi32(
+        r0: &mut __m256i,
+        r1: &mut __m256i,
+        r2: &mut __m256i,
+        r3: &mut __m256i,
+    ) {
+        let t0 = _mm256_unpacklo_epi32(*r0, *r1);
+        let t1 = _mm256_unpackhi_epi32(*r0, *r1);
+        let t2 = _mm256_unpacklo_epi32(*r2, *r3);
+        let t3 = _mm256_unpackhi_epi32(*r2, *r3);
+        *r0 = _mm256_unpacklo_epi64(t0, t2);
+        *r1 = _mm256_unpackhi_epi64(t0, t2);
+        *r2 = _mm256_unpacklo_epi64(t1, t3);
+        *r3 = _mm256_unpackhi_epi64(t1, t3);
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn deblock_8_lanes_avx2(
+        vp1: &mut __m256i,
+        vp0: &mut __m256i,
+        vq0: &mut __m256i,
+        vq1: &mut __m256i,
+        v_beta: __m256i,
+        v_beta_half: __m256i,
+        v_tc: __m256i,
+        v_neg_tc: __m256i,
+        v_tc_half: __m256i,
+        v_neg_tc_half: __m256i,
+    ) {
+        let zero = _mm256_setzero_si256();
+        let max_val = _mm256_set1_epi32(255);
+        let v_four = _mm256_set1_epi32(4);
+
+        let diff_pq0 = _mm256_abs_epi32(_mm256_sub_epi32(*vp0, *vq0));
+        let diff_p10 = _mm256_abs_epi32(_mm256_sub_epi32(*vp1, *vp0));
+        let diff_q10 = _mm256_abs_epi32(_mm256_sub_epi32(*vq1, *vq0));
+
+        let m0 = _mm256_cmpgt_epi32(v_beta, diff_pq0);
+        let m1 = _mm256_cmpgt_epi32(v_beta_half, diff_p10);
+        let m2 = _mm256_cmpgt_epi32(v_beta_half, diff_q10);
+        let mask = _mm256_and_si256(m0, _mm256_and_si256(m1, m2));
+
+        let qp0 = _mm256_sub_epi32(*vq0, *vp0);
+        let qp0_3 = _mm256_add_epi32(qp0, _mm256_slli_epi32(qp0, 1));
+        let pq1 = _mm256_sub_epi32(*vp1, *vq1);
+        let num = _mm256_add_epi32(_mm256_add_epi32(qp0_3, pq1), v_four);
+        let delta = _mm256_min_epi32(_mm256_max_epi32(_mm256_srai_epi32(num, 3), v_neg_tc), v_tc);
+        let delta1 = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_srai_epi32(delta, 1), v_neg_tc_half),
+            v_tc_half,
+        );
+
+        let np0 = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_add_epi32(*vp0, delta), zero),
+            max_val,
+        );
+        let nq0 = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_sub_epi32(*vq0, delta), zero),
+            max_val,
+        );
+        let np1 = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_add_epi32(*vp1, delta1), zero),
+            max_val,
+        );
+        let nq1 = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_sub_epi32(*vq1, delta1), zero),
+            max_val,
+        );
+
+        *vp1 = _mm256_blendv_epi8(*vp1, np1, mask);
+        *vp0 = _mm256_blendv_epi8(*vp0, np0, mask);
+        *vq0 = _mm256_blendv_epi8(*vq0, nq0, mask);
+        *vq1 = _mm256_blendv_epi8(*vq1, nq1, mask);
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn deblock_and_sao_plane(
+        plane: &mut [i32],
+        plane_dim: usize,
+        blocks_x: usize,
+        blocks_y: usize,
+        q_dc: i32,
+    ) {
+        if blocks_x == 0
+            || blocks_y == 0
+            || blocks_x * 8 > plane_dim
+            || blocks_y * 8 > plane_dim
+            || plane.len() < (blocks_y * 8 - 1) * plane_dim + blocks_x * 8
+        {
+            deblock_and_sao_plane_scalar(plane, plane_dim, blocks_x, blocks_y, q_dc);
+            return;
+        }
+
+        let beta = (q_dc + 4).clamp(6, 36);
+        let tc = ((q_dc + 3) >> 2).clamp(1, 10);
+        let v_beta = _mm256_set1_epi32(beta);
+        let v_beta_half = _mm256_set1_epi32(beta >> 1);
+        let v_tc = _mm256_set1_epi32(tc);
+        let v_neg_tc = _mm256_set1_epi32(-tc);
+        let v_tc_half = _mm256_set1_epi32(tc >> 1);
+        let v_neg_tc_half = _mm256_set1_epi32(-(tc >> 1));
+
+        let base_ptr = plane.as_mut_ptr();
+
+        // 1. Vertical 8x8 block boundaries (8 rows processed simultaneously per boundary via 2x4x4 transpose)
+        if blocks_x > 1 {
+            for by in 0..blocks_y {
+                let y0 = by * 8;
+                for bx in 1..blocks_x {
+                    let x = bx * 8;
+                    let p = base_ptr.add(y0 * plane_dim + x - 2);
+                    let r0 = _mm_loadu_si128(p as *const __m128i);
+                    let r1 = _mm_loadu_si128(p.add(plane_dim) as *const __m128i);
+                    let r2 = _mm_loadu_si128(p.add(plane_dim * 2) as *const __m128i);
+                    let r3 = _mm_loadu_si128(p.add(plane_dim * 3) as *const __m128i);
+                    let r4 = _mm_loadu_si128(p.add(plane_dim * 4) as *const __m128i);
+                    let r5 = _mm_loadu_si128(p.add(plane_dim * 5) as *const __m128i);
+                    let r6 = _mm_loadu_si128(p.add(plane_dim * 6) as *const __m128i);
+                    let r7 = _mm_loadu_si128(p.add(plane_dim * 7) as *const __m128i);
+
+                    let mut vp1 = _mm256_inserti128_si256(_mm256_castsi128_si256(r0), r4, 1);
+                    let mut vp0 = _mm256_inserti128_si256(_mm256_castsi128_si256(r1), r5, 1);
+                    let mut vq0 = _mm256_inserti128_si256(_mm256_castsi128_si256(r2), r6, 1);
+                    let mut vq1 = _mm256_inserti128_si256(_mm256_castsi128_si256(r3), r7, 1);
+
+                    transpose_2x4x4_epi32(&mut vp1, &mut vp0, &mut vq0, &mut vq1);
+                    deblock_8_lanes_avx2(
+                        &mut vp1,
+                        &mut vp0,
+                        &mut vq0,
+                        &mut vq1,
+                        v_beta,
+                        v_beta_half,
+                        v_tc,
+                        v_neg_tc,
+                        v_tc_half,
+                        v_neg_tc_half,
+                    );
+                    transpose_2x4x4_epi32(&mut vp1, &mut vp0, &mut vq0, &mut vq1);
+
+                    _mm_storeu_si128(p as *mut __m128i, _mm256_castsi256_si128(vp1));
+                    _mm_storeu_si128(
+                        p.add(plane_dim) as *mut __m128i,
+                        _mm256_castsi256_si128(vp0),
+                    );
+                    _mm_storeu_si128(
+                        p.add(plane_dim * 2) as *mut __m128i,
+                        _mm256_castsi256_si128(vq0),
+                    );
+                    _mm_storeu_si128(
+                        p.add(plane_dim * 3) as *mut __m128i,
+                        _mm256_castsi256_si128(vq1),
+                    );
+                    _mm_storeu_si128(
+                        p.add(plane_dim * 4) as *mut __m128i,
+                        _mm256_extracti128_si256(vp1, 1),
+                    );
+                    _mm_storeu_si128(
+                        p.add(plane_dim * 5) as *mut __m128i,
+                        _mm256_extracti128_si256(vp0, 1),
+                    );
+                    _mm_storeu_si128(
+                        p.add(plane_dim * 6) as *mut __m128i,
+                        _mm256_extracti128_si256(vq0, 1),
+                    );
+                    _mm_storeu_si128(
+                        p.add(plane_dim * 7) as *mut __m128i,
+                        _mm256_extracti128_si256(vq1, 1),
+                    );
+                }
+            }
+        }
+
+        // 2. Horizontal 8x8 block boundaries (8 columns processed simultaneously in contiguous __m256i)
+        if blocks_y > 1 {
+            for by in 1..blocks_y {
+                let y = by * 8;
+                for bx in 0..blocks_x {
+                    let x = bx * 8;
+                    let p_p1 = base_ptr.add((y - 2) * plane_dim + x);
+                    let p_p0 = base_ptr.add((y - 1) * plane_dim + x);
+                    let p_q0 = base_ptr.add(y * plane_dim + x);
+                    let p_q1 = base_ptr.add((y + 1) * plane_dim + x);
+
+                    let mut vp1 = _mm256_loadu_si256(p_p1 as *const __m256i);
+                    let mut vp0 = _mm256_loadu_si256(p_p0 as *const __m256i);
+                    let mut vq0 = _mm256_loadu_si256(p_q0 as *const __m256i);
+                    let mut vq1 = _mm256_loadu_si256(p_q1 as *const __m256i);
+
+                    deblock_8_lanes_avx2(
+                        &mut vp1,
+                        &mut vp0,
+                        &mut vq0,
+                        &mut vq1,
+                        v_beta,
+                        v_beta_half,
+                        v_tc,
+                        v_neg_tc,
+                        v_tc_half,
+                        v_neg_tc_half,
+                    );
+
+                    _mm256_storeu_si256(p_p1 as *mut __m256i, vp1);
+                    _mm256_storeu_si256(p_p0 as *mut __m256i, vp0);
+                    _mm256_storeu_si256(p_q0 as *mut __m256i, vq0);
+                    _mm256_storeu_si256(p_q1 as *mut __m256i, vq1);
+                }
+            }
+        }
+
+        // 3. Edge-preserving Sample Adaptive Offset (SAO) 1D Edge Offset anti-ringing damping
+        let sao_thresh = (beta >> 1).max(3);
+        let v_sao_thresh = _mm256_set1_epi32(sao_thresh);
+        let zero = _mm256_setzero_si256();
+        let v_one = _mm256_set1_epi32(1);
+        let v_two = _mm256_set1_epi32(2);
+        let max_val = _mm256_set1_epi32(255);
+        let idx_prev = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+        let idx_next = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7);
+
+        let active_rows = blocks_y * 8;
+        for y in 0..active_rows {
+            let row_ptr = base_ptr.add(y * plane_dim);
+            for bx in 0..blocks_x {
+                let ptr = row_ptr.add(bx * 8);
+                let v_cur = _mm256_loadu_si256(ptr as *const __m256i);
+                let v_prev = _mm256_permutevar8x32_epi32(v_cur, idx_prev);
+                let v_next = _mm256_permutevar8x32_epi32(v_cur, idx_next);
+
+                let d_left = _mm256_sub_epi32(v_cur, v_prev);
+                let d_right = _mm256_sub_epi32(v_cur, v_next);
+                let abs_l = _mm256_abs_epi32(d_left);
+                let abs_r = _mm256_abs_epi32(d_right);
+
+                let m_thresh = _mm256_and_si256(
+                    _mm256_cmpgt_epi32(v_sao_thresh, abs_l),
+                    _mm256_cmpgt_epi32(v_sao_thresh, abs_r),
+                );
+                let min_abs = _mm256_min_epi32(abs_l, abs_r);
+                let step = _mm256_min_epi32(
+                    _mm256_max_epi32(
+                        _mm256_srai_epi32(_mm256_add_epi32(min_abs, v_one), 2),
+                        v_one,
+                    ),
+                    v_two,
+                );
+                let m_pos = _mm256_and_si256(
+                    m_thresh,
+                    _mm256_and_si256(
+                        _mm256_cmpgt_epi32(d_left, zero),
+                        _mm256_cmpgt_epi32(d_right, zero),
+                    ),
+                );
+                let m_neg = _mm256_and_si256(
+                    m_thresh,
+                    _mm256_and_si256(
+                        _mm256_cmpgt_epi32(zero, d_left),
+                        _mm256_cmpgt_epi32(zero, d_right),
+                    ),
+                );
+
+                let sub_val = _mm256_min_epi32(
+                    _mm256_max_epi32(_mm256_sub_epi32(v_cur, step), zero),
+                    max_val,
+                );
+                let add_val = _mm256_min_epi32(
+                    _mm256_max_epi32(_mm256_add_epi32(v_cur, step), zero),
+                    max_val,
+                );
+                let res =
+                    _mm256_blendv_epi8(_mm256_blendv_epi8(v_cur, sub_val, m_pos), add_val, m_neg);
+                _mm256_storeu_si256(ptr as *mut __m256i, res);
+            }
         }
     }
 }
