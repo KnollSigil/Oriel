@@ -331,6 +331,19 @@ impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
 
 const WINDOW_LAUNCH_ID_BASE: u64 = 1u64 << 62;
 
+/// Everything a composite of a surface tree depends on, cheap to compute without touching pixels.
+/// Clients such as Firefox commit at vsync rate without attaching new buffers (to drive frame
+/// callbacks), so comparing this first avoids GPU readbacks and full-window blends per commit.
+#[derive(Clone, PartialEq)]
+struct CompositeSignature {
+    /// Per surface with a buffer, in paint order: buffer generation, buffer size, logical size,
+    /// and position in the tree (logical).
+    surfaces: Vec<(u64, u32, u32, u32, u32, i32, i32)>,
+    scale_bits: (u64, u64),
+    geometry: FrameRect,
+    input_bounds: FrameRect,
+}
+
 #[derive(Clone)]
 struct CachedFrame {
     width: u32,
@@ -370,6 +383,8 @@ struct TrackedWindow {
     has_window_entry: bool,
     latest_bgra: Option<CachedFrame>,
     last_sub_info: Vec<(bool, u32, u32, i32, i32)>,
+    /// Inputs of the last composite; an equal signature means the composite would be identical.
+    last_composite_sig: Option<CompositeSignature>,
 }
 
 struct TrackedPopup {
@@ -379,6 +394,7 @@ struct TrackedPopup {
     geo: Rectangle<i32, Logical>,
     announced: bool,
     latest_bgra: Option<CachedFrame>,
+    last_composite_sig: Option<CompositeSignature>,
 }
 
 struct TrackedX11Window {
@@ -566,6 +582,9 @@ struct AppState {
     surface_to_window: HashMap<ObjectId, WindowId>,
     /// Cached CPU or VRAM-resident frame per `WlSurface::id()`.
     surface_buffers: HashMap<ObjectId, (u32, u32, FramePixels)>,
+    /// Generation of each entry in `surface_buffers`, bumped whenever a new buffer is stored.
+    surface_buffer_gens: HashMap<ObjectId, u64>,
+    next_buffer_gen: u64,
     /// KDE server-decoration modes set on a `WlSurface` before `xdg_surface.get_toplevel`.
     pending_kde_decorations: HashMap<ObjectId, bool>,
     windows: HashMap<WindowId, TrackedWindow>,
@@ -1571,6 +1590,34 @@ impl AppState {
         }
     }
 
+    /// The buffered surfaces of the tree under `root` as `CompositeSignature::surfaces`.
+    fn tree_buffer_signature(&self, root: &WlSurface) -> Vec<(u64, u32, u32, u32, u32, i32, i32)> {
+        let mut out = Vec::new();
+        with_surface_tree_downward(
+            root,
+            (0, 0),
+            |surf, states, (ox, oy)| {
+                let (nx, ny) = if surf == root {
+                    (*ox, *oy)
+                } else {
+                    let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
+                    let loc = sub_state.current().location;
+                    (ox + loc.x, oy + loc.y)
+                };
+                let id = surf.id();
+                if let Some((sw, sh, _)) = self.surface_buffers.get(&id) {
+                    let (log_w, log_h) = surface_logical_size_from_states(states, *sw, *sh);
+                    let gen = self.surface_buffer_gens.get(&id).copied().unwrap_or(0);
+                    out.push((gen, *sw, *sh, log_w, log_h, nx, ny));
+                }
+                TraversalAction::DoChildren((nx, ny))
+            },
+            |_, _, _| {},
+            |_, _, _| true,
+        );
+        out
+    }
+
     fn recomposite_window(&mut self, window_id: WindowId, root_surface: &WlSurface) {
         let root_id = root_surface.id();
         let Some((surf_w, surf_h, _)) = self.surface_buffers.get(&root_id) else {
@@ -1666,6 +1713,19 @@ impl AppState {
         } else {
             (surf_w, surf_h)
         };
+
+        let sig = CompositeSignature {
+            surfaces: self.tree_buffer_signature(root_surface),
+            scale_bits: (comp_sx.to_bits(), comp_sy.to_bits()),
+            geometry,
+            input_bounds,
+        };
+        if let Some(tracked) = self.windows.get_mut(&window_id) {
+            if tracked.last_composite_sig.as_ref() == Some(&sig) {
+                return;
+            }
+            tracked.last_composite_sig = Some(sig);
+        }
 
         let composite: FramePixels = if !has_subsurfaces {
             // Zero-copy fast path for single-surface windows (both VRAM Dmabuf and SHM).
@@ -1851,6 +1911,24 @@ impl AppState {
         let (pop_log_w, pop_log_h) = (geometry.width, geometry.height);
         let (pop_phys_w, pop_phys_h) = (surf_w, surf_h);
 
+        let sig = CompositeSignature {
+            surfaces: self.tree_buffer_signature(&root_surface),
+            scale_bits: (root_sx.to_bits(), root_sy.to_bits()),
+            geometry,
+            input_bounds,
+        };
+        if let Some(popup) = self.popup_windows.get_mut(&window_id) {
+            if let Some(g) = acked_geo {
+                if g.size.w > 0 && g.size.h > 0 {
+                    popup.geo = g;
+                }
+            }
+            if popup.last_composite_sig.as_ref() == Some(&sig) {
+                return;
+            }
+            popup.last_composite_sig = Some(sig);
+        }
+
         let mut bgra = vec![0u8; (pop_phys_w * pop_phys_h * 4) as usize];
         with_surface_tree_downward(
             &root_surface,
@@ -1896,11 +1974,6 @@ impl AppState {
         let Some(popup) = self.popup_windows.get_mut(&window_id) else {
             return;
         };
-        if let Some(g) = acked_geo {
-            if g.size.w > 0 && g.size.h > 0 {
-                popup.geo = g;
-            }
-        }
 
         let bgra_arc = Arc::new(bgra);
         let new_frame = CachedFrame {
@@ -2034,6 +2107,7 @@ impl CompositorHandler for AppState {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         self.surface_buffers.remove(&surface.id());
+        self.surface_buffer_gens.remove(&surface.id());
         if let Some(jobs) = self.surface_readbacks.remove(&surface.id()) {
             for id in jobs {
                 self.readback_jobs.remove(&id);
@@ -2326,6 +2400,9 @@ impl AppState {
 
     fn store_surface_buffer(&mut self, surface: &WlSurface, (w, h, pixels): ImportedFrame) {
         if w > 0 && h > 0 {
+            self.next_buffer_gen += 1;
+            self.surface_buffer_gens
+                .insert(surface.id(), self.next_buffer_gen);
             self.surface_buffers.insert(surface.id(), (w, h, pixels));
         }
     }
@@ -2515,6 +2592,7 @@ impl XdgShellHandler for AppState {
                 has_window_entry: false,
                 latest_bgra: None,
                 last_sub_info: Vec::new(),
+                last_composite_sig: None,
             },
         );
         self.focused_window_id = window_id;
@@ -2691,6 +2769,7 @@ impl XdgShellHandler for AppState {
                 geo,
                 announced: false,
                 latest_bgra: None,
+                last_composite_sig: None,
             },
         );
     }
@@ -4285,6 +4364,8 @@ fn run_compositor_loop(
         start_time: Instant::now(),
         surface_to_window: HashMap::new(),
         surface_buffers: HashMap::new(),
+        surface_buffer_gens: HashMap::new(),
+        next_buffer_gen: 0,
         pending_kde_decorations: HashMap::new(),
         windows: HashMap::new(),
         popup_windows: HashMap::new(),
