@@ -28,7 +28,10 @@ use tokio::sync::mpsc;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use crate::hosts::{load_client_settings, parse_uri, ssh_bootstrap, RenderScaleCap};
+use crate::hosts::{
+    load_client_settings, parse_uri, resolve_uri, ssh_bootstrap, take_env_secret, RenderScaleCap,
+    TOKEN_ENV, URI_ENV,
+};
 use crate::window::ClientUiEvent;
 
 #[derive(Debug, Parser)]
@@ -37,21 +40,20 @@ struct Cli {
     #[command(subcommand)]
     subcommand: Option<ClientSubcommand>,
 
-    /// Connection URI printed by remotewayland-server (remotewayland://host:port?fp=...&token=...).
-    #[arg(long)]
+    /// Read the connection URI printed by `remotewayland-server attach`
+    /// (remotewayland://host:port?fp=...&token=...) from stdin. Only `-` is accepted: a URI
+    /// on the command line would expose its token to other local users. The URI can also be
+    /// given in $REMOTEWAYLAND_URI.
+    #[arg(long, value_name = "-")]
     uri: Option<String>,
 
-    /// Server UDP address (if not using --uri).
+    /// Server UDP address (if not using a URI); the token goes in $REMOTEWAYLAND_TOKEN.
     #[arg(long)]
     server: Option<SocketAddr>,
 
     /// Expected server TLS certificate SHA-256 hex fingerprint (if not using --uri).
     #[arg(long)]
     fingerprint: Option<String>,
-
-    /// Session authentication token (if not using --uri).
-    #[arg(long)]
-    token: Option<String>,
 
     /// Host PipeWire microphone source name or serial to use (default: system default).
     #[arg(long)]
@@ -105,9 +107,23 @@ enum ClientSubcommand {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
 
-        /// Connection URI printed by remotewayland-server (direct QUIC mode if --socket is omitted).
-        #[arg(long)]
+        /// Read the connection URI from stdin (direct QUIC mode); only `-` is accepted. The
+        /// URI can also be given in $REMOTEWAYLAND_URI.
+        #[arg(long, value_name = "-", conflicts_with_all = ["socket", "ssh"])]
         uri: Option<String>,
+
+        /// Get a connection URI by running `remotewayland-server attach` over SSH on this
+        /// target (direct QUIC mode).
+        #[arg(long, value_name = "TARGET", conflicts_with = "socket")]
+        ssh: Option<String>,
+
+        /// Remote path to `remotewayland-server` binary (with --ssh).
+        #[arg(long, requires = "ssh")]
+        server_bin: Option<String>,
+
+        /// UDP port or inclusive port range the remote server must listen on (with --ssh).
+        #[arg(long, value_name = "PORT[-END]", requires = "ssh")]
+        port: Option<remotewayland_proto::PortRange>,
 
         /// Reattach to an existing persistent server PTY by ID instead of starting a new shell.
         #[arg(long)]
@@ -125,14 +141,32 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Taken before any threads start, and removed so nothing this client starts inherits them.
+    let env_uri = take_env_secret(URI_ENV);
+    let env_token = take_env_secret(TOKEN_ENV);
 
     match cli.subcommand {
         Some(ClientSubcommand::PtyAttach {
             socket,
             uri,
+            ssh,
+            server_bin,
+            port,
             pty_id,
             command,
         }) => {
+            let uri = match ssh {
+                Some(target) => match ssh_bootstrap(&target, server_bin.as_deref(), port) {
+                    Ok(uri) => Some(uri),
+                    Err(err) => {
+                        // Usually running in a terminal window that closes when this exits.
+                        pty::report_error_and_wait(&err);
+                        std::process::exit(1);
+                    }
+                },
+                None if socket.is_none() => resolve_uri(uri.as_deref(), env_uri)?,
+                None => None,
+            };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -149,7 +183,9 @@ fn main() -> Result<()> {
                     command,
                 ))?
             } else {
-                anyhow::bail!("pty-attach requires either --socket <path> or --uri <uri>");
+                anyhow::bail!(
+                    "pty-attach requires --socket <path>, --ssh <target>, --uri -, or {URI_ENV}"
+                );
             };
             std::process::exit(code);
         }
@@ -168,16 +204,23 @@ fn main() -> Result<()> {
                 Some(s) => RenderScaleCap::parse_cli(&s)?,
                 None => load_client_settings().max_scale,
             };
-            let uri = ssh_bootstrap(&target, server_bin.as_deref(), port)?;
             if terminal {
                 let cmd_str = if command.is_empty() {
                     None
                 } else {
                     Some(command.join(" "))
                 };
-                pty::spawn_local_terminal_pty(&uri, cmd_str.as_deref())?;
+                // The terminal bootstraps over SSH itself, so the session token never has to
+                // pass through its arguments or environment.
+                pty::spawn_local_terminal_pty_ssh(
+                    &target,
+                    server_bin.as_deref(),
+                    port,
+                    cmd_str.as_deref(),
+                )?;
                 return Ok(());
             }
+            let uri = ssh_bootstrap(&target, server_bin.as_deref(), port)?;
             let (server, fingerprint, token) = parse_uri(&uri)?;
             let initial_exec = if command.is_empty() {
                 None
@@ -204,7 +247,7 @@ fn main() -> Result<()> {
                 .transpose()?;
             let effective_scale_cap =
                 cli_max_scale.unwrap_or_else(|| load_client_settings().max_scale);
-            if let Some(uri) = cli.uri {
+            if let Some(uri) = resolve_uri(cli.uri.as_deref(), env_uri)? {
                 let (server, fingerprint, token) = parse_uri(&uri)?;
                 run_gui_session(
                     server,
@@ -215,9 +258,9 @@ fn main() -> Result<()> {
                     None,
                     None,
                 )
-            } else if let (Some(server), Some(fp), Some(token)) =
-                (cli.server, cli.fingerprint, cli.token)
-            {
+            } else if let (Some(server), Some(fp)) = (cli.server, cli.fingerprint) {
+                let token = env_token
+                    .with_context(|| format!("--server/--fingerprint need {TOKEN_ENV} set"))?;
                 run_gui_session(server, fp, token, true, effective_scale_cap, None, None)
             } else {
                 launcher::run_launcher(cli_max_scale)

@@ -246,6 +246,47 @@ pub fn ssh_bootstrap(
     Ok(uri)
 }
 
+/// Environment variable a connect URI can be passed in instead of `--uri`.
+pub const URI_ENV: &str = "REMOTEWAYLAND_URI";
+/// Environment variable the session token is passed in alongside `--server`/`--fingerprint`.
+pub const TOKEN_ENV: &str = "REMOTEWAYLAND_TOKEN";
+
+/// Read a secret from the environment and remove it, so processes this one starts (terminals,
+/// `ssh`) don't inherit it. Unlike a process's arguments, its environment is readable only
+/// by its own user. Call it before any threads start, since it changes the environment.
+pub fn take_env_secret(key: &str) -> Option<String> {
+    let value = std::env::var(key).ok();
+    std::env::remove_var(key);
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The connect URI given by `--uri` or the environment.
+///
+/// A URI carries a session token, and any local user can read a process's arguments, so on
+/// the command line only `--uri -` is accepted, which reads the URI from stdin.
+pub fn resolve_uri(arg: Option<&str>, env_uri: Option<String>) -> Result<Option<String>> {
+    match arg {
+        Some("-") => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("failed to read the connect URI from stdin")?;
+            let uri = line.trim();
+            if uri.is_empty() {
+                bail!("no connect URI on stdin");
+            }
+            Ok(Some(uri.to_string()))
+        }
+        Some(_) => bail!(
+            "refusing a connect URI on the command line, where other local users can read its \
+             session token; pass `--uri -` and write the URI to stdin, or set {URI_ENV}"
+        ),
+        None => Ok(env_uri),
+    }
+}
+
 /// Parse `remotewayland://host:port?fp=...&token=...`, resolving hostnames if needed.
 pub fn parse_uri(uri: &str) -> Result<(SocketAddr, String, String)> {
     let rest = uri
@@ -296,6 +337,18 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_uri_refuses_a_uri_in_the_arguments() {
+        let uri = "remotewayland://127.0.0.1:7443?fp=ab&token=secret";
+        let err = resolve_uri(Some(uri), None).unwrap_err().to_string();
+        assert!(!err.contains("secret"), "error echoes the token: {err}");
+        assert_eq!(
+            resolve_uri(None, Some(uri.to_string())).unwrap().as_deref(),
+            Some(uri)
+        );
+        assert_eq!(resolve_uri(None, None).unwrap(), None);
+    }
 
     #[test]
     fn render_scale_cap_apply_and_cli_parsing() {

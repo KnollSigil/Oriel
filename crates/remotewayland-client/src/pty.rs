@@ -339,7 +339,18 @@ where
     }
 }
 
-/// Attach local stdin/stdout to a remote PTY over a fresh direct QUIC connection (`--uri`).
+/// Print `err`, and when stdin is a terminal, wait for Enter so a terminal window opened just
+/// for this process stays open long enough to read it.
+pub fn report_error_and_wait(err: &anyhow::Error) {
+    use std::io::IsTerminal;
+    eprintln!("remotewayland: {err:#}");
+    if std::io::stdin().is_terminal() {
+        eprint!("Press Enter to close.");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+}
+
+/// Attach local stdin/stdout to a remote PTY over a fresh direct QUIC connection.
 pub async fn run_pty_attach(
     server: SocketAddr,
     fingerprint: String,
@@ -534,13 +545,27 @@ pub fn spawn_local_terminal_pty_socket_with_terminal(
     spawn_local_terminal_with_args(&attach_args, Some(socket_path), initial_mode, terminal)
 }
 
-/// Spawn the user's preferred local terminal emulator attached to `remotewayland-client pty-attach --uri <uri>`.
-pub fn spawn_local_terminal_pty(uri: &str, command: Option<&str>) -> Result<std::process::Child> {
+/// Spawn the user's preferred local terminal emulator running
+/// `remotewayland-client pty-attach --ssh <target>`, which gets its own connect URI over SSH.
+pub fn spawn_local_terminal_pty_ssh(
+    ssh_target: &str,
+    server_bin: Option<&str>,
+    port: Option<remotewayland_proto::PortRange>,
+    command: Option<&str>,
+) -> Result<std::process::Child> {
     let mut attach_args = vec![
         "pty-attach".to_string(),
-        "--uri".to_string(),
-        uri.to_string(),
+        "--ssh".to_string(),
+        ssh_target.to_string(),
     ];
+    if let Some(bin) = server_bin {
+        attach_args.push("--server-bin".to_string());
+        attach_args.push(bin.to_string());
+    }
+    if let Some(port) = port {
+        attach_args.push("--port".to_string());
+        attach_args.push(port.to_string());
+    }
     if let Some(cmd) = command {
         attach_args.push("--command".to_string());
         attach_args.push(cmd.to_string());

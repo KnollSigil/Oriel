@@ -34,7 +34,7 @@ use tracing_subscriber::EnvFilter;
 
 /// TTL for single-use tokens minted via `attach` / control socket.
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(60);
-/// TTL for the initial single-use token (e.g. one supplied via `--token`) in foreground mode.
+/// TTL for the initial single-use token in foreground mode.
 const FOREGROUND_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Parser)]
@@ -53,10 +53,6 @@ struct Cli {
     /// free port is used; with one, the server only starts if it can bind a port in it.
     #[arg(long, default_value = "0.0.0.0", value_name = "IP[:PORT[-END]]")]
     listen: quic::ListenSpec,
-
-    /// Ephemeral session token (auto-generated via CSPRNG if omitted).
-    #[arg(long)]
-    token: Option<String>,
 
     /// Run quietly as a background daemon (used internally by `attach`).
     #[arg(long, hide = true)]
@@ -204,10 +200,9 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
     // the server process to its isolated session XDG_RUNTIME_DIR.
     let control_sock = session::control_socket_path(&host_runtime_dir);
 
-    let token = match cli.token {
-        Some(t) => t,
-        None => generate_ephemeral_token()?,
-    };
+    // There is deliberately no flag to supply a token: another local user could read it
+    // from this process's arguments. Clients get one from `attach` instead.
+    let token = generate_ephemeral_token()?;
     let initial_ttl = if cli.daemon {
         ATTACH_TOKEN_TTL
     } else {
