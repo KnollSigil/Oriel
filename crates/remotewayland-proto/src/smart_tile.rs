@@ -10,7 +10,6 @@
 //!   and automatic lossless refinement on idle.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,17 +27,57 @@ pub mod vram;
 #[path = "smart_tile_rans.rs"]
 pub mod rans;
 
-static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
-static FORCE_DISABLE_GPU: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    static FORCE_SCALAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_DISABLE_GPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+#[inline]
+fn snapshot_test_overrides() -> (bool, bool) {
+    (FORCE_SCALAR.get(), FORCE_DISABLE_GPU.get())
+}
+
+#[cfg(not(test))]
+#[inline]
+const fn snapshot_test_overrides() -> (bool, bool) {
+    (false, false)
+}
+
+#[cfg(test)]
+#[inline]
+fn apply_test_overrides(overrides: (bool, bool)) {
+    FORCE_SCALAR.set(overrides.0);
+    FORCE_DISABLE_GPU.set(overrides.1);
+}
+
+#[cfg(not(test))]
+#[inline]
+const fn apply_test_overrides(_overrides: (bool, bool)) {}
 
 #[inline]
 fn use_simd() -> bool {
-    !FORCE_SCALAR.load(Ordering::Relaxed)
+    #[cfg(test)]
+    {
+        !FORCE_SCALAR.get()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 #[inline]
 fn use_gpu() -> bool {
-    !FORCE_DISABLE_GPU.load(Ordering::Relaxed) && !FORCE_SCALAR.load(Ordering::Relaxed)
+    #[cfg(test)]
+    {
+        !FORCE_DISABLE_GPU.get() && !FORCE_SCALAR.get()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 /// Tile edge length in pixels (must be a multiple of 16 for 4:2:0 8x8 DCT blocks).
@@ -2164,6 +2203,7 @@ impl SmartTileEncoder {
                     start_row = end_row;
                 }
 
+                let test_overrides = snapshot_test_overrides();
                 let mut band_outputs: Vec<(Vec<u8>, bool, bool)> = Vec::with_capacity(num_workers);
                 std::thread::scope(|s| {
                     let mut handles = Vec::with_capacity(num_workers);
@@ -2171,6 +2211,7 @@ impl SmartTileEncoder {
                         band_slices
                     {
                         handles.push(s.spawn(move || {
+                            apply_test_overrides(test_overrides);
                             let mut out = Vec::with_capacity(items.len() * 512);
                             let mut local_lossy = false;
                             let mut local_mv_used = false;
@@ -3216,9 +3257,13 @@ fn encode_tiles_with_gpu(
                 if !rem.is_empty() {
                     band_splits.push(rem);
                 }
+                let test_overrides = snapshot_test_overrides();
                 std::thread::scope(|s| {
                     for chunk in band_splits {
-                        s.spawn(move || eval_mv_range(chunk));
+                        s.spawn(move || {
+                            apply_test_overrides(test_overrides);
+                            eval_mv_range(chunk);
+                        });
                     }
                 });
             } else {
@@ -3470,6 +3515,7 @@ fn encode_tiles_with_gpu(
                     start_row = end_row;
                 }
 
+                let test_overrides = snapshot_test_overrides();
                 let mut band_outputs = Vec::with_capacity(band_slices.len());
                 std::thread::scope(|s| {
                     let mut handles = Vec::with_capacity(band_slices.len());
@@ -3477,6 +3523,7 @@ fn encode_tiles_with_gpu(
                         band_slices
                     {
                         handles.push(s.spawn(move || {
+                            apply_test_overrides(test_overrides);
                             let mut local_out = Vec::with_capacity(plan_chunk.len() * 512);
                             let mut l_lossy = false;
                             let mut l_mv = false;
@@ -7005,8 +7052,14 @@ mod tests {
                        disable_gpu: bool,
                        quality: u8|
          -> (Duration, Duration, usize, usize, Vec<u8>) {
-            FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
-            FORCE_DISABLE_GPU.store(disable_gpu, Ordering::Relaxed);
+            struct OverrideReset;
+            impl Drop for OverrideReset {
+                fn drop(&mut self) {
+                    apply_test_overrides((false, false));
+                }
+            }
+            let _reset = OverrideReset;
+            apply_test_overrides((force_scalar, disable_gpu));
             let mut enc = SmartTileEncoder::new();
             let mut dec = SmartTileDecoder::new();
             // Prime with keyframe + first motion frame
@@ -7033,8 +7086,7 @@ mod tests {
                 dec_time += t_d.elapsed();
                 last_dec = (*buf).clone();
             }
-            FORCE_SCALAR.store(false, Ordering::Relaxed);
-            FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
+            drop(_reset);
             (
                 enc_time / 4,
                 dec_time / 4,
@@ -7204,12 +7256,21 @@ mod tests {
         let f2 = make_frame(2);
 
         // Encode sequence with GPU enabled (using `engine` directly if global_gpu_engine skipped llvmpipe)
-        FORCE_DISABLE_GPU.store(true, Ordering::Relaxed);
-        let mut enc_cpu = SmartTileEncoder::new();
-        let _ = enc_cpu.encode(ew, eh, &f0, 75);
-        let p1_cpu = enc_cpu.encode(ew, eh, &f1, 75);
-        let p2_cpu = enc_cpu.encode(ew, eh, &f2, 75);
-        FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
+        let (p1_cpu, p2_cpu, enc_cpu) = {
+            struct OverrideReset;
+            impl Drop for OverrideReset {
+                fn drop(&mut self) {
+                    apply_test_overrides((false, false));
+                }
+            }
+            let _reset = OverrideReset;
+            apply_test_overrides((false, true));
+            let mut enc_cpu = SmartTileEncoder::new();
+            let _ = enc_cpu.encode(ew, eh, &f0, 75);
+            let p1_cpu = enc_cpu.encode(ew, eh, &f1, 75);
+            let p2_cpu = enc_cpu.encode(ew, eh, &f2, 75);
+            (p1_cpu, p2_cpu, enc_cpu)
+        };
 
         // Now run the exact same sequence through `encode_tiles_with_gpu` using `engine`.
         let mut enc_gpu = SmartTileEncoder::new();
@@ -7357,19 +7418,27 @@ mod tests {
         let f1 = sample_hpel_frame(1);
         let f2 = sample_hpel_frame(2);
 
-        FORCE_SCALAR.store(true, Ordering::Relaxed);
-        FORCE_DISABLE_GPU.store(true, Ordering::Relaxed);
-        let mut enc_scal = SmartTileEncoder::new();
-        let _ = enc_scal.encode(w, h, &f0, 75);
-        let p1_scal = enc_scal.encode(w, h, &f1, 75);
-        let p2_scal = enc_scal.encode(w, h, &f2, 75);
-        FORCE_SCALAR.store(false, Ordering::Relaxed);
+        let (p1_scal, p2_scal, enc_scal, p1_simd, p2_simd, enc_simd) = {
+            struct OverrideReset;
+            impl Drop for OverrideReset {
+                fn drop(&mut self) {
+                    apply_test_overrides((false, false));
+                }
+            }
+            let _reset = OverrideReset;
+            apply_test_overrides((true, true));
+            let mut enc_scal = SmartTileEncoder::new();
+            let _ = enc_scal.encode(w, h, &f0, 75);
+            let p1_scal = enc_scal.encode(w, h, &f1, 75);
+            let p2_scal = enc_scal.encode(w, h, &f2, 75);
 
-        let mut enc_simd = SmartTileEncoder::new();
-        let _ = enc_simd.encode(w, h, &f0, 75);
-        let p1_simd = enc_simd.encode(w, h, &f1, 75);
-        let p2_simd = enc_simd.encode(w, h, &f2, 75);
-        FORCE_DISABLE_GPU.store(false, Ordering::Relaxed);
+            apply_test_overrides((false, true));
+            let mut enc_simd = SmartTileEncoder::new();
+            let _ = enc_simd.encode(w, h, &f0, 75);
+            let p1_simd = enc_simd.encode(w, h, &f1, 75);
+            let p2_simd = enc_simd.encode(w, h, &f2, 75);
+            (p1_scal, p2_scal, enc_scal, p1_simd, p2_simd, enc_simd)
+        };
 
         assert_eq!(
             p1_simd.payload, p1_scal.payload,
