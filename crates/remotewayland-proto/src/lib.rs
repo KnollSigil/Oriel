@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -457,6 +457,10 @@ pub enum ControlMessage {
     Contrast { contrast: u32 },
     /// Client -> Server: the local pointer left a remote window (mirrors `wl_pointer::leave`).
     PointerLeave { window_id: WindowId },
+    /// Client -> Server: whether the server downscales frames an app renders above its
+    /// window's display scale (an integer-scale app on a fractional-scale display) to that
+    /// scale before streaming them. Applies to the session from then on; enabled by default.
+    ServerDownscale { enabled: bool },
 }
 
 /// Whether `rgb` is a valid XDG `accent-color`: three finite components in `[0, 1]`.
@@ -926,6 +930,7 @@ mod tests {
         };
         let no_accent = ControlMessage::AccentColor { rgb: None };
         let contrast = ControlMessage::Contrast { contrast: 1 };
+        let downscale = ControlMessage::ServerDownscale { enabled: false };
 
         write_control_message(&mut tx, &primary).await.unwrap();
         write_control_message(&mut tx, &cursor).await.unwrap();
@@ -942,7 +947,7 @@ mod tests {
         write_control_message(&mut tx, &no_button_layout)
             .await
             .unwrap();
-        for msg in [&accent, &no_accent, &contrast] {
+        for msg in [&accent, &no_accent, &contrast, &downscale] {
             write_control_message(&mut tx, msg).await.unwrap();
         }
         drop(tx);
@@ -983,7 +988,7 @@ mod tests {
             read_control_message(&mut rx).await.unwrap().unwrap(),
             no_button_layout
         );
-        for msg in [accent, no_accent, contrast] {
+        for msg in [accent, no_accent, contrast, downscale] {
             assert_eq!(read_control_message(&mut rx).await.unwrap().unwrap(), msg);
         }
         assert!(read_control_message(&mut rx).await.unwrap().is_none());

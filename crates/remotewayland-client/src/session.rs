@@ -294,7 +294,7 @@ pub struct SessionManager {
     hosts: Vec<HostProfile>,
     sessions: HashMap<String, HostSession>,
     active_target: Option<String>,
-    global_max_scale: RenderScaleCap,
+    settings: ClientSettings,
     cli_max_scale: Option<RenderScaleCap>,
     next_launch_id: u64,
     next_attempt_id: u64,
@@ -307,7 +307,7 @@ impl SessionManager {
     pub fn new(cli_max_scale: Option<RenderScaleCap>) -> (Self, SessionEvents) {
         Self::with_state(
             load_hosts(),
-            load_client_settings().max_scale,
+            load_client_settings(),
             cli_max_scale,
             Persistence {
                 save_hosts,
@@ -318,7 +318,7 @@ impl SessionManager {
 
     fn with_state(
         hosts: Vec<HostProfile>,
-        global_max_scale: RenderScaleCap,
+        settings: ClientSettings,
         cli_max_scale: Option<RenderScaleCap>,
         persistence: Persistence,
     ) -> (Self, SessionEvents) {
@@ -337,7 +337,7 @@ impl SessionManager {
             hosts,
             sessions: HashMap::new(),
             active_target,
-            global_max_scale,
+            settings,
             cli_max_scale,
             next_launch_id: seed,
             next_attempt_id: 1,
@@ -382,13 +382,17 @@ impl SessionManager {
     }
 
     pub fn global_max_scale(&self) -> RenderScaleCap {
-        self.global_max_scale
+        self.settings.max_scale
+    }
+
+    pub fn downscale_hidpi(&self) -> bool {
+        self.settings.downscale_hidpi
     }
 
     fn effective_max_scale(&self, host_override: Option<RenderScaleCap>) -> RenderScaleCap {
         self.cli_max_scale
             .or(host_override)
-            .unwrap_or(self.global_max_scale)
+            .unwrap_or(self.settings.max_scale)
     }
 
     fn is_active(&self, target: &str) -> bool {
@@ -553,6 +557,9 @@ impl SessionManager {
             })
             .map_err(|err| format!("failed to spawn Wayland UI thread: {err}"))?;
 
+        let _ = ctrl_tx.send(ControlMessage::ServerDownscale {
+            enabled: self.settings.downscale_hidpi,
+        });
         let _ = ctrl_tx.send(ControlMessage::ListApps);
         rt.spawn(forward_net_events(
             target.to_string(),
@@ -780,15 +787,34 @@ impl SessionManager {
 
     /// Change the global render scale cap, save it, and apply it to open connections.
     pub fn set_global_max_scale(&mut self, cap: RenderScaleCap) {
-        if self.global_max_scale == cap {
+        if self.settings.max_scale == cap {
             return;
         }
-        self.global_max_scale = cap;
-        if let Err(err) = (self.persistence.save_settings)(&ClientSettings { max_scale: cap }) {
-            tracing::warn!(error = %err, "failed to save client settings");
-        }
+        self.settings.max_scale = cap;
+        self.save_settings();
         for host in &self.hosts {
             self.send_max_scale(host);
+        }
+    }
+
+    /// Turn server-side downscaling of HiDPI frames on or off, save it, and apply it to open
+    /// connections.
+    pub fn set_downscale_hidpi(&mut self, enabled: bool) {
+        if self.settings.downscale_hidpi == enabled {
+            return;
+        }
+        self.settings.downscale_hidpi = enabled;
+        self.save_settings();
+        for sess in self.sessions.values() {
+            if let Some(ctrl_tx) = &sess.ctrl_tx {
+                let _ = ctrl_tx.send(ControlMessage::ServerDownscale { enabled });
+            }
+        }
+    }
+
+    fn save_settings(&self) {
+        if let Err(err) = (self.persistence.save_settings)(&self.settings) {
+            tracing::warn!(error = %err, "failed to save client settings");
         }
     }
 
@@ -1043,7 +1069,7 @@ mod tests {
     fn manager(targets: &[&str]) -> (SessionManager, SessionEvents) {
         SessionManager::with_state(
             targets.iter().map(|t| profile(t)).collect(),
-            RenderScaleCap::Uncapped,
+            ClientSettings::default(),
             None,
             Persistence {
                 save_hosts: |_| Ok(()),
@@ -1113,6 +1139,28 @@ mod tests {
         let (attempt, ctrl_rx) = started(mgr, target, false);
         let _ = mgr.handle_event(net(target, attempt, LauncherNetEvent::Connected));
         (attempt, ctrl_rx)
+    }
+
+    #[test]
+    fn downscale_setting_applies_to_open_connections() {
+        let (mut mgr, _events) = manager(&["a", "b"]);
+        assert!(mgr.downscale_hidpi());
+        let (_, mut rx_a) = connected(&mut mgr, "a");
+        let (_, mut rx_b) = connected(&mut mgr, "b");
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        mgr.set_downscale_hidpi(false);
+        assert!(!mgr.downscale_hidpi());
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert_eq!(
+                rx.try_recv().ok(),
+                Some(ControlMessage::ServerDownscale { enabled: false })
+            );
+        }
+        // Unchanged: nothing more is sent.
+        mgr.set_downscale_hidpi(false);
+        assert!(rx_a.try_recv().is_err());
     }
 
     #[test]

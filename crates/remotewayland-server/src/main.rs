@@ -8,6 +8,7 @@ mod apps;
 mod audio;
 mod compositor;
 mod damage;
+mod downscale;
 mod gpu;
 mod media;
 mod pty;

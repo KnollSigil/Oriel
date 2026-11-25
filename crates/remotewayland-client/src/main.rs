@@ -281,6 +281,9 @@ fn run_gui_session(
     let (ui_tx, ui_rx) = window::create_ui_channel();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
 
+    let _ = ctrl_tx.send(ControlMessage::ServerDownscale {
+        enabled: load_client_settings().downscale_hidpi,
+    });
     if let Some(exec) = initial_exec {
         let _ = ctrl_tx.send(ControlMessage::LaunchApp {
             launch_id: 0,

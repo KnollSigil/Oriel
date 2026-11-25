@@ -1584,6 +1584,24 @@ fn open_preferences_dialog(window: &adw::ApplicationWindow, state: Rc<RefCell<Ap
         }
     });
     display_group.add(&scale_row);
+    let downscale_row = adw::SwitchRow::builder()
+        .title("Downscale HiDPI Frames on Server")
+        .subtitle(
+            "Shrink windows of apps without fractional scaling to this display's scale before \
+             streaming them, saving bandwidth",
+        )
+        .active(state.borrow().sessions.downscale_hidpi())
+        .build();
+    downscale_row.connect_active_notify({
+        let state = Rc::clone(&state);
+        move |row| {
+            state
+                .borrow_mut()
+                .sessions
+                .set_downscale_hidpi(row.is_active())
+        }
+    });
+    display_group.add(&downscale_row);
 
     // Inline radio rows (rather than a nested dropdown) so switching microphones is a
     // single click or keypress; the PipeWire source switches live.

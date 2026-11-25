@@ -96,10 +96,23 @@ impl RenderScaleCap {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClientSettings {
     #[serde(default)]
     pub max_scale: RenderScaleCap,
+    /// Have the server downscale frames that integer-scale apps render above a fractional
+    /// display scale (e.g. 2x for a 120% display) before streaming them.
+    #[serde(default = "default_true")]
+    pub downscale_hidpi: bool,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        Self {
+            max_scale: RenderScaleCap::default(),
+            downscale_hidpi: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +352,24 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_settings_default_missing_keys() {
+        // Settings saved before `downscale_hidpi` existed turn it on.
+        let old: ClientSettings = serde_json::from_str(r#"{"max_scale":"scale150"}"#).unwrap();
+        assert_eq!(old.max_scale, RenderScaleCap::Scale150);
+        assert!(old.downscale_hidpi);
+        let empty: ClientSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, ClientSettings::default());
+        assert!(ClientSettings::default().downscale_hidpi);
+
+        let off = ClientSettings {
+            downscale_hidpi: false,
+            ..ClientSettings::default()
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(serde_json::from_str::<ClientSettings>(&json).unwrap(), off);
+    }
 
     #[test]
     fn resolve_uri_refuses_a_uri_in_the_arguments() {

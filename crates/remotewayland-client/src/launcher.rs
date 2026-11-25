@@ -133,6 +133,9 @@ mod cli_ui {
                 }
             })?;
 
+        let _ = ctrl_tx.send(ControlMessage::ServerDownscale {
+            enabled: load_client_settings().downscale_hidpi,
+        });
         let _ = ctrl_tx.send(ControlMessage::ListApps);
         let mut apps = Vec::new();
         while let Some(ev) = net_rx.blocking_recv() {

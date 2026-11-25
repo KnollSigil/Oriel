@@ -870,6 +870,9 @@ async fn run_display_session(
                     Some(ControlMessage::DisplayScale { scale_factor }) => {
                         let _ = cmd_tx.send(CompositorCommand::SetDisplayScale { scale_factor });
                     }
+                    Some(ControlMessage::ServerDownscale { enabled }) => {
+                        let _ = cmd_tx.send(CompositorCommand::SetServerDownscale { enabled });
+                    }
                     Some(ControlMessage::WindowClosed { window_id }) => {
                         let _ = cmd_tx.send(CompositorCommand::CloseWindow { window_id });
                     }

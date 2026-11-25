@@ -107,7 +107,8 @@ use smithay::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::damage::{surface_damage_to_frame, FrameDamage, SurfaceView};
+use crate::damage::{surface_damage_to_frame, DamageRect, FrameDamage, SurfaceView};
+use crate::downscale::{scaled_size, BoxDownscaler};
 use crate::gpu::{
     BgraFrame, CompositeLayer, FramePixels, GpuImporter, GpuMode, ImportedFrame, PendingReadback,
     Readback,
@@ -250,6 +251,11 @@ pub enum CompositorCommand {
     },
     SetDisplayScale {
         scale_factor: f64,
+    },
+    /// Whether frames an app renders above its window's display scale (an integer-scale app on
+    /// a fractional-scale display) are box-downscaled to that scale before streaming.
+    SetServerDownscale {
+        enabled: bool,
     },
     CloseWindow {
         window_id: WindowId,
@@ -439,6 +445,8 @@ struct TrackedWindow {
     last_sub_info: Vec<(bool, u32, u32, i32, i32)>,
     /// Inputs of the last composite; an equal signature means the composite would be identical.
     last_composite_sig: Option<CompositeSignature>,
+    /// The size frames were last downscaled to, if they were (for logging changes).
+    downscaled_to: Option<(u32, u32)>,
 }
 
 struct TrackedPopup {
@@ -607,6 +615,11 @@ struct AppState {
     output_scale: i32,
     display_scale: f64,
     xwayland_scale: f64,
+    /// See [`CompositorCommand::SetServerDownscale`].
+    downscale_hidpi: bool,
+    downscaler: BoxDownscaler,
+    /// Recent downscaled frames, reused once nothing else holds them.
+    downscale_pool: Vec<Arc<Vec<u8>>>,
     seat: Seat<Self>,
     space: Space<Window>,
     popups: PopupManager,
@@ -1123,6 +1136,13 @@ impl AppState {
                     );
                     self.display_scale = scale;
                     self.update_output_and_xwayland_scale();
+                }
+            }
+            CompositorCommand::SetServerDownscale { enabled } => {
+                if self.downscale_hidpi != enabled {
+                    info!(enabled, "server-side HiDPI frame downscaling changed");
+                    self.downscale_hidpi = enabled;
+                    self.recomposite_all();
                 }
             }
             CompositorCommand::CloseWindow { window_id } => {
@@ -1749,6 +1769,77 @@ impl AppState {
         FramePixels::Cpu(Arc::new(buf))
     }
 
+    /// Recomposite every Wayland window and popup, e.g. after a setting that changes how
+    /// frames are built.
+    fn recomposite_all(&mut self) {
+        let windows: Vec<(WindowId, WlSurface)> = self
+            .windows
+            .iter()
+            .filter_map(|(id, t)| Some((*id, t.window.toplevel()?.wl_surface().clone())))
+            .collect();
+        for (window_id, root_surface) in windows {
+            self.recomposite_window(window_id, &root_surface);
+        }
+        let popups: Vec<WindowId> = self.popup_windows.keys().copied().collect();
+        for window_id in popups {
+            self.recomposite_popup(window_id);
+        }
+    }
+
+    /// Box-downscale a `src_size` frame to `out` pixels, on the GPU if the frame is in VRAM.
+    /// `prev` is the previous frame at `out` size and `damage` (in `out` pixels) what changed
+    /// since it; on the CPU only that is filtered again.
+    fn downscale_frame(
+        &mut self,
+        frame: &FramePixels,
+        src_size: (u32, u32),
+        out: (u32, u32),
+        prev: Option<&FramePixels>,
+        damage: &FrameDamage,
+    ) -> FramePixels {
+        if let (FramePixels::Gpu(handle), Some(gpu)) = (frame, self.gpu.as_mut()) {
+            if let Some(scaled) = gpu.downscale(handle, out.0, out.1) {
+                return FramePixels::Gpu(scaled);
+            }
+            debug!(
+                ?src_size,
+                ?out,
+                "GPU downscale unavailable; downscaling on the CPU"
+            );
+        }
+        let src = frame.to_cpu_bgra();
+        let len = (out.0 * out.1 * 4) as usize;
+        if src.len() < (src_size.0 * src_size.1 * 4) as usize {
+            warn!(?src_size, bytes = src.len(), "frame too short to downscale");
+            return FramePixels::Cpu(Arc::new(vec![0u8; len]));
+        }
+
+        // Reuse a pooled buffer nothing else holds any more.
+        let free = self
+            .downscale_pool
+            .iter()
+            .position(|b| Arc::strong_count(b) == 1 && b.len() == len);
+        let mut buf = free
+            .and_then(|i| Arc::try_unwrap(self.downscale_pool.swap_remove(i)).ok())
+            .unwrap_or_else(|| vec![0u8; len]);
+
+        match (prev, damage) {
+            (Some(FramePixels::Cpu(prev)), FrameDamage::Rects(rects)) if prev.len() == len => {
+                buf.copy_from_slice(prev);
+                self.downscaler
+                    .downscale_rects(&src, src_size, &mut buf, out, rects);
+            }
+            _ => self.downscaler.downscale(&src, src_size, &mut buf, out),
+        }
+
+        let buf = Arc::new(buf);
+        self.downscale_pool.push(Arc::clone(&buf));
+        if self.downscale_pool.len() > DOWNSCALE_POOL_SIZE {
+            self.downscale_pool.remove(0);
+        }
+        FramePixels::Cpu(buf)
+    }
+
     fn recomposite_window(&mut self, window_id: WindowId, root_surface: &WlSurface) {
         let root_id = root_surface.id();
         let Some((surf_w, surf_h, _)) = self.surface_buffers.get(&root_id) else {
@@ -1845,9 +1936,35 @@ impl AppState {
             (surf_w, surf_h)
         };
 
+        // An app rendering above its window's display scale (an integer-scale app on a
+        // fractional-scale display) is downscaled to that scale here: the client would scale
+        // it down anyway, after it crossed the network.
+        let downscale_to = if self.downscale_hidpi && !mixed_scale {
+            let display_scale = self
+                .windows
+                .get(&window_id)
+                .map(|w| w.scale_factor)
+                .unwrap_or(self.display_scale);
+            downscale_target(
+                (root_log_w, root_log_h),
+                (surf_w, surf_h),
+                root_sx.min(root_sy),
+                display_scale,
+            )
+        } else {
+            None
+        };
+        let (frame_w, frame_h) = downscale_to.unwrap_or((win_phys_w, win_phys_h));
+
         let sig = CompositeSignature {
             surfaces: self.tree_buffer_signature(root_surface),
-            scale_bits: (comp_sx.to_bits(), comp_sy.to_bits()),
+            scale_bits: match downscale_to {
+                Some((w, h)) => (
+                    (f64::from(w) / f64::from(root_log_w)).to_bits(),
+                    (f64::from(h) / f64::from(root_log_h)).to_bits(),
+                ),
+                None => (comp_sx.to_bits(), comp_sy.to_bits()),
+            },
             geometry,
             input_bounds,
         };
@@ -1909,13 +2026,17 @@ impl AppState {
                 damage.merge(surface_damage.placed(*sw, *sh, *dst));
             }
         }
+        if downscale_to.is_some() && damage != FrameDamage::Full {
+            let out = DamageRect::from_size((frame_w as i32, frame_h as i32).into());
+            damage = damage.placed(win_phys_w, win_phys_h, out);
+        }
 
         // The client attached new buffers without damaging anything: nothing to send.
         let metadata_unchanged = prev_sig
             .as_ref()
             .is_some_and(|prev| prev.same_metadata(&sig));
         if damage.is_empty() && announced && metadata_unchanged {
-            if !has_subsurfaces {
+            if !has_subsurfaces && downscale_to.is_none() {
                 // Drop the old buffer for the identical new one, so it can be reused.
                 let pixels = self.surface_buffers.get(&root_id).unwrap().2.clone();
                 if let Some(frame) = self
@@ -1936,10 +2057,41 @@ impl AppState {
             let layers: Vec<CompositeLayer> = layers.into_iter().map(|(_, layer)| layer).collect();
             self.composite_layers(win_phys_w, win_phys_h, &layers)
         };
+        let in_vram = matches!(composite, FramePixels::Gpu(_));
+        let composite = match downscale_to {
+            Some(out) => {
+                let prev = self
+                    .windows
+                    .get(&window_id)
+                    .and_then(|t| t.latest_bgra.as_ref())
+                    .filter(|f| (f.width, f.height) == out)
+                    .map(|f| f.pixels.clone());
+                self.downscale_frame(
+                    &composite,
+                    (win_phys_w, win_phys_h),
+                    out,
+                    prev.as_ref(),
+                    &damage,
+                )
+            }
+            None => composite,
+        };
 
         let Some(tracked) = self.windows.get_mut(&window_id) else {
             return;
         };
+        if tracked.downscaled_to != downscale_to {
+            debug!(
+                window_id,
+                rendered = ?(win_phys_w, win_phys_h),
+                streamed = ?(frame_w, frame_h),
+                logical = ?(root_log_w, root_log_h),
+                display_scale = tracked.scale_factor,
+                in_vram,
+                "window frame downscaling changed"
+            );
+            tracked.downscaled_to = downscale_to;
+        }
         if sub_info != tracked.last_sub_info {
             debug!(
                 window_id,
@@ -1955,8 +2107,8 @@ impl AppState {
         }
 
         let new_frame = CachedFrame {
-            width: win_phys_w,
-            height: win_phys_h,
+            width: frame_w,
+            height: frame_h,
             logical_width: root_log_w,
             logical_height: root_log_h,
             geometry,
@@ -2072,10 +2224,28 @@ impl AppState {
         let input_bounds = self.tree_input_bounds(&root_surface, root_log_w, root_log_h);
         let (pop_log_w, pop_log_h) = (geometry.width, geometry.height);
         let (pop_phys_w, pop_phys_h) = (surf_w, surf_h);
+        // Downscaled like its toplevel (see `recomposite_window`).
+        let downscale_to = if self.downscale_hidpi {
+            downscale_target(
+                (root_log_w, root_log_h),
+                (surf_w, surf_h),
+                root_sx.min(root_sy),
+                self.window_scale_for_surface(&root_surface),
+            )
+        } else {
+            None
+        };
+        let (frame_w, frame_h) = downscale_to.unwrap_or((pop_phys_w, pop_phys_h));
 
         let sig = CompositeSignature {
             surfaces: self.tree_buffer_signature(&root_surface),
-            scale_bits: (root_sx.to_bits(), root_sy.to_bits()),
+            scale_bits: match downscale_to {
+                Some((w, h)) => (
+                    (f64::from(w) / f64::from(root_log_w)).to_bits(),
+                    (f64::from(h) / f64::from(root_log_h)).to_bits(),
+                ),
+                None => (root_sx.to_bits(), root_sy.to_bits()),
+            },
             geometry,
             input_bounds,
         };
@@ -2133,14 +2303,21 @@ impl AppState {
             |_, _, _| true,
         );
 
+        if let Some(out) = downscale_to {
+            let mut scaled = vec![0u8; (out.0 * out.1 * 4) as usize];
+            self.downscaler
+                .downscale(&bgra, (pop_phys_w, pop_phys_h), &mut scaled, out);
+            bgra = scaled;
+        }
+
         let Some(popup) = self.popup_windows.get_mut(&window_id) else {
             return;
         };
 
         let bgra_arc = Arc::new(bgra);
         let new_frame = CachedFrame {
-            width: pop_phys_w,
-            height: pop_phys_h,
+            width: frame_w,
+            height: frame_h,
             logical_width: root_log_w,
             logical_height: root_log_h,
             geometry,
@@ -2811,6 +2988,7 @@ impl XdgShellHandler for AppState {
                 latest_bgra: None,
                 last_sub_info: Vec::new(),
                 last_composite_sig: None,
+                downscaled_to: None,
             },
         );
         self.focused_window_id = window_id;
@@ -4583,6 +4761,9 @@ fn run_compositor_loop(
         output_scale: 1,
         display_scale: 1.0,
         xwayland_scale: 1.0,
+        downscale_hidpi: true,
+        downscaler: BoxDownscaler::default(),
+        downscale_pool: Vec::new(),
         seat,
         space,
         popups: PopupManager::default(),
@@ -5012,6 +5193,28 @@ fn input_region_bounds(region: Option<&RegionAttributes>, log_w: u32, log_h: u32
     }
 }
 
+/// Downscaled frames kept for reuse (see `AppState::downscale_frame`).
+const DOWNSCALE_POOL_SIZE: usize = 4;
+
+/// How far above its display scale a frame must be rendered before it is downscaled; absorbs
+/// the rounding of fractional-scale buffer sizes.
+const DOWNSCALE_TOLERANCE: f64 = 0.05;
+
+/// The size to downscale a `phys` frame of a `logical` surface rendered at `frame_scale` to,
+/// for a window shown at `display_scale`; `None` if it isn't rendered above that scale.
+fn downscale_target(
+    (log_w, log_h): (u32, u32),
+    (phys_w, phys_h): (u32, u32),
+    frame_scale: f64,
+    display_scale: f64,
+) -> Option<(u32, u32)> {
+    if log_w == 0 || log_h == 0 || frame_scale <= display_scale + DOWNSCALE_TOLERANCE {
+        return None;
+    }
+    let (w, h) = scaled_size(log_w, log_h, display_scale);
+    (w < phys_w && h < phys_h).then_some((w, h))
+}
+
 fn sanitize_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale >= 1.0 {
         scale.min(4.0)
@@ -5379,6 +5582,28 @@ mod tests {
         assert_eq!((w, h), (2, 2));
         let firsts: Vec<u8> = out.chunks(4).map(|p| p[0]).collect();
         assert_eq!(firsts, vec![1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn downscale_target_only_for_frames_above_the_display_scale() {
+        // Integer-scale app on a 120% display: 2x frame streamed at 1.2x.
+        assert_eq!(
+            downscale_target((800, 600), (1600, 1200), 2.0, 1.2),
+            Some((960, 720))
+        );
+        // Fractional-scale app already at 1.2x (with buffer-size rounding).
+        assert_eq!(downscale_target((801, 601), (961, 721), 1.1998, 1.2), None);
+        // At or below the display scale.
+        assert_eq!(downscale_target((800, 600), (1600, 1200), 2.0, 2.0), None);
+        assert_eq!(downscale_target((800, 600), (800, 600), 1.0, 1.5), None);
+        // Within the tolerance.
+        assert_eq!(downscale_target((800, 600), (1000, 750), 1.25, 1.22), None);
+        // 150%: 2x -> 1.5x.
+        assert_eq!(
+            downscale_target((101, 51), (202, 102), 2.0, 1.5),
+            Some((152, 77))
+        );
+        assert_eq!(downscale_target((0, 10), (0, 20), 2.0, 1.2), None);
     }
 
     #[test]

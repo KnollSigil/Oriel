@@ -24,7 +24,10 @@ use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode, NodeType};
 use smithay::backend::egl::fence::EGLFence;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
-use smithay::backend::renderer::gles::{GlesMapping, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::{
+    GlesFrame, GlesMapping, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName,
+    UniformType,
+};
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer, Texture,
 };
@@ -38,6 +41,77 @@ const MAX_CACHED_TARGETS: usize = 8;
 
 /// CPU surface frames kept uploaded for compositing.
 const MAX_CACHED_UPLOADS: usize = 16;
+
+/// Area-average (box) downscaling: each output pixel averages the source texels its footprint
+/// (`ratio` texels across) covers, weighted by coverage. Texels are sampled at their centres, so
+/// the sampler's filter doesn't matter. Footprints up to [`MAX_BOX_RATIO`] texels are supported.
+const BOX_DOWNSCALE_SHADER: &str = r#"#version 100
+
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+#endif
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+uniform float alpha;
+uniform vec2 tex_size;
+uniform vec2 ratio;
+varying vec2 v_coords;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+void main() {
+    vec2 center = v_coords * tex_size;
+    vec2 lo = center - 0.5 * ratio;
+    vec2 hi = center + 0.5 * ratio;
+    vec2 base = floor(lo);
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int j = 0; j < 8; j++) {
+        float ty = base.y + float(j);
+        if (ty >= hi.y) break;
+        float wy = min(ty + 1.0, hi.y) - max(ty, lo.y);
+        for (int i = 0; i < 8; i++) {
+            float tx = base.x + float(i);
+            if (tx >= hi.x) break;
+            float w = wy * (min(tx + 1.0, hi.x) - max(tx, lo.x));
+            sum += texture2D(tex, (vec2(tx, ty) + 0.5) / tex_size) * w;
+            total += w;
+        }
+    }
+    vec4 color = sum / max(total, 1e-6);
+
+#if defined(NO_ALPHA)
+    color = vec4(color.rgb, 1.0) * alpha;
+#else
+    color = color * alpha;
+#endif
+
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
+#endif
+
+    gl_FragColor = color;
+}
+"#;
+
+/// The largest downscale ratio [`BOX_DOWNSCALE_SHADER`] handles: its loops take at most 8 taps.
+pub const MAX_BOX_RATIO: f64 = 7.0;
 
 /// Maximum idle pooled zero-copy Vulkan/GLES DMABUF slots retained across window sizes.
 const MAX_IDLE_ZERO_COPY_SLOTS: usize = 16;
@@ -233,6 +307,8 @@ pub struct GpuImporter {
     /// Textures of CPU surface frames uploaded for [`GpuImporter::composite`], keyed by
     /// the (immutable) frame bytes they hold.
     uploads: Vec<(Weak<Vec<u8>>, GlesTexture)>,
+    /// [`BOX_DOWNSCALE_SHADER`], compiled on first use; `Err` if it failed to compile.
+    box_program: Option<std::result::Result<GlesTexProgram, ()>>,
 }
 
 impl GpuImporter {
@@ -318,6 +394,7 @@ impl GpuImporter {
             targets: HashMap::new(),
             bgra_readback,
             uploads: Vec::new(),
+            box_program: None,
         })
     }
 
@@ -566,6 +643,57 @@ impl GpuImporter {
         height: u32,
         layers: &[CompositeLayer],
     ) -> Option<GpuFrameHandle> {
+        self.draw_layers(width, height, layers, None)
+    }
+
+    /// Downscale `frame` to a `width`x`height` VRAM frame with an area-average (box) filter.
+    /// Returns `None` if the GPU can't (no zero-copy support, a footprint wider than
+    /// [`MAX_BOX_RATIO`], or a failed step).
+    pub fn downscale(
+        &mut self,
+        frame: &GpuFrameHandle,
+        width: u32,
+        height: u32,
+    ) -> Option<GpuFrameHandle> {
+        let ratio_x = f64::from(frame.width) / f64::from(width);
+        let ratio_y = f64::from(frame.height) / f64::from(height);
+        if ratio_x > MAX_BOX_RATIO || ratio_y > MAX_BOX_RATIO {
+            return None;
+        }
+        let program = self.box_program()?;
+        let dst = Rectangle::from_size((width as i32, height as i32).into());
+        let layer = (
+            FramePixels::Gpu(frame.clone()),
+            frame.width,
+            frame.height,
+            dst,
+        );
+        self.draw_layers(width, height, &[layer], Some(&program))
+    }
+
+    /// [`BOX_DOWNSCALE_SHADER`], compiled once.
+    fn box_program(&mut self) -> Option<GlesTexProgram> {
+        let program = self.box_program.get_or_insert_with(|| {
+            let uniforms = [
+                UniformName::new("tex_size", UniformType::_2f),
+                UniformName::new("ratio", UniformType::_2f),
+            ];
+            self.renderer
+                .compile_custom_texture_shader(BOX_DOWNSCALE_SHADER, &uniforms)
+                .map_err(|err| warn!(error = ?err, "failed to compile the box downscale shader"))
+        });
+        program.as_ref().ok().cloned()
+    }
+
+    /// Draw `layers` onto a new `width`x`height` VRAM frame, with `program` (and its
+    /// `tex_size`/`ratio` uniforms) instead of the default texture shader if given.
+    fn draw_layers(
+        &mut self,
+        width: u32,
+        height: u32,
+        layers: &[CompositeLayer],
+        program: Option<&GlesTexProgram>,
+    ) -> Option<GpuFrameHandle> {
         let render_transform = self.zero_copy.as_ref()?.render_transform;
         let pool = Arc::clone(&self.zero_copy.as_ref()?.pool);
         let mut slot = self.checkout_zero_copy_slot(width, height)?;
@@ -611,7 +739,18 @@ impl GpuImporter {
             for (texture, src, dst) in &textures {
                 // Damage is relative to `dst`.
                 let damage = [Rectangle::from_size(dst.size)];
-                Frame::render_texture_from_to(
+                let tex_size = texture.size();
+                let uniforms = [
+                    Uniform::new("tex_size", (tex_size.w as f32, tex_size.h as f32)),
+                    Uniform::new(
+                        "ratio",
+                        (
+                            (src.size.w / f64::from(dst.size.w)) as f32,
+                            (src.size.h / f64::from(dst.size.h)) as f32,
+                        ),
+                    ),
+                ];
+                GlesFrame::render_texture_from_to(
                     &mut frame,
                     texture,
                     *src,
@@ -620,6 +759,8 @@ impl GpuImporter {
                     &[],
                     Transform::Normal,
                     1.0,
+                    program,
+                    if program.is_some() { &uniforms } else { &[] },
                 )
                 .map_err(|e| anyhow!("failed to draw surface frame: {e:?}"))?;
             }
@@ -1081,6 +1222,49 @@ mod tests {
         assert_eq!(at(22, 30), BLUE, "left of the subsurface");
         assert_eq!(at(53, 37), WHITE, "clipped subsurface top-left quadrant");
         assert_eq!(at(63, 47), GREEN, "clipped subsurface");
+    }
+
+    #[test]
+    fn downscale_box_filters_in_vram_like_the_cpu() {
+        let Ok(Some(mut gpu)) = GpuImporter::new(&GpuMode::Auto) else {
+            eprintln!("Skipping GPU downscale test: no hardware EGL GPU available");
+            return;
+        };
+        if gpu.zero_copy.is_none() {
+            eprintln!("Skipping GPU downscale test: adapter does not support DMABUF sharing");
+            return;
+        }
+        // A 1px checkerboard (which nearest or bilinear sampling would alias) over a
+        // premultiplied alpha gradient.
+        let (sw, sh, dw, dh) = (40u32, 30u32, 24u32, 18u32);
+        let src: Vec<u8> = (0..sh)
+            .flat_map(|y| {
+                (0..sw).flat_map(move |x| {
+                    let a = (255 * x / (sw - 1)) as u8;
+                    let c = if (x + y) % 2 == 0 { a } else { a / 4 };
+                    [c, c / 2, c, a]
+                })
+            })
+            .collect();
+        let full = Rectangle::from_size((sw as i32, sh as i32).into());
+        let layer = (FramePixels::Cpu(Arc::new(src.clone())), sw, sh, full);
+        let uploaded = gpu.composite(sw, sh, &[layer]).expect("upload to VRAM");
+        let scaled = gpu.downscale(&uploaded, dw, dh).expect("GPU downscale");
+        assert_eq!((scaled.width, scaled.height), (dw, dh));
+        let got = scaled.read_to_cpu_bgra().expect("read downscaled frame");
+
+        let mut want = vec![0u8; (dw * dh * 4) as usize];
+        crate::downscale::BoxDownscaler::default().downscale(&src, (sw, sh), &mut want, (dw, dh));
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| g.abs_diff(*w))
+            .max()
+            .unwrap();
+        assert!(
+            worst <= 2,
+            "GPU and CPU box filters differ by up to {worst}"
+        );
     }
 
     #[test]
