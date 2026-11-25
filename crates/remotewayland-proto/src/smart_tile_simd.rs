@@ -407,6 +407,123 @@ pub fn ycbcr420_half_to_bgra_tile_scalar(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn bgra_tile_to_ycbcr420_quarter_scalar(
+    bgra: &[u8],
+    fb_w: u32,
+    x0: u32,
+    y0: u32,
+    tw: u32,
+    th: u32,
+    y_plane: &mut [i32; 16 * 16],
+    cb_plane: &mut [i32; 8 * 8],
+    cr_plane: &mut [i32; 8 * 8],
+) {
+    let stride = fb_w as usize * 4;
+    let max_x = tw as usize - 1;
+    let max_y = th as usize - 1;
+    let mut cb_quarter = [0i32; 16 * 16];
+    let mut cr_quarter = [0i32; 16 * 16];
+
+    for qy in 0..16usize {
+        let base_y = qy * 4;
+        for qx in 0..16usize {
+            let base_x = qx * 4;
+            let mut sum_b = 0i32;
+            let mut sum_g = 0i32;
+            let mut sum_r = 0i32;
+            for dy in 0..4usize {
+                let sy = (y0 as usize) + (base_y + dy).min(max_y);
+                let row = sy * stride;
+                for dx in 0..4usize {
+                    let sx = (x0 as usize) + (base_x + dx).min(max_x);
+                    let idx = row + sx * 4;
+                    sum_b += bgra[idx] as i32;
+                    sum_g += bgra[idx + 1] as i32;
+                    sum_r += bgra[idx + 2] as i32;
+                }
+            }
+            let b = (sum_b + 8) >> 4;
+            let g = (sum_g + 8) >> 4;
+            let r = (sum_r + 8) >> 4;
+            let (y, cb, cr) = rgb_to_ycbcr(r, g, b);
+            let out_idx = qy * 16 + qx;
+            y_plane[out_idx] = y;
+            cb_quarter[out_idx] = cb;
+            cr_quarter[out_idx] = cr;
+        }
+    }
+
+    for cy in 0..8usize {
+        let y2 = cy * 2;
+        for cx in 0..8usize {
+            let x2 = cx * 2;
+            let i00 = y2 * 16 + x2;
+            let i01 = i00 + 1;
+            let i10 = i00 + 16;
+            let i11 = i10 + 1;
+            cb_plane[cy * 8 + cx] =
+                (cb_quarter[i00] + cb_quarter[i01] + cb_quarter[i10] + cb_quarter[i11] + 2) >> 2;
+            cr_plane[cy * 8 + cx] =
+                (cr_quarter[i00] + cr_quarter[i01] + cr_quarter[i10] + cr_quarter[i11] + 2) >> 2;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ycbcr420_quarter_to_bgra_tile_scalar(
+    y_plane: &[i32; 16 * 16],
+    cb_plane: &[i32; 8 * 8],
+    cr_plane: &[i32; 8 * 8],
+    a_plane: Option<&[i32; 16 * 16]>,
+    bgra: &mut [u8],
+    fb_w: u32,
+    x0: u32,
+    y0: u32,
+    tw: u32,
+    th: u32,
+) {
+    let stride = fb_w as usize * 4;
+    for py in 0..(th as usize) {
+        let row_base = (y0 as usize + py) * stride + (x0 as usize) * 4;
+        let qy0 = py >> 2;
+        let qy1 = (qy0 + 1).min(15);
+        let wy = (py & 3) as i32;
+        let wy0 = 4 - wy;
+        let r0 = qy0 * 16;
+        let r1 = qy1 * 16;
+        let cy = qy0 >> 1;
+        for px in 0..(tw as usize) {
+            let qx0 = px >> 2;
+            let qx1 = (qx0 + 1).min(15);
+            let wx = (px & 3) as i32;
+            let wx0 = 4 - wx;
+            let top = y_plane[r0 + qx0] * wx0 + y_plane[r0 + qx1] * wx;
+            let bot = y_plane[r1 + qx0] * wx0 + y_plane[r1 + qx1] * wx;
+            let y = (top * wy0 + bot * wy + 8) >> 4;
+            let c_idx = cy * 8 + (qx0 >> 1);
+            let (mut r, mut g, mut b) = ycbcr_to_rgb(y, cb_plane[c_idx], cr_plane[c_idx]);
+            let a = match a_plane {
+                Some(ap) => {
+                    let a_top = ap[r0 + qx0] * wx0 + ap[r0 + qx1] * wx;
+                    let a_bot = ap[r1 + qx0] * wx0 + ap[r1 + qx1] * wx;
+                    let av = ((a_top * wy0 + a_bot * wy + 8) >> 4).clamp(0, 255) as u8;
+                    r = r.min(av);
+                    g = g.min(av);
+                    b = b.min(av);
+                    av
+                }
+                None => 255,
+            };
+            let dst = row_base + px * 4;
+            bgra[dst] = b;
+            bgra[dst + 1] = g;
+            bgra[dst + 2] = r;
+            bgra[dst + 3] = a;
+        }
+    }
+}
+
 pub fn tile_equals_scalar(
     a: &[u8],
     b: &[u8],
@@ -1582,6 +1699,292 @@ pub mod avx2 {
                         _mm256_slli_epi32(av, 24)
                     }
                     None => alpha_opaque,
+                };
+
+                let bgra_px = _mm256_or_si256(
+                    _mm256_or_si256(b, _mm256_slli_epi32(g, 8)),
+                    _mm256_or_si256(_mm256_slli_epi32(r, 16), a_shifted),
+                );
+                _mm256_storeu_si256(dst_row.add(px * 4) as *mut __m256i, bgra_px);
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn bgra_tile_to_ycbcr420_quarter(
+        bgra: &[u8],
+        fb_w: u32,
+        x0: u32,
+        y0: u32,
+        tw: u32,
+        th: u32,
+        y_plane: &mut [i32; 16 * 16],
+        cb_plane: &mut [i32; 8 * 8],
+        cr_plane: &mut [i32; 8 * 8],
+    ) {
+        if tw < 64 {
+            bgra_tile_to_ycbcr420_quarter_scalar(
+                bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane,
+            );
+            return;
+        }
+        let stride = fb_w as usize * 4;
+        let max_y = th as usize - 1;
+        let mask_ff = _mm256_set1_epi32(0xFF);
+        let two = _mm256_set1_epi32(2);
+        let eight = _mm256_set1_epi32(8);
+        let perm_quad = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        let mut cb_quarter = [0i32; 16 * 16];
+        let mut cr_quarter = [0i32; 16 * 16];
+
+        #[target_feature(enable = "avx2")]
+        #[inline]
+        unsafe fn hsum_4x4(
+            s0: __m256i,
+            s1: __m256i,
+            s2: __m256i,
+            s3: __m256i,
+            perm_quad: __m256i,
+            eight: __m256i,
+        ) -> __m256i {
+            let t01 = _mm256_hadd_epi32(s0, s1);
+            let t23 = _mm256_hadd_epi32(s2, s3);
+            let u = _mm256_hadd_epi32(t01, t23);
+            let ordered = _mm256_permutevar8x32_epi32(u, perm_quad);
+            _mm256_srai_epi32(_mm256_add_epi32(ordered, eight), 4)
+        }
+
+        for qy in 0..16usize {
+            let base_y = qy * 4;
+            let sy0 = (y0 as usize) + base_y.min(max_y);
+            let sy1 = (y0 as usize) + (base_y + 1).min(max_y);
+            let sy2 = (y0 as usize) + (base_y + 2).min(max_y);
+            let sy3 = (y0 as usize) + (base_y + 3).min(max_y);
+            let r0 = bgra.as_ptr().add(sy0 * stride + (x0 as usize) * 4);
+            let r1 = bgra.as_ptr().add(sy1 * stride + (x0 as usize) * 4);
+            let r2 = bgra.as_ptr().add(sy2 * stride + (x0 as usize) * 4);
+            let r3 = bgra.as_ptr().add(sy3 * stride + (x0 as usize) * 4);
+            let out_row = qy * 16;
+
+            for chunk in 0..2usize {
+                let byte_base = chunk * 128; // 32 pixels = 128 bytes -> 8 quarter-res outputs
+                let mut sb = [_mm256_setzero_si256(); 4];
+                let mut sg = [_mm256_setzero_si256(); 4];
+                let mut sr = [_mm256_setzero_si256(); 4];
+                for k in 0..4usize {
+                    let off = byte_base + k * 32;
+                    let p0 = _mm256_loadu_si256(r0.add(off) as *const __m256i);
+                    let p1 = _mm256_loadu_si256(r1.add(off) as *const __m256i);
+                    let p2 = _mm256_loadu_si256(r2.add(off) as *const __m256i);
+                    let p3 = _mm256_loadu_si256(r3.add(off) as *const __m256i);
+
+                    let b01 = _mm256_add_epi32(
+                        _mm256_and_si256(p0, mask_ff),
+                        _mm256_and_si256(p1, mask_ff),
+                    );
+                    let b23 = _mm256_add_epi32(
+                        _mm256_and_si256(p2, mask_ff),
+                        _mm256_and_si256(p3, mask_ff),
+                    );
+                    sb[k] = _mm256_add_epi32(b01, b23);
+
+                    let g01 = _mm256_add_epi32(
+                        _mm256_and_si256(_mm256_srli_epi32(p0, 8), mask_ff),
+                        _mm256_and_si256(_mm256_srli_epi32(p1, 8), mask_ff),
+                    );
+                    let g23 = _mm256_add_epi32(
+                        _mm256_and_si256(_mm256_srli_epi32(p2, 8), mask_ff),
+                        _mm256_and_si256(_mm256_srli_epi32(p3, 8), mask_ff),
+                    );
+                    sg[k] = _mm256_add_epi32(g01, g23);
+
+                    let r01 = _mm256_add_epi32(
+                        _mm256_and_si256(_mm256_srli_epi32(p0, 16), mask_ff),
+                        _mm256_and_si256(_mm256_srli_epi32(p1, 16), mask_ff),
+                    );
+                    let r23 = _mm256_add_epi32(
+                        _mm256_and_si256(_mm256_srli_epi32(p2, 16), mask_ff),
+                        _mm256_and_si256(_mm256_srli_epi32(p3, 16), mask_ff),
+                    );
+                    sr[k] = _mm256_add_epi32(r01, r23);
+                }
+
+                let b = hsum_4x4(sb[0], sb[1], sb[2], sb[3], perm_quad, eight);
+                let g = hsum_4x4(sg[0], sg[1], sg[2], sg[3], perm_quad, eight);
+                let r = hsum_4x4(sr[0], sr[1], sr[2], sr[3], perm_quad, eight);
+                let (y, cb, cr) = rgb_to_ycbcr_8px(b, g, r);
+                let dst_off = out_row + chunk * 8;
+                _mm256_storeu_si256(y_plane.as_mut_ptr().add(dst_off) as *mut __m256i, y);
+                _mm256_storeu_si256(cb_quarter.as_mut_ptr().add(dst_off) as *mut __m256i, cb);
+                _mm256_storeu_si256(cr_quarter.as_mut_ptr().add(dst_off) as *mut __m256i, cr);
+            }
+        }
+
+        // Vectorized 2x2 chroma box-filter downsampling (16x16 -> 8x8).
+        for cy in 0..8usize {
+            let r0 = (cy * 2) * 16;
+            let r1 = r0 + 16;
+            let out_base = cy * 8;
+
+            let cb_0a = _mm256_loadu_si256(cb_quarter.as_ptr().add(r0) as *const __m256i);
+            let cb_0b = _mm256_loadu_si256(cb_quarter.as_ptr().add(r0 + 8) as *const __m256i);
+            let cb_1a = _mm256_loadu_si256(cb_quarter.as_ptr().add(r1) as *const __m256i);
+            let cb_1b = _mm256_loadu_si256(cb_quarter.as_ptr().add(r1 + 8) as *const __m256i);
+            let cb_v0 = _mm256_add_epi32(cb_0a, cb_1a);
+            let cb_v1 = _mm256_add_epi32(cb_0b, cb_1b);
+            let cb_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cb_v0, cb_v1), 0xD8);
+            let cb_avg = _mm256_srai_epi32(_mm256_add_epi32(cb_h, two), 2);
+            _mm256_storeu_si256(cb_plane.as_mut_ptr().add(out_base) as *mut __m256i, cb_avg);
+
+            let cr_0a = _mm256_loadu_si256(cr_quarter.as_ptr().add(r0) as *const __m256i);
+            let cr_0b = _mm256_loadu_si256(cr_quarter.as_ptr().add(r0 + 8) as *const __m256i);
+            let cr_1a = _mm256_loadu_si256(cr_quarter.as_ptr().add(r1) as *const __m256i);
+            let cr_1b = _mm256_loadu_si256(cr_quarter.as_ptr().add(r1 + 8) as *const __m256i);
+            let cr_v0 = _mm256_add_epi32(cr_0a, cr_1a);
+            let cr_v1 = _mm256_add_epi32(cr_0b, cr_1b);
+            let cr_h = _mm256_permute4x64_epi64(_mm256_hadd_epi32(cr_v0, cr_v1), 0xD8);
+            let cr_avg = _mm256_srai_epi32(_mm256_add_epi32(cr_h, two), 2);
+            _mm256_storeu_si256(cr_plane.as_mut_ptr().add(out_base) as *mut __m256i, cr_avg);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn ycbcr420_quarter_to_bgra_tile(
+        y_plane: &[i32; 16 * 16],
+        cb_plane: &[i32; 8 * 8],
+        cr_plane: &[i32; 8 * 8],
+        a_plane: Option<&[i32; 16 * 16]>,
+        bgra: &mut [u8],
+        fb_w: u32,
+        x0: u32,
+        y0: u32,
+        tw: u32,
+        th: u32,
+    ) {
+        if tw < 64 {
+            ycbcr420_quarter_to_bgra_tile_scalar(
+                y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+            );
+            return;
+        }
+        let stride = fb_w as usize * 4;
+        let zero = _mm256_setzero_si256();
+        let max255 = _mm256_set1_epi32(255);
+        let eight = _mm256_set1_epi32(8);
+        let alpha_opaque = _mm256_set1_epi32(-16777216i32); // 0xFF00_0000
+
+        let v_wx = _mm256_setr_epi32(0, 1, 2, 3, 0, 1, 2, 3);
+        let v_wx0 = _mm256_setr_epi32(4, 3, 2, 1, 4, 3, 2, 1);
+        let perm_qx0 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+        let perm_qx1 = _mm256_setr_epi32(1, 1, 1, 1, 2, 2, 2, 2);
+
+        let mut yb = [0i32; 24];
+        let mut ab = [0i32; 24];
+
+        for py in 0..(th as usize) {
+            let dst_row = bgra
+                .as_mut_ptr()
+                .add((y0 as usize + py) * stride + (x0 as usize) * 4);
+            let qy0 = py >> 2;
+            let qy1 = (qy0 + 1).min(15);
+            let wy = (py & 3) as i32;
+            let wy0 = 4 - wy;
+            let v_wy0 = _mm256_set1_epi32(wy0);
+            let v_wy = _mm256_set1_epi32(wy);
+            let r0 = qy0 * 16;
+            let r1 = qy1 * 16;
+            let c_row = (qy0 >> 1) * 8;
+
+            // Pre-blend the 16 horizontal luma samples vertically (`y_r0 * wy0 + y_r1 * wy`).
+            let y0_lo = _mm256_loadu_si256(y_plane.as_ptr().add(r0) as *const __m256i);
+            let y0_hi = _mm256_loadu_si256(y_plane.as_ptr().add(r0 + 8) as *const __m256i);
+            let y1_lo = _mm256_loadu_si256(y_plane.as_ptr().add(r1) as *const __m256i);
+            let y1_hi = _mm256_loadu_si256(y_plane.as_ptr().add(r1 + 8) as *const __m256i);
+            let yb_lo = _mm256_add_epi32(
+                _mm256_mullo_epi32(y0_lo, v_wy0),
+                _mm256_mullo_epi32(y1_lo, v_wy),
+            );
+            let yb_hi = _mm256_add_epi32(
+                _mm256_mullo_epi32(y0_hi, v_wy0),
+                _mm256_mullo_epi32(y1_hi, v_wy),
+            );
+            _mm256_storeu_si256(yb.as_mut_ptr() as *mut __m256i, yb_lo);
+            _mm256_storeu_si256(yb.as_mut_ptr().add(8) as *mut __m256i, yb_hi);
+            yb[16] = yb[15];
+
+            if let Some(ap) = a_plane {
+                let a0_lo = _mm256_loadu_si256(ap.as_ptr().add(r0) as *const __m256i);
+                let a0_hi = _mm256_loadu_si256(ap.as_ptr().add(r0 + 8) as *const __m256i);
+                let a1_lo = _mm256_loadu_si256(ap.as_ptr().add(r1) as *const __m256i);
+                let a1_hi = _mm256_loadu_si256(ap.as_ptr().add(r1 + 8) as *const __m256i);
+                let ab_lo = _mm256_add_epi32(
+                    _mm256_mullo_epi32(a0_lo, v_wy0),
+                    _mm256_mullo_epi32(a1_lo, v_wy),
+                );
+                let ab_hi = _mm256_add_epi32(
+                    _mm256_mullo_epi32(a0_hi, v_wy0),
+                    _mm256_mullo_epi32(a1_hi, v_wy),
+                );
+                _mm256_storeu_si256(ab.as_mut_ptr() as *mut __m256i, ab_lo);
+                _mm256_storeu_si256(ab.as_mut_ptr().add(8) as *mut __m256i, ab_hi);
+                ab[16] = ab[15];
+            }
+
+            for chunk in 0..8usize {
+                let px = chunk * 8;
+                let load_off = chunk * 2;
+                let y_src = _mm256_loadu_si256(yb.as_ptr().add(load_off) as *const __m256i);
+                let y_q0 = _mm256_permutevar8x32_epi32(y_src, perm_qx0);
+                let y_q1 = _mm256_permutevar8x32_epi32(y_src, perm_qx1);
+                let y = _mm256_srai_epi32(
+                    _mm256_add_epi32(
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(y_q0, v_wx0),
+                            _mm256_mullo_epi32(y_q1, v_wx),
+                        ),
+                        eight,
+                    ),
+                    4,
+                );
+
+                // All 8 pixels in `chunk` share the exact same chroma sample `c_row + chunk`!
+                let c_idx = c_row + chunk;
+                let c = cb_plane[c_idx] - 128;
+                let d = cr_plane[c_idx] - 128;
+                let r_off = _mm256_set1_epi32((359 * d + 128) >> 8);
+                let g_off = _mm256_set1_epi32((88 * c + 183 * d + 128) >> 8);
+                let b_off = _mm256_set1_epi32((454 * c + 128) >> 8);
+
+                let mut r =
+                    _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(y, r_off), zero), max255);
+                let mut g =
+                    _mm256_min_epi32(_mm256_max_epi32(_mm256_sub_epi32(y, g_off), zero), max255);
+                let mut b =
+                    _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(y, b_off), zero), max255);
+
+                let a_shifted = if a_plane.is_some() {
+                    let a_src = _mm256_loadu_si256(ab.as_ptr().add(load_off) as *const __m256i);
+                    let a_q0 = _mm256_permutevar8x32_epi32(a_src, perm_qx0);
+                    let a_q1 = _mm256_permutevar8x32_epi32(a_src, perm_qx1);
+                    let a_val = _mm256_srai_epi32(
+                        _mm256_add_epi32(
+                            _mm256_add_epi32(
+                                _mm256_mullo_epi32(a_q0, v_wx0),
+                                _mm256_mullo_epi32(a_q1, v_wx),
+                            ),
+                            eight,
+                        ),
+                        4,
+                    );
+                    let av = _mm256_min_epi32(_mm256_max_epi32(a_val, zero), max255);
+                    r = _mm256_min_epi32(r, av);
+                    g = _mm256_min_epi32(g, av);
+                    b = _mm256_min_epi32(b, av);
+                    _mm256_slli_epi32(av, 24)
+                } else {
+                    alpha_opaque
                 };
 
                 let bgra_px = _mm256_or_si256(

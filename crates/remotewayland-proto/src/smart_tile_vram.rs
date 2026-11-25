@@ -22,6 +22,17 @@ pub const SCAN_FLAG_DIRTY: u32 = 1 << 0;
 pub const SCAN_FLAG_OPAQUE: u32 = 1 << 1;
 pub const SCAN_FLAG_SOLID: u32 = 1 << 2;
 
+pub const FAST_UI_MAX_TILES: usize = 8;
+
+#[inline]
+pub const fn qblocks_words_per_tile(scale: u32) -> usize {
+    match scale {
+        4 => 193,
+        2 => 769,
+        _ => 3073,
+    }
+}
+
 pub const CMD_FLAG_WANTS_LOSSY: u32 = 1 << 0;
 pub const CMD_FLAG_OPAQUE: u32 = 1 << 1;
 pub const CMD_FLAG_SOLID: u32 = 1 << 2;
@@ -95,16 +106,24 @@ struct IngestParams {
     is_keyframe: u32,
 }
 
+struct ScanOutBuffer {
+    dirty_count: atomic<u32>,
+    fast_count: atomic<u32>,
+    tiles: array<u32>,
+}
+
 @group(0) @binding(0) var<uniform> ingest_params: IngestParams;
 @group(0) @binding(1) var ingest_tex: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read> ingest_ref_bgra: array<u32>;
 @group(0) @binding(3) var<storage, read_write> ingest_cur_bgra: array<u32>;
-@group(0) @binding(4) var<storage, read_write> ingest_scan_out: array<u32>;
+@group(0) @binding(4) var<storage, read_write> ingest_scan_out: ScanOutBuffer;
+@group(0) @binding(5) var<storage, read_write> ingest_fast_extract: array<u32>;
 
 var<workgroup> wg_scan_dirty: atomic<u32>;
 var<workgroup> wg_scan_non_opaque: atomic<u32>;
 var<workgroup> wg_scan_non_solid: atomic<u32>;
 var<workgroup> wg_top_left_px: u32;
+var<workgroup> wg_fast_slot: u32;
 
 fn load_tex_bgra(x: u32, y: u32, crop_x: u32, crop_y: u32, rb_swizzle: u32) -> u32 {
     let c = textureLoad(ingest_tex, vec2<i32>(i32(crop_x + x), i32(crop_y + y)), 0);
@@ -151,9 +170,10 @@ fn ingest_and_scan_vram(
 
     let solid_ref = wg_top_left_px;
     let py = lid.x;
+    let force_dirty = (ingest_params.is_keyframe & 1u) != 0u;
     if (py < th) {
         let row_base = (y0 + py) * ingest_params.fb_w + x0;
-        var row_dirty = select(0u, 1u, ingest_params.is_keyframe != 0u);
+        var row_dirty = select(0u, 1u, force_dirty);
         var row_non_opaque = 0u;
         var row_non_solid = 0u;
         for (var px = 0u; px < tw; px = px + 1u) {
@@ -192,8 +212,34 @@ fn ingest_and_scan_vram(
         let dirty = atomicLoad(&wg_scan_dirty);
         let opaque = select(2u, 0u, atomicLoad(&wg_scan_non_opaque) != 0u);
         let solid = select(4u, 0u, atomicLoad(&wg_scan_non_solid) != 0u);
-        ingest_scan_out[tidx * 2u] = dirty | opaque | solid;
-        ingest_scan_out[tidx * 2u + 1u] = solid_ref;
+        var slot = 0xFFFFu;
+        if (dirty != 0u) {
+            atomicAdd(&ingest_scan_out.dirty_count, 1u);
+            if ((ingest_params.is_keyframe & 2u) != 0u && solid == 0u) {
+                slot = atomicAdd(&ingest_scan_out.fast_count, 1u);
+            }
+        }
+        wg_fast_slot = slot;
+        let slot_enc = select(0u, (slot + 1u) << 8u, slot < 8u);
+        ingest_scan_out.tiles[tidx * 2u] = dirty | opaque | solid | slot_enc;
+        ingest_scan_out.tiles[tidx * 2u + 1u] = solid_ref;
+    }
+    workgroupBarrier();
+
+    if (wg_fast_slot < 8u) {
+        let out_base = wg_fast_slot * 8192u;
+        for (var i = py; i < 4096u; i = i + 64u) {
+            let r = i >> 6u;
+            let c = i & 63u;
+            if (r < th && c < tw) {
+                let fb_idx = (y0 + r) * ingest_params.fb_w + (x0 + c);
+                ingest_fast_extract[out_base + i] = ingest_cur_bgra[fb_idx];
+                ingest_fast_extract[out_base + 4096u + i] = ingest_ref_bgra[fb_idx];
+            } else {
+                ingest_fast_extract[out_base + i] = 0u;
+                ingest_fast_extract[out_base + 4096u + i] = 0u;
+            }
+        }
     }
 }
 
@@ -213,6 +259,7 @@ struct ScrollParams {
 @group(0) @binding(1) var<storage, read> scroll_ref_bgra: array<u32>;
 @group(0) @binding(2) var<storage, read> scroll_cur_bgra: array<u32>;
 @group(0) @binding(3) var<storage, read_write> scroll_out: array<u32>;
+@group(0) @binding(4) var<storage, read> scroll_scan_meta: array<u32>;
 
 fn px_luma_fast(px: u32) -> u32 {
     let b = px & 0xFFu;
@@ -225,6 +272,9 @@ fn px_luma_fast(px: u32) -> u32 {
 fn compute_scroll_summaries(
     @builtin(global_invocation_id) gid: vec3<u32>,
 ) {
+    if (scroll_scan_meta[0] < 12u) {
+        return;
+    }
     let idx = gid.x;
     let w = scroll_params.fb_w;
     let h = scroll_params.fb_h;
@@ -1072,7 +1122,8 @@ fn encode_vram_tiles_batch(
     let num_chroma = chroma_bx * chroma_by;
     let total_active_blocks = num_luma + 2u * num_chroma;
 
-    let qout_tile_base = tidx * 3073u;
+    let tile_qstride = select(select(3073u, 769u, scale == 2u), 193u, scale == 4u);
+    let qout_tile_base = tidx * tile_qstride;
     if (lane == 0u) {
         vtb_qblocks[qout_tile_base] = select(0, 1, is_inter);
     }
@@ -1744,6 +1795,7 @@ impl VramPipelines {
                 bgl_storage(2, true),
                 bgl_storage(3, false),
                 bgl_storage(4, false),
+                bgl_storage(5, false),
             ],
         });
         let ingest_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1767,6 +1819,7 @@ impl VramPipelines {
                 bgl_storage(1, true),
                 bgl_storage(2, true),
                 bgl_storage(3, false),
+                bgl_storage(4, true),
             ],
         });
         let scroll_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2153,7 +2206,7 @@ impl GpuTextureFrame {
             return None;
         }
         let mut win = VramWindowState::new(Arc::clone(&self.engine));
-        let _ = win.ingest_and_scan(self, true, false)?;
+        let _ = win.ingest_and_scan(self, true, false, false)?;
         win.download_cur_bgra()
     }
 }
@@ -2191,6 +2244,7 @@ pub struct VramWindowState {
     mv_res_staging: Option<wgpu::Buffer>,
 
     lossy_capacity: usize,
+    qblocks_byte_capacity: u64,
     descs_buf: Option<wgpu::Buffer>,
     qblocks_buf: Option<wgpu::Buffer>,
     qblocks_staging: Option<wgpu::Buffer>,
@@ -2198,6 +2252,7 @@ pub struct VramWindowState {
     extract_capacity: usize,
     extract_buf: Option<wgpu::Buffer>,
     extract_staging: Option<wgpu::Buffer>,
+    fast_extract_host: Vec<u8>,
 
     rects_capacity: usize,
     rects_buf: Option<wgpu::Buffer>,
@@ -2265,12 +2320,14 @@ impl VramWindowState {
             mv_res_buf: None,
             mv_res_staging: None,
             lossy_capacity: 0,
+            qblocks_byte_capacity: 0,
             descs_buf: None,
             qblocks_buf: None,
             qblocks_staging: None,
             extract_capacity: 0,
             extract_buf: None,
             extract_staging: None,
+            fast_extract_host: Vec::new(),
             rects_capacity: 0,
             rects_buf: None,
             scatter_buf: None,
@@ -2329,11 +2386,13 @@ impl VramWindowState {
 
         if self.tiles_capacity < total_tiles {
             let cap = total_tiles.next_power_of_two().max(256);
-            let bytes = (cap * 2 * 4) as u64;
+            let bytes = ((2 + cap * 2) * 4) as u64;
             self.scan_buf = Some(dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("vram_scan_buf"),
                 size: bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
             self.scan_staging = Some(dev.create_buffer(&wgpu::BufferDescriptor {
@@ -2459,13 +2518,15 @@ impl VramWindowState {
     }
 
     /// Pass 1: Ingest `GpuTextureFrame` into `cur_buf`, scan dirty/opaque/solid tiles,
-    /// and optionally compute scroll hashes/profiles in the same GPU submit.
+    /// optimistically extract up to `FAST_UI_MAX_TILES` non-solid UI tiles, and optionally
+    /// compute scroll hashes/profiles in the same GPU submit.
     pub fn ingest_and_scan(
         &mut self,
         frame: &GpuTextureFrame,
         is_keyframe: bool,
         probe_scroll: bool,
-    ) -> Option<(&[u32], Option<(i16, i16)>)> {
+        enable_fast_ui: bool,
+    ) -> Option<(&[u32], Option<(i16, i16)>, &[u8])> {
         if !Arc::ptr_eq(&self.engine, &frame.engine) {
             *self = Self::new(Arc::clone(&frame.engine));
         }
@@ -2476,11 +2537,13 @@ impl VramWindowState {
         let rows = frame.height.div_ceil(TILE_SIZE);
         let total_tiles = (cols * rows) as usize;
         let do_scroll = probe_scroll && !is_keyframe && frame.width >= 192 && frame.height >= 192;
+        let do_fast_ui = enable_fast_ui && !is_keyframe;
 
         let dev = self.engine.device();
         let queue = self.engine.queue();
         let pipes = self.engine.vram_pipelines();
 
+        let ingest_flags = u32::from(is_keyframe) | (u32::from(do_fast_ui) << 1);
         let ingest_uni = IngestParamsUniform {
             fb_w: frame.width,
             fb_h: frame.height,
@@ -2489,7 +2552,7 @@ impl VramWindowState {
             crop_x: frame.crop_x,
             crop_y: frame.crop_y,
             rb_swizzle: u32::from(frame.rb_swizzle),
-            is_keyframe: u32::from(is_keyframe),
+            is_keyframe: ingest_flags,
         };
         queue.write_buffer(&self.ingest_uniform, 0, bytemuck::bytes_of(&ingest_uni));
 
@@ -2497,6 +2560,11 @@ impl VramWindowState {
         let cur_buf = self.cur_buf.as_ref()?;
         let scan_buf = self.scan_buf.as_ref()?;
         let scan_staging = self.scan_staging.as_ref()?;
+        let fast_ex_buf = if do_fast_ui {
+            self.extract_buf.as_ref()?
+        } else {
+            &self.dummy_buf
+        };
 
         let ingest_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("vram_ingest_bg"),
@@ -2521,6 +2589,10 @@ impl VramWindowState {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: scan_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: fast_ex_buf.as_entire_binding(),
                 },
             ],
         });
@@ -2554,6 +2626,10 @@ impl VramWindowState {
                         binding: 3,
                         resource: self.scroll_buf.as_ref()?.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: scan_buf.as_entire_binding(),
+                    },
                 ],
             }))
         } else {
@@ -2563,6 +2639,7 @@ impl VramWindowState {
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vram_ingest_enc"),
         });
+        enc.clear_buffer(scan_buf, 0, Some(8));
         {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("vram_ingest_cpass"),
@@ -2580,7 +2657,8 @@ impl VramWindowState {
             }
         }
 
-        let scan_bytes = (total_tiles * 2 * 4) as u64;
+        let scan_bytes = ((2 + total_tiles * 2) * 4) as u64;
+        let fast_ex_bytes = (FAST_UI_MAX_TILES * 8192 * 4) as u64;
         enc.copy_buffer_to_buffer(scan_buf, 0, scan_staging, 0, scan_bytes);
         if do_scroll {
             enc.copy_buffer_to_buffer(
@@ -2589,6 +2667,15 @@ impl VramWindowState {
                 self.scroll_staging.as_ref()?,
                 0,
                 scroll_bytes,
+            );
+        }
+        if do_fast_ui {
+            enc.copy_buffer_to_buffer(
+                self.extract_buf.as_ref()?,
+                0,
+                self.extract_staging.as_ref()?,
+                0,
+                fast_ex_bytes,
             );
         }
 
@@ -2619,33 +2706,71 @@ impl VramWindowState {
             None
         };
 
+        let rx3 = if do_fast_ui {
+            let ex_slice = self.extract_staging.as_ref()?.slice(0..fast_ex_bytes);
+            let (tx3, rx3) = std::sync::mpsc::channel();
+            ex_slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx3.send(r);
+            });
+            Some(rx3)
+        } else {
+            None
+        };
+
         let _ = dev.poll(wgpu::PollType::wait_indefinitely());
+
+        let unmap_pass1 =
+            |s_scan: &wgpu::Buffer, s_scr: Option<&wgpu::Buffer>, s_ex: Option<&wgpu::Buffer>| {
+                s_scan.unmap();
+                if let Some(b) = s_scr {
+                    b.unmap();
+                }
+                if let Some(b) = s_ex {
+                    b.unmap();
+                }
+            };
+        let scr_opt = if do_scroll {
+            self.scroll_staging.as_ref()
+        } else {
+            None
+        };
+        let ex_opt = if do_fast_ui {
+            self.extract_staging.as_ref()
+        } else {
+            None
+        };
+
         if rx1.recv().ok().and_then(|r| r.ok()).is_none() {
-            scan_staging.unmap();
-            if do_scroll {
-                self.scroll_staging.as_ref()?.unmap();
-            }
+            unmap_pass1(scan_staging, scr_opt, ex_opt);
             return None;
         }
         if let Some(rx2) = rx2 {
             if rx2.recv().ok().and_then(|r| r.ok()).is_none() {
-                scan_staging.unmap();
-                self.scroll_staging.as_ref()?.unmap();
+                unmap_pass1(scan_staging, scr_opt, ex_opt);
+                return None;
+            }
+        }
+        if let Some(rx3) = rx3 {
+            if rx3.recv().ok().and_then(|r| r.ok()).is_none() {
+                unmap_pass1(scan_staging, scr_opt, ex_opt);
                 return None;
             }
         }
 
-        {
+        let (dirty_count, fast_count) = {
             let mapped = scan_slice.get_mapped_range().ok()?;
             let words: &[u32] = bytemuck::cast_slice(&mapped);
+            let dc = words[0] as usize;
+            let fc = words[1] as usize;
             self.scan_host.clear();
-            self.scan_host.extend_from_slice(words);
-        }
+            self.scan_host.extend_from_slice(&words[2..]);
+            (dc, fc)
+        };
         scan_staging.unmap();
 
         let detected_mv = if do_scroll {
             let scroll_staging = self.scroll_staging.as_ref()?;
-            let mv = {
+            let mv = if dirty_count >= 12 {
                 let mapped = scroll_staging
                     .slice(0..scroll_bytes)
                     .get_mapped_range()
@@ -2658,6 +2783,8 @@ impl VramWindowState {
                     frame.width as usize,
                     frame.height as usize,
                 )
+            } else {
+                None
             };
             scroll_staging.unmap();
             mv
@@ -2665,7 +2792,19 @@ impl VramWindowState {
             None
         };
 
-        Some((&self.scan_host, detected_mv))
+        self.fast_extract_host.clear();
+        if do_fast_ui {
+            let ex_staging = self.extract_staging.as_ref()?;
+            if dirty_count > 0 && dirty_count <= FAST_UI_MAX_TILES && fast_count > 0 {
+                let copy_slots = fast_count.min(FAST_UI_MAX_TILES);
+                let copy_bytes = (copy_slots * 8192 * 4) as u64;
+                let mapped = ex_staging.slice(0..copy_bytes).get_mapped_range().ok()?;
+                self.fast_extract_host.extend_from_slice(&mapped);
+            }
+            ex_staging.unmap();
+        }
+
+        Some((&self.scan_host, detected_mv, &self.fast_extract_host))
     }
 
     /// Pass 2: Snapshot `ref_buf -> prev_ref_buf` (if needed), run GPU MV skip + 1/2-pel search,
@@ -2716,6 +2855,9 @@ impl VramWindowState {
             self.cmd_capacity = cap;
         }
 
+        let words_per_tile = qblocks_words_per_tile(scale);
+        let q_bytes = (num_lossy_opaque * words_per_tile * 4) as u64;
+
         if num_lossy_opaque > 0 && self.lossy_capacity < num_lossy_opaque {
             let cap = num_lossy_opaque.next_power_of_two().max(128);
             self.descs_buf = Some(dev.create_buffer(&wgpu::BufferDescriptor {
@@ -2724,20 +2866,23 @@ impl VramWindowState {
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }));
-            let qb_bytes = (cap * 3073 * 4) as u64;
+            self.lossy_capacity = cap;
+        }
+        if q_bytes > 0 && self.qblocks_byte_capacity < q_bytes {
+            let qb_cap = q_bytes.next_power_of_two().max(128 * 769 * 4);
             self.qblocks_buf = Some(dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("vram_qblocks_buf"),
-                size: qb_bytes,
+                size: qb_cap,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
             self.qblocks_staging = Some(dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("vram_qblocks_staging"),
-                size: qb_bytes,
+                size: qb_cap,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
-            self.lossy_capacity = cap;
+            self.qblocks_byte_capacity = qb_cap;
         }
 
         if num_extract > 0 && self.extract_capacity < num_extract {
@@ -2904,7 +3049,6 @@ impl VramWindowState {
         }
 
         let mv_bytes = (cmds.len() * 4) as u64;
-        let q_bytes = (num_lossy_opaque * 3073 * 4) as u64;
         let ex_bytes = (num_extract * 8192 * 4) as u64;
 
         enc.copy_buffer_to_buffer(mv_res_buf, 0, mv_res_staging, 0, mv_bytes);

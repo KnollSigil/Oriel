@@ -112,10 +112,17 @@ pub fn validate_frame_dims(width: u32, height: u32) -> Result<usize> {
 }
 
 /// Compress a `SmartTile` packet using Zstd-style two-stage `LZ4 + 4-way interleaved rANS`
-/// (plus direct 4-way rANS fallback on small lossy payloads) and emit whichever representation is smallest.
+/// and emit whichever representation is strictly smallest.
+/// Small lossless UI/cursor packets (`< 8 KB` LZ4) skip the rANS pass for sub-millisecond latency,
+/// while lossy frames, cold keyframes, and idle lossless refresh chunks all benefit from rANS.
 fn compress_packet_adaptive(raw: &[u8], used_lossy: bool) -> Vec<u8> {
     let lz4 = lz4_flex::compress_prepend_size(raw);
-    if used_lossy && raw.len() >= 128 && raw.len() < (rans::RANS_MAGIC_BIT as usize) {
+    let try_rans = if used_lossy {
+        raw.len() >= 128
+    } else {
+        lz4.len() >= 8192
+    };
+    if try_rans && raw.len() < (rans::RANS_MAGIC_BIT as usize) {
         if let Some(lz4_rans) = rans::compress_lz4_body_with_rans(raw.len(), &lz4) {
             return lz4_rans;
         }
@@ -654,6 +661,7 @@ fn bgra_tile_to_alpha_half(
 
 /// Extract a 4x4-downsampled tile `(x0, y0, tw, th)` into padded 16x16 Y and 8x8 Cb/Cr planes.
 /// Used as a heavy-congestion fallback for large HiDPI video/motion updates (16x fewer pixels).
+#[allow(clippy::too_many_arguments)]
 fn bgra_tile_to_ycbcr420_quarter(
     bgra: &[u8],
     fb_w: u32,
@@ -665,55 +673,20 @@ fn bgra_tile_to_ycbcr420_quarter(
     cb_plane: &mut [i32; 8 * 8],
     cr_plane: &mut [i32; 8 * 8],
 ) {
-    let stride = fb_w as usize * 4;
-    let max_x = tw as usize - 1;
-    let max_y = th as usize - 1;
-    let mut cb_quarter = [0i32; 16 * 16];
-    let mut cr_quarter = [0i32; 16 * 16];
-
-    for qy in 0..16usize {
-        let base_y = qy * 4;
-        for qx in 0..16usize {
-            let base_x = qx * 4;
-            let mut sum_b = 0i32;
-            let mut sum_g = 0i32;
-            let mut sum_r = 0i32;
-            for dy in 0..4usize {
-                let sy = (y0 as usize) + (base_y + dy).min(max_y);
-                let row = sy * stride;
-                for dx in 0..4usize {
-                    let sx = (x0 as usize) + (base_x + dx).min(max_x);
-                    let idx = row + sx * 4;
-                    sum_b += bgra[idx] as i32;
-                    sum_g += bgra[idx + 1] as i32;
-                    sum_r += bgra[idx + 2] as i32;
-                }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::bgra_tile_to_ycbcr420_quarter(
+                    bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane,
+                );
             }
-            let b = (sum_b + 8) >> 4;
-            let g = (sum_g + 8) >> 4;
-            let r = (sum_r + 8) >> 4;
-            let (y, cb, cr) = rgb_to_ycbcr(r, g, b);
-            let out_idx = qy * 16 + qx;
-            y_plane[out_idx] = y;
-            cb_quarter[out_idx] = cb;
-            cr_quarter[out_idx] = cr;
+            return;
         }
     }
-
-    for cy in 0..8usize {
-        let y2 = cy * 2;
-        for cx in 0..8usize {
-            let x2 = cx * 2;
-            let i00 = y2 * 16 + x2;
-            let i01 = i00 + 1;
-            let i10 = i00 + 16;
-            let i11 = i10 + 1;
-            cb_plane[cy * 8 + cx] =
-                (cb_quarter[i00] + cb_quarter[i01] + cb_quarter[i10] + cb_quarter[i11] + 2) >> 2;
-            cr_plane[cy * 8 + cx] =
-                (cr_quarter[i00] + cr_quarter[i01] + cr_quarter[i10] + cr_quarter[i11] + 2) >> 2;
-        }
-    }
+    simd::bgra_tile_to_ycbcr420_quarter_scalar(
+        bgra, fb_w, x0, y0, tw, th, y_plane, cb_plane, cr_plane,
+    );
 }
 
 /// Write reconstructed 16x16 Y + 8x8 Cb/Cr (+ optional 16x16 Alpha) planes back into a BGRA tile
@@ -731,45 +704,20 @@ fn ycbcr420_quarter_to_bgra_tile(
     tw: u32,
     th: u32,
 ) {
-    let stride = fb_w as usize * 4;
-    for py in 0..(th as usize) {
-        let row_base = (y0 as usize + py) * stride + (x0 as usize) * 4;
-        let qy0 = py >> 2;
-        let qy1 = (qy0 + 1).min(15);
-        let wy = (py & 3) as i32;
-        let wy0 = 4 - wy;
-        let r0 = qy0 * 16;
-        let r1 = qy1 * 16;
-        let cy = qy0 >> 1;
-        for px in 0..(tw as usize) {
-            let qx0 = px >> 2;
-            let qx1 = (qx0 + 1).min(15);
-            let wx = (px & 3) as i32;
-            let wx0 = 4 - wx;
-            let top = y_plane[r0 + qx0] * wx0 + y_plane[r0 + qx1] * wx;
-            let bot = y_plane[r1 + qx0] * wx0 + y_plane[r1 + qx1] * wx;
-            let y = (top * wy0 + bot * wy + 8) >> 4;
-            let c_idx = cy * 8 + (qx0 >> 1);
-            let (mut r, mut g, mut b) = ycbcr_to_rgb(y, cb_plane[c_idx], cr_plane[c_idx]);
-            let a = match a_plane {
-                Some(ap) => {
-                    let a_top = ap[r0 + qx0] * wx0 + ap[r0 + qx1] * wx;
-                    let a_bot = ap[r1 + qx0] * wx0 + ap[r1 + qx1] * wx;
-                    let av = ((a_top * wy0 + a_bot * wy + 8) >> 4).clamp(0, 255) as u8;
-                    r = r.min(av);
-                    g = g.min(av);
-                    b = b.min(av);
-                    av
-                }
-                None => 255,
-            };
-            let dst = row_base + px * 4;
-            bgra[dst] = b;
-            bgra[dst + 1] = g;
-            bgra[dst + 2] = r;
-            bgra[dst + 3] = a;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_simd() && std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                simd::avx2::ycbcr420_quarter_to_bgra_tile(
+                    y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+                );
+            }
+            return;
         }
     }
+    simd::ycbcr420_quarter_to_bgra_tile_scalar(
+        y_plane, cb_plane, cr_plane, a_plane, bgra, fb_w, x0, y0, tw, th,
+    );
 }
 
 /// Extract a 4x4-downsampled alpha plane `(16x16)` for a tile `(x0, y0, tw, th)`.
@@ -2385,12 +2333,13 @@ impl SmartTileEncoder {
 
         let probe_scroll =
             !is_keyframe && (self.no_scroll_streak < 3 || self.no_scroll_streak >= 10);
+        let enable_fast_ui = !is_keyframe && !self.in_half_res && !self.in_quarter_res;
 
-        let Some((scan_words_slice, gpu_scroll_mv)) = self
+        let Some((scan_words_slice, gpu_scroll_mv, fast_extract_slice)) = self
             .vram_state
             .as_mut()
             .unwrap()
-            .ingest_and_scan(frame, is_keyframe, probe_scroll)
+            .ingest_and_scan(frame, is_keyframe, probe_scroll, enable_fast_ui)
         else {
             self.vram_resident = false;
             let cpu_bgra = frame
@@ -2507,6 +2456,72 @@ impl SmartTileEncoder {
         self.scratch_packet
             .extend_from_slice(&(dirty_tile_count as u32).to_le_bytes());
 
+        // Single-pass Fast-UI path: when `1..=FAST_UI_MAX_TILES` lossless UI/cursor tiles changed,
+        // Pass 1 already extracted their `(cur, ref)` pixels into `fast_extract_slice`, so we skip
+        // the second synchronous `execute_encode_pass` + `dev.poll` roundtrip completely and commit
+        // `cur -> ref` asynchronously on the GPU queue!
+        let can_fast_ui = enable_fast_ui
+            && !dirty_tiles.is_empty()
+            && dirty_tiles.len() <= vram::FAST_UI_MAX_TILES
+            && frame_mv.is_none()
+            && !massive_motion
+            && dirty_tiles
+                .iter()
+                .all(|&(_, _, _, _, _, _, tidx, sflags, _)| {
+                    let wants_lossy = self.tiles[tidx].motion_streak >= MOTION_STREAK_THRESHOLD;
+                    let is_solid = (sflags & vram::SCAN_FLAG_SOLID) != 0;
+                    let slot_plus1 = (sflags >> 8) as usize;
+                    !wants_lossy
+                        && (is_solid
+                            || (slot_plus1 > 0 && slot_plus1 * 32768 <= fast_extract_slice.len()))
+                });
+
+        if can_fast_ui {
+            let mut commit_rects = Vec::with_capacity(dirty_tiles.len());
+            for &(tx, ty, x0, y0, tw, th, tidx, sflags, solid_px) in &dirty_tiles {
+                self.scratch_packet
+                    .extend_from_slice(&(tx as u16).to_le_bytes());
+                self.scratch_packet
+                    .extend_from_slice(&(ty as u16).to_le_bytes());
+                if (sflags & vram::SCAN_FLAG_SOLID) != 0 {
+                    self.scratch_packet.push(MODE_LOSSLESS_RAW);
+                    let px_bytes = solid_px.to_le_bytes();
+                    let count = (tw as usize) * (th as usize);
+                    self.scratch_packet.reserve(count * 4);
+                    for _ in 0..count {
+                        self.scratch_packet.extend_from_slice(&px_bytes);
+                    }
+                } else {
+                    let slot = ((sflags >> 8) as usize) - 1;
+                    let ex_base = slot * 32768;
+                    let cur_tile = &fast_extract_slice[ex_base..ex_base + 16384];
+                    let ref_tile = &fast_extract_slice[ex_base + 16384..ex_base + 32768];
+                    write_lossless_tile_extracted(
+                        cur_tile,
+                        ref_tile,
+                        tw,
+                        th,
+                        false,
+                        &mut self.scratch_packet,
+                    );
+                }
+                self.tiles[tidx].is_lossy = false;
+                commit_rects.push(vram::TileRect { x0, y0, tw, th });
+            }
+            self.vram_state
+                .as_mut()
+                .unwrap()
+                .commit_cur_to_ref_tiles(&commit_rects);
+            let payload = compress_packet_adaptive(&self.scratch_packet, false);
+            return Ok(SmartTilePacket {
+                is_keyframe: false,
+                used_lossy: false,
+                had_copy_rect: false,
+                dirty_tiles: dirty_tile_count,
+                payload,
+            });
+        }
+
         let mut cmds = Vec::with_capacity(dirty_tile_count);
         let mut num_lossy_opaque = 0usize;
         let mut num_extract = 0usize;
@@ -2604,7 +2619,7 @@ impl SmartTileEncoder {
                         out_buf.extend_from_slice(&(ty as u16).to_le_bytes());
 
                         let batch_idx = cmd.batch_idx as usize;
-                        let q_tile_base = batch_idx * 3073;
+                        let q_tile_base = batch_idx * vram::qblocks_words_per_tile(scale);
                         let use_inter = qblocks_flat[q_tile_base] != 0;
                         let q_blocks_base = q_tile_base + 1;
 
@@ -2854,7 +2869,12 @@ impl SmartTileEncoder {
                         scratch_packet[4..8].copy_from_slice(&(refresh_count as u32).to_le_bytes());
                         let compressed = lz4_flex::compress_prepend_size(scratch_packet);
                         if compressed.len() >= byte_budget {
-                            ready_payload = Some(compressed);
+                            let final_pkt = rans::compress_lz4_body_with_rans(
+                                scratch_packet.len(),
+                                &compressed,
+                            )
+                            .unwrap_or(compressed);
+                            ready_payload = Some(final_pkt);
                             break;
                         }
                         let remaining_comp = byte_budget - compressed.len();
@@ -2880,7 +2900,7 @@ impl SmartTileEncoder {
                 None => {
                     self.scratch_packet[4..8]
                         .copy_from_slice(&(refresh_count as u32).to_le_bytes());
-                    lz4_flex::compress_prepend_size(&self.scratch_packet)
+                    compress_packet_adaptive(&self.scratch_packet, false)
                 }
             };
             return Some(SmartTilePacket {
@@ -2942,7 +2962,12 @@ impl SmartTileEncoder {
                         .copy_from_slice(&(refresh_count as u32).to_le_bytes());
                     let compressed = lz4_flex::compress_prepend_size(&self.scratch_packet);
                     if compressed.len() >= byte_budget {
-                        ready_payload = Some(compressed);
+                        let final_pkt = rans::compress_lz4_body_with_rans(
+                            self.scratch_packet.len(),
+                            &compressed,
+                        )
+                        .unwrap_or(compressed);
+                        ready_payload = Some(final_pkt);
                         break 'outer;
                     }
                     // Estimate how many additional raw bytes fit within the remaining compressed budget.
@@ -2968,7 +2993,7 @@ impl SmartTileEncoder {
             Some(p) => p,
             None => {
                 self.scratch_packet[4..8].copy_from_slice(&(refresh_count as u32).to_le_bytes());
-                lz4_flex::compress_prepend_size(&self.scratch_packet)
+                compress_packet_adaptive(&self.scratch_packet, false)
             }
         };
         Some(SmartTilePacket {
@@ -6570,6 +6595,72 @@ mod tests {
                     &hy_ref,
                     &hcb_ref,
                     &hcr_ref,
+                    alpha_opt,
+                    &mut out_ref,
+                    fb_w,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                );
+                assert_eq!(out_simd, out_ref);
+            }
+
+            // Quarter-res forward & inverse (opaque & transparent)
+            let mut qy_simd = [0i32; 16 * 16];
+            let mut qcb_simd = [0i32; 8 * 8];
+            let mut qcr_simd = [0i32; 8 * 8];
+            let mut qy_ref = [0i32; 16 * 16];
+            let mut qcb_ref = [0i32; 8 * 8];
+            let mut qcr_ref = [0i32; 8 * 8];
+
+            bgra_tile_to_ycbcr420_quarter(
+                &src_bgra,
+                fb_w,
+                x0,
+                y0,
+                tw,
+                th,
+                &mut qy_simd,
+                &mut qcb_simd,
+                &mut qcr_simd,
+            );
+            simd::bgra_tile_to_ycbcr420_quarter_scalar(
+                &src_bgra,
+                fb_w,
+                x0,
+                y0,
+                tw,
+                th,
+                &mut qy_ref,
+                &mut qcb_ref,
+                &mut qcr_ref,
+            );
+            assert_eq!(qy_simd, qy_ref);
+            assert_eq!(qcb_simd, qcb_ref);
+            assert_eq!(qcr_simd, qcr_ref);
+
+            let mut qa_plane = [0i32; 16 * 16];
+            bgra_tile_to_alpha_quarter(&src_bgra, fb_w, x0, y0, tw, th, &mut qa_plane);
+            for alpha_opt in [None, Some(&qa_plane)] {
+                let mut out_simd = vec![0u8; src_bgra.len()];
+                let mut out_ref = vec![0u8; src_bgra.len()];
+                ycbcr420_quarter_to_bgra_tile(
+                    &qy_simd,
+                    &qcb_simd,
+                    &qcr_simd,
+                    alpha_opt,
+                    &mut out_simd,
+                    fb_w,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                );
+                simd::ycbcr420_quarter_to_bgra_tile_scalar(
+                    &qy_ref,
+                    &qcb_ref,
+                    &qcr_ref,
                     alpha_opt,
                     &mut out_ref,
                     fb_w,

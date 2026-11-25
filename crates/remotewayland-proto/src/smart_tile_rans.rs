@@ -28,7 +28,9 @@ const RANS_L: u32 = 1 << 16; // 65536 (16-bit word renormalization -> 32-bit sta
 
 #[derive(Clone, Copy)]
 struct SymEnc {
-    freq: u32,
+    x_max: u32,
+    rcp: u64,
+    cmpl_freq: u32,
     cum: u32,
 }
 
@@ -120,13 +122,24 @@ fn encode_rans_core(stage_input: &[u8], raw_len: usize, lz4_stage_len: u32) -> V
         return out;
     }
 
-    // Build cumulative frequency table for rANS encode.
-    let mut enc_tab = [SymEnc { freq: 0, cum: 0 }; 256];
+    // Build cumulative frequency + division-free 63-bit reciprocal table for rANS encode.
+    let mut enc_tab = [SymEnc {
+        x_max: 0,
+        rcp: 0,
+        cmpl_freq: 0,
+        cum: 0,
+    }; 256];
     let mut cum = 0u32;
     for s in 0..256 {
         let f = freqs[s] as u32;
         if f > 0 {
-            enc_tab[s] = SymEnc { freq: f, cum };
+            let rcp = (1u128 << 63).div_ceil(f as u128) as u64;
+            enc_tab[s] = SymEnc {
+                x_max: ((RANS_L >> PROB_BITS) << 16) * f,
+                rcp,
+                cmpl_freq: (PROB_SCALE as u32) - f,
+                cum,
+            };
             cum += f;
         }
     }
@@ -137,16 +150,13 @@ fn encode_rans_core(stage_input: &[u8], raw_len: usize, lz4_stage_len: u32) -> V
 
     #[inline(always)]
     fn put_sym(state: &mut u32, sym: &SymEnc, words_rev: &mut Vec<u16>) {
-        let f = sym.freq;
-        let x_max = ((RANS_L >> PROB_BITS) << 16) * f;
         let mut x = *state;
-        if x >= x_max {
+        if x >= sym.x_max {
             words_rev.push((x & 0xFFFF) as u16);
             x >>= 16;
         }
-        let q = x / f;
-        let r = x - q * f;
-        *state = (q << PROB_BITS) + r + sym.cum;
+        let q = (((x as u128) * (sym.rcp as u128)) >> 63) as u32;
+        *state = x + q * sym.cmpl_freq + sym.cum;
     }
 
     let rem = n & 3;
