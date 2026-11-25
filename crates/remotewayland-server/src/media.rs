@@ -4,10 +4,13 @@
 //! - `SmartTile`: per-tile motion compensation, 64x64 dirty-tile skipping, adaptive lossless/DCT
 //!   (Intra I-tiles & Inter residual P-tiles with alpha support), and Golomb-Rice lossless idle refinement.
 
+use anyhow::Result;
 use remotewayland_proto::smart_tile::{
     xor_encode_row, SmartTileEncoder, DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES,
 };
 use remotewayland_proto::VideoCodec;
+
+use crate::gpu::FramePixels;
 
 /// An encoded video frame (keyframe or delta/tile packet).
 pub struct EncodedFrame {
@@ -32,6 +35,48 @@ impl WindowVideoEncoder {
         match codec {
             VideoCodec::SmartTile => Self::SmartTile(SmartTileEncoder::new()),
             _ => Self::Lz4Delta(VideoEncoder::new()),
+        }
+    }
+
+    pub fn encode_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        pts_ns: u64,
+        pixels: &FramePixels,
+        quality: u8,
+    ) -> Result<EncodedFrame> {
+        match (self, pixels) {
+            (Self::SmartTile(enc), FramePixels::Gpu(gpu_handle)) => {
+                let pkt = enc.encode_gpu_texture(&gpu_handle.as_texture_frame(), quality)?;
+                Ok(EncodedFrame {
+                    pts_ns,
+                    width,
+                    height,
+                    is_keyframe: pkt.is_keyframe,
+                    used_lossy: pkt.used_lossy,
+                    had_copy_rect: pkt.had_copy_rect,
+                    dirty_tiles: pkt.dirty_tiles,
+                    data: pkt.payload,
+                })
+            }
+            (Self::SmartTile(enc), FramePixels::Cpu(bgra)) => {
+                let pkt = enc.encode(width, height, bgra, quality);
+                Ok(EncodedFrame {
+                    pts_ns,
+                    width,
+                    height,
+                    is_keyframe: pkt.is_keyframe,
+                    used_lossy: pkt.used_lossy,
+                    had_copy_rect: pkt.had_copy_rect,
+                    dirty_tiles: pkt.dirty_tiles,
+                    data: pkt.payload,
+                })
+            }
+            (Self::Lz4Delta(enc), pixels) => {
+                let bgra = pixels.to_cpu_bgra();
+                Ok(enc.encode_bgra(width, height, pts_ns, &bgra))
+            }
         }
     }
 

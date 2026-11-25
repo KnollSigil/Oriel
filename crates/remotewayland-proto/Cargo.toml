@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ash.workspace = true
 bytemuck.workspace = true
 bytes.workspace = true
+libc.workspace = true
 lz4_flex.workspace = true
 pollster.workspace = true
 postcard.workspace = true

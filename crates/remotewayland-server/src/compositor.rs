@@ -107,7 +107,9 @@ use smithay::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::gpu::{BgraFrame, GpuImporter, GpuMode, PendingReadback, Readback};
+use crate::gpu::{
+    BgraFrame, FramePixels, GpuImporter, GpuMode, ImportedFrame, PendingReadback, Readback,
+};
 use calloop::timer::{TimeoutAction, Timer};
 use smithay::backend::egl::fence::EGLFence;
 use smithay::backend::renderer::sync::Fence as _;
@@ -191,7 +193,7 @@ pub enum CompositorEvent {
         logical_height: u32,
         geometry: FrameRect,
         input_bounds: FrameRect,
-        bgra: Arc<Vec<u8>>,
+        pixels: FramePixels,
     },
     CursorUpdate {
         window_id: WindowId,
@@ -339,7 +341,7 @@ struct CachedFrame {
     geometry: FrameRect,
     /// Bounding box of the app's input region inside the frame (logical).
     input_bounds: FrameRect,
-    bgra: Arc<Vec<u8>>,
+    pixels: FramePixels,
 }
 
 impl PartialEq for CachedFrame {
@@ -350,7 +352,7 @@ impl PartialEq for CachedFrame {
             && self.logical_height == other.logical_height
             && self.geometry == other.geometry
             && self.input_bounds == other.input_bounds
-            && (Arc::ptr_eq(&self.bgra, &other.bgra) || self.bgra == other.bgra)
+            && self.pixels == other.pixels
     }
 }
 impl Eq for CachedFrame {}
@@ -562,8 +564,8 @@ struct AppState {
     start_time: Instant,
     /// Map from `WlSurface::id()` (`ObjectId`, unique across clients) -> WindowId (for toplevels & popups).
     surface_to_window: HashMap<ObjectId, WindowId>,
-    /// Cached RGBA buffer per `WlSurface::id()` for surface-tree compositing.
-    surface_buffers: HashMap<ObjectId, (u32, u32, Arc<Vec<u8>>)>,
+    /// Cached CPU or VRAM-resident frame per `WlSurface::id()`.
+    surface_buffers: HashMap<ObjectId, (u32, u32, FramePixels)>,
     /// KDE server-decoration modes set on a `WlSurface` before `xdg_surface.get_toplevel`.
     pending_kde_decorations: HashMap<ObjectId, bool>,
     windows: HashMap<WindowId, TrackedWindow>,
@@ -717,12 +719,13 @@ impl AppState {
     }
 
     fn emit_cursor_surface_bitmap(&mut self, surf: &WlSurface) {
-        let Some((w, h, bgra)) = self.surface_buffers.get(&surf.id()) else {
+        let Some((w, h, surf_pixels)) = self.surface_buffers.get(&surf.id()) else {
             return;
         };
         if *w == 0 || *h == 0 || *w > MAX_CURSOR_DIM || *h > MAX_CURSOR_DIM {
             return;
         }
+        let bgra = surf_pixels.to_cpu_bgra();
         let (logical_w, logical_h) = surface_logical_size(surf, *w, *h);
         let (hotspot_x, hotspot_y) = with_states(surf, |states| {
             states
@@ -745,7 +748,7 @@ impl AppState {
         ) {
             return;
         }
-        let bgra_cloned = (**bgra).clone();
+        let bgra_cloned = (*bgra).clone();
         self.last_cursor_bitmap = Some((
             *w,
             *h,
@@ -1460,7 +1463,7 @@ impl AppState {
                         logical_height: frame.logical_height,
                         geometry: frame.geometry,
                         input_bounds: frame.input_bounds,
-                        bgra: Arc::clone(&frame.bgra),
+                        pixels: frame.pixels.clone(),
                     });
                 }
             }
@@ -1484,7 +1487,7 @@ impl AppState {
                         logical_height: frame.logical_height,
                         geometry: frame.geometry,
                         input_bounds: frame.input_bounds,
-                        bgra: (*frame.bgra).clone(),
+                        bgra: (*frame.pixels.to_cpu_bgra()).clone(),
                     });
                 }
             }
@@ -1525,7 +1528,7 @@ impl AppState {
                         logical_height: frame.logical_height,
                         geometry: frame.geometry,
                         input_bounds: frame.input_bounds,
-                        bgra: Arc::clone(&frame.bgra),
+                        pixels: frame.pixels.clone(),
                     });
                 }
             }
@@ -1549,7 +1552,7 @@ impl AppState {
                         logical_height: frame.logical_height,
                         geometry: frame.geometry,
                         input_bounds: frame.input_bounds,
-                        bgra: (*frame.bgra).clone(),
+                        bgra: (*frame.pixels.to_cpu_bgra()).clone(),
                     });
                 }
             }
@@ -1664,9 +1667,9 @@ impl AppState {
             (surf_w, surf_h)
         };
 
-        let composite: Arc<Vec<u8>> = if !has_subsurfaces {
-            // Zero-copy fast path for single-surface windows (most Wayland apps).
-            Arc::clone(&self.surface_buffers.get(&root_id).unwrap().2)
+        let composite: FramePixels = if !has_subsurfaces {
+            // Zero-copy fast path for single-surface windows (both VRAM Dmabuf and SHM).
+            self.surface_buffers.get(&root_id).unwrap().2.clone()
         } else {
             let mut buf = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
             with_surface_tree_downward(
@@ -1680,7 +1683,8 @@ impl AppState {
                         let loc = sub_state.current().location;
                         (ox + loc.x, oy + loc.y)
                     };
-                    if let Some((sw, sh, srgba)) = self.surface_buffers.get(&surf.id()) {
+                    if let Some((sw, sh, spixels)) = self.surface_buffers.get(&surf.id()) {
+                        let srgba = spixels.to_cpu_bgra();
                         let (sub_log_w, sub_log_h) =
                             surface_logical_size_from_states(states, *sw, *sh);
                         let dst_x = (nx as f64 * comp_sx).round() as i32;
@@ -1695,11 +1699,11 @@ impl AppState {
                         };
                         if dst_w == *sw && dst_h == *sh {
                             blit_rgba_over(
-                                &mut buf, win_phys_w, win_phys_h, srgba, *sw, *sh, dst_x, dst_y,
+                                &mut buf, win_phys_w, win_phys_h, &srgba, *sw, *sh, dst_x, dst_y,
                             );
                         } else {
                             blit_rgba_over_scaled(
-                                &mut buf, win_phys_w, win_phys_h, srgba, *sw, *sh, dst_x, dst_y,
+                                &mut buf, win_phys_w, win_phys_h, &srgba, *sw, *sh, dst_x, dst_y,
                                 dst_w, dst_h,
                             );
                         }
@@ -1709,7 +1713,7 @@ impl AppState {
                 |_, _, _| {},
                 |_, _, _| true,
             );
-            Arc::new(buf)
+            FramePixels::Cpu(Arc::new(buf))
         };
 
         let Some(tracked) = self.windows.get_mut(&window_id) else {
@@ -1736,7 +1740,7 @@ impl AppState {
             logical_height: root_log_h,
             geometry,
             input_bounds,
-            bgra: composite,
+            pixels: composite,
         };
 
         if tracked.latest_bgra.as_ref() == Some(&new_frame) {
@@ -1806,7 +1810,7 @@ impl AppState {
             logical_height: new_frame.logical_height,
             geometry: new_frame.geometry,
             input_bounds: new_frame.input_bounds,
-            bgra: new_frame.bgra,
+            pixels: new_frame.pixels,
         });
     }
 
@@ -1859,7 +1863,8 @@ impl AppState {
                     let loc = sub_state.current().location;
                     (ox + loc.x, oy + loc.y)
                 };
-                if let Some((sw, sh, sbgra)) = self.surface_buffers.get(&surf.id()) {
+                if let Some((sw, sh, spixels)) = self.surface_buffers.get(&surf.id()) {
+                    let sbgra = spixels.to_cpu_bgra();
                     let (sub_log_w, sub_log_h) = surface_logical_size_from_states(states, *sw, *sh);
                     let dst_x = (nx as f64 * root_sx).round() as i32;
                     let dst_y = (ny as f64 * root_sy).round() as i32;
@@ -1873,11 +1878,11 @@ impl AppState {
                     };
                     if dst_w == *sw && dst_h == *sh {
                         blit_rgba_over(
-                            &mut bgra, pop_phys_w, pop_phys_h, sbgra, *sw, *sh, dst_x, dst_y,
+                            &mut bgra, pop_phys_w, pop_phys_h, &sbgra, *sw, *sh, dst_x, dst_y,
                         );
                     } else {
                         blit_rgba_over_scaled(
-                            &mut bgra, pop_phys_w, pop_phys_h, sbgra, *sw, *sh, dst_x, dst_y,
+                            &mut bgra, pop_phys_w, pop_phys_h, &sbgra, *sw, *sh, dst_x, dst_y,
                             dst_w, dst_h,
                         );
                     }
@@ -1897,6 +1902,7 @@ impl AppState {
             }
         }
 
+        let bgra_arc = Arc::new(bgra);
         let new_frame = CachedFrame {
             width: pop_phys_w,
             height: pop_phys_h,
@@ -1904,7 +1910,7 @@ impl AppState {
             logical_height: root_log_h,
             geometry,
             input_bounds,
-            bgra: Arc::new(bgra),
+            pixels: FramePixels::Cpu(Arc::clone(&bgra_arc)),
         };
 
         if popup.latest_bgra.as_ref() == Some(&new_frame) {
@@ -1932,7 +1938,7 @@ impl AppState {
             logical_height: new_frame.logical_height,
             geometry: new_frame.geometry,
             input_bounds: new_frame.input_bounds,
-            bgra: (*new_frame.bgra).clone(),
+            bgra: (*bgra_arc).clone(),
         });
     }
 }
@@ -1988,8 +1994,8 @@ impl CompositorHandler for AppState {
         let readback_frame = readback_job.and_then(|id| self.take_readback(surface, id));
 
         if let Some(buffer) = buffer_opt {
-            let frame = if get_dmabuf(&buffer).is_ok() {
-                // Read back before this commit was applied (see `queue_buffer_readback`).
+            let frame: Option<ImportedFrame> = if get_dmabuf(&buffer).is_ok() {
+                // Imported/blitted before this commit was applied (see `queue_buffer_readback`).
                 readback_frame
             } else {
                 read_shm_buffer(&buffer).map(|frame| {
@@ -2010,10 +2016,11 @@ impl CompositorHandler for AppState {
                         let size = (frame.0 as i32, frame.1 as i32).into();
                         buffer_crop(src, size, scale, transform.into())
                     });
-                    match crop {
+                    let (w, h, bgra) = match crop {
                         Some(rect) => crop_frame(&frame, rect),
                         None => frame,
-                    }
+                    };
+                    (w, h, FramePixels::Cpu(Arc::new(bgra)))
                 })
             };
             if let Some(frame) = frame {
@@ -2057,10 +2064,10 @@ impl Cacheable for ReadbackJobState {
     }
 }
 
-/// A client dmabuf read back before the commit that attached it is applied.
+/// A client dmabuf imported/blitted before the commit that attached it is applied.
 struct ReadbackJob {
-    /// The frame, once the readback succeeded.
-    frame: Option<BgraFrame>,
+    /// The frame, once the GPU blit or readback succeeded.
+    frame: Option<ImportedFrame>,
 }
 
 /// State carried through the stages of one readback.
@@ -2291,7 +2298,7 @@ impl AppState {
     }
 
     /// Record the frame and let the held commit apply.
-    fn complete_readback(&mut self, ctx: ReadbackContext, frame: Option<BgraFrame>) {
+    fn complete_readback(&mut self, ctx: ReadbackContext, frame: Option<ImportedFrame>) {
         if let Some(job) = self.readback_jobs.get_mut(&ctx.id) {
             job.frame = frame;
         }
@@ -2303,7 +2310,7 @@ impl AppState {
 
     /// Take the readback for the commit being applied. Earlier jobs of the surface belong to
     /// commits that were applied or merged away, so they are dropped too.
-    fn take_readback(&mut self, surface: &WlSurface, id: u64) -> Option<BgraFrame> {
+    fn take_readback(&mut self, surface: &WlSurface, id: u64) -> Option<ImportedFrame> {
         if let Some(queue) = self.surface_readbacks.get_mut(&surface.id()) {
             while queue.front().is_some_and(|&queued| queued < id) {
                 if let Some(stale) = queue.pop_front() {
@@ -2317,10 +2324,9 @@ impl AppState {
         self.readback_jobs.remove(&id)?.frame
     }
 
-    fn store_surface_buffer(&mut self, surface: &WlSurface, (w, h, bgra): BgraFrame) {
+    fn store_surface_buffer(&mut self, surface: &WlSurface, (w, h, pixels): ImportedFrame) {
         if w > 0 && h > 0 {
-            self.surface_buffers
-                .insert(surface.id(), (w, h, Arc::new(bgra)));
+            self.surface_buffers.insert(surface.id(), (w, h, pixels));
         }
     }
 
@@ -3003,7 +3009,7 @@ impl AppState {
     }
 
     fn recomposite_x11_window(&mut self, window_id: WindowId, wl_surface: &WlSurface) {
-        let Some((w, h, bgra_ref)) = self.surface_buffers.get(&wl_surface.id()) else {
+        let Some((w, h, pixels_ref)) = self.surface_buffers.get(&wl_surface.id()) else {
             return;
         };
         let (w, h) = (*w, *h);
@@ -3034,7 +3040,7 @@ impl AppState {
             logical_height: log_h,
             geometry: FrameRect::full(log_w, log_h),
             input_bounds: FrameRect::full(log_w, log_h),
-            bgra: Arc::clone(bgra_ref),
+            pixels: pixels_ref.clone(),
         };
         let frame_unchanged = xwin.announced
             && !title_or_app_changed
@@ -3111,12 +3117,12 @@ impl AppState {
             logical_height: new_frame.logical_height,
             geometry: new_frame.geometry,
             input_bounds: new_frame.input_bounds,
-            bgra: new_frame.bgra,
+            pixels: new_frame.pixels,
         });
     }
 
     fn recomposite_x11_popup(&mut self, window_id: WindowId, wl_surface: &WlSurface) {
-        let Some((w, h, bgra_ref)) = self.surface_buffers.get(&wl_surface.id()) else {
+        let Some((w, h, pixels_ref)) = self.surface_buffers.get(&wl_surface.id()) else {
             return;
         };
         let (w, h) = (*w, *h);
@@ -3136,11 +3142,12 @@ impl AppState {
             logical_height: log_h,
             geometry: FrameRect::full(log_w, log_h),
             input_bounds: FrameRect::full(log_w, log_h),
-            bgra: Arc::clone(bgra_ref),
+            pixels: pixels_ref.clone(),
         };
         if xpop.announced && xpop.latest_bgra.as_ref() == Some(&new_frame) {
             return;
         }
+        let popup_bgra = (*new_frame.pixels.to_cpu_bgra()).clone();
         xpop.latest_bgra = Some(new_frame.clone());
         if !xpop.announced {
             xpop.announced = true;
@@ -3172,7 +3179,7 @@ impl AppState {
             logical_height: new_frame.logical_height,
             geometry: new_frame.geometry,
             input_bounds: new_frame.input_bounds,
-            bgra: (*new_frame.bgra).clone(),
+            bgra: popup_bgra,
         });
     }
 

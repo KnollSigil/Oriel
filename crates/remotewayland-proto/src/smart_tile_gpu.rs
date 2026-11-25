@@ -16,7 +16,8 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -1093,6 +1094,8 @@ struct TileBatchParamsUniform {
 pub struct SmartTileGpuEngine {
     pub adapter_name: String,
     pub device_type: wgpu::DeviceType,
+    drm_dev_id: Option<u64>,
+    supports_dmabuf: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     scan_bgl: wgpu::BindGroupLayout,
@@ -1102,6 +1105,7 @@ pub struct SmartTileGpuEngine {
     idct_pipeline: wgpu::ComputePipeline,
     tile_batch_bgl: wgpu::BindGroupLayout,
     tile_batch_pipeline: wgpu::ComputePipeline,
+    vram_pipelines: OnceLock<super::vram::VramPipelines>,
     /// Last timing breakdown `(upload_time, gpu_dispatch_and_readback_time, cpu_rle_and_scatter_time)`.
     pub last_timing: Mutex<(
         std::time::Duration,
@@ -1138,60 +1142,202 @@ struct GpuScratchBuffers {
     tb_recon_staging: Option<wgpu::Buffer>,
 }
 
-static GLOBAL_GPU_ENGINE: OnceLock<Option<SmartTileGpuEngine>> = OnceLock::new();
+static GLOBAL_GPU_ENGINE: OnceLock<Option<Arc<SmartTileGpuEngine>>> = OnceLock::new();
+static DRM_GPU_ENGINES: OnceLock<Mutex<HashMap<u64, Option<Arc<SmartTileGpuEngine>>>>> =
+    OnceLock::new();
 
 /// Obtain a reference to the singleton hardware GPU compute engine if a hardware Vulkan/GLES
 /// adapter (`DiscreteGpu` or `IntegratedGpu`) is available.
 pub fn global_gpu_engine() -> Option<&'static SmartTileGpuEngine> {
     GLOBAL_GPU_ENGINE
-        .get_or_init(SmartTileGpuEngine::try_new_hardware)
-        .as_ref()
+        .get_or_init(|| SmartTileGpuEngine::try_new_hardware().map(Arc::new))
+        .as_deref()
+}
+
+/// Obtain a cloneable `Arc` to the singleton hardware GPU compute engine.
+pub fn global_gpu_engine_arc() -> Option<Arc<SmartTileGpuEngine>> {
+    GLOBAL_GPU_ENGINE
+        .get_or_init(|| SmartTileGpuEngine::try_new_hardware().map(Arc::new))
+        .clone()
+}
+
+/// Obtain a hardware GPU compute engine matching the given Linux DRM device ID (`st_rdev` of
+/// `/dev/dri/renderD*` or `/dev/dri/card*`), sharing the global engine when on the same GPU.
+pub fn engine_for_drm_dev(drm_dev_id: u64) -> Option<Arc<SmartTileGpuEngine>> {
+    if let Some(global) = global_gpu_engine_arc() {
+        if global.drm_dev_id == Some(drm_dev_id) {
+            return Some(global);
+        }
+    }
+    let cache = DRM_GPU_ENGINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().ok()?;
+    if let Some(existing) = map.get(&drm_dev_id) {
+        return existing.clone();
+    }
+    let created = SmartTileGpuEngine::try_new_for_drm_dev(Some(drm_dev_id), false).map(Arc::new);
+    map.insert(drm_dev_id, created.clone());
+    created
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn vulkan_adapter_drm_devs(adapter: &wgpu::Adapter) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    unsafe {
+        let hal_adapter = adapter.as_hal::<wgpu::hal::api::Vulkan>()?;
+        let raw_inst = hal_adapter.shared_instance().raw_instance();
+        let phys = hal_adapter.raw_physical_device();
+        let mut drm_props = ash::vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut props2 = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
+        raw_inst.get_physical_device_properties2(phys, &mut props2);
+        let primary = if drm_props.has_primary != 0 {
+            libc::makedev(drm_props.primary_major as _, drm_props.primary_minor as _) as u64
+        } else {
+            0
+        };
+        let render = if drm_props.has_render != 0 {
+            libc::makedev(drm_props.render_major as _, drm_props.render_minor as _) as u64
+        } else {
+            0
+        };
+        if primary != 0 || render != 0 {
+            return Some((primary, render));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = adapter;
+    None
 }
 
 impl SmartTileGpuEngine {
     /// Initialize the `wgpu` compute pipelines on a hardware GPU (skipping CPU software adapters like `llvmpipe`).
     pub fn try_new_hardware() -> Option<Self> {
-        Self::try_new_internal(false)
+        Self::try_new_for_drm_dev(None, false)
     }
 
     /// Initialize the `wgpu` compute pipelines, allowing fallback CPU adapters (used in tests if no physical GPU is exposed).
     pub fn try_new_any() -> Option<Self> {
-        Self::try_new_internal(true)
+        Self::try_new_for_drm_dev(None, true)
     }
 
-    fn try_new_internal(allow_cpu_adapter: bool) -> Option<Self> {
+    #[inline]
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    #[inline]
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    #[inline]
+    pub fn drm_dev_id(&self) -> Option<u64> {
+        self.drm_dev_id
+    }
+
+    #[inline]
+    pub fn supports_dmabuf(&self) -> bool {
+        self.supports_dmabuf
+    }
+
+    #[inline]
+    pub(crate) fn vram_pipelines(&self) -> &super::vram::VramPipelines {
+        self.vram_pipelines
+            .get_or_init(|| super::vram::VramPipelines::new(&self.device))
+    }
+
+    pub fn try_new_for_drm_dev(
+        target_drm_dev: Option<u64>,
+        allow_cpu_adapter: bool,
+    ) -> Option<Self> {
+        let backends = if target_drm_dev.is_some() {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::VULKAN | wgpu::Backends::GL
+        };
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
-        let adapters = pollster::block_on(
-            instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::GL),
-        );
+        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
         let adapter = adapters
             .into_iter()
             .filter(|a| {
                 let info = a.get_info();
-                allow_cpu_adapter
+                let hw_ok = allow_cpu_adapter
                     || matches!(
                         info.device_type,
                         wgpu::DeviceType::DiscreteGpu
                             | wgpu::DeviceType::IntegratedGpu
                             | wgpu::DeviceType::VirtualGpu
-                    )
+                    );
+                if !hw_ok {
+                    return false;
+                }
+                if let Some(wanted) = target_drm_dev {
+                    let Some((prim, rend)) = vulkan_adapter_drm_devs(a) else {
+                        return false;
+                    };
+                    prim == wanted || rend == wanted
+                } else {
+                    true
+                }
             })
-            .min_by_key(|a| match a.get_info().device_type {
-                wgpu::DeviceType::DiscreteGpu => 0,
-                wgpu::DeviceType::IntegratedGpu => 1,
-                wgpu::DeviceType::VirtualGpu => 2,
-                _ => 3,
+            .min_by_key(|a| {
+                let info = a.get_info();
+                let backend_prio = if info.backend == wgpu::Backend::Vulkan {
+                    0
+                } else {
+                    1
+                };
+                let dev_prio = match info.device_type {
+                    wgpu::DeviceType::DiscreteGpu => 0,
+                    wgpu::DeviceType::IntegratedGpu => 1,
+                    wgpu::DeviceType::VirtualGpu => 2,
+                    _ => 3,
+                };
+                (backend_prio, dev_prio)
             })?;
 
         let info = adapter.get_info();
+        let drm_devs = vulkan_adapter_drm_devs(&adapter);
+        let resolved_drm_dev = target_drm_dev.or_else(|| {
+            drm_devs.and_then(|(prim, rend)| {
+                if rend != 0 {
+                    Some(rend)
+                } else if prim != 0 {
+                    Some(prim)
+                } else {
+                    None
+                }
+            })
+        });
+
+        let adapter_features = adapter.features();
+        let mut required_features = wgpu::Features::empty();
+        if adapter_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        }
+        if adapter_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_FD) {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_FD;
+        }
+        let supports_dmabuf =
+            required_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
+
+        let adapter_limits = adapter.limits();
+        let required_limits = wgpu::Limits {
+            max_compute_workgroup_storage_size: adapter_limits
+                .max_compute_workgroup_storage_size
+                .max(16384),
+            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+            max_buffer_size: adapter_limits.max_buffer_size,
+            ..wgpu::Limits::default()
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("SmartTileGpuEngine"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_features,
+            required_limits,
             ..Default::default()
         }))
         .ok()?;
@@ -1423,12 +1569,15 @@ impl SmartTileGpuEngine {
             adapter = %info.name,
             device_type = ?info.device_type,
             backend = ?info.backend,
+            supports_dmabuf,
             "Initialized SmartTile wgpu compute shader engine"
         );
 
         Some(Self {
             adapter_name: info.name,
             device_type: info.device_type,
+            drm_dev_id: resolved_drm_dev,
+            supports_dmabuf,
             device,
             queue,
             scan_bgl,
@@ -1438,6 +1587,7 @@ impl SmartTileGpuEngine {
             idct_pipeline,
             tile_batch_bgl,
             tile_batch_pipeline,
+            vram_pipelines: OnceLock::new(),
             last_timing: Mutex::new((
                 std::time::Duration::ZERO,
                 std::time::Duration::ZERO,

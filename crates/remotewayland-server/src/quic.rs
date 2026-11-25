@@ -1267,7 +1267,7 @@ impl EventForwarder {
                 logical_height,
                 geometry,
                 input_bounds,
-                bgra,
+                pixels,
             } => {
                 let (conn, selected_codec, session_start) =
                     (&self.conn, self.selected_codec, self.session_start);
@@ -1286,7 +1286,7 @@ impl EventForwarder {
                     logical_height,
                     geometry,
                     input_bounds,
-                    bgra,
+                    pixels,
                 });
             }
             CompositorEvent::SnapshotTaken { .. } => {}
@@ -1353,7 +1353,7 @@ struct RawVideoFrame {
     logical_height: u32,
     geometry: FrameRect,
     input_bounds: FrameRect,
-    bgra: Arc<Vec<u8>>,
+    pixels: crate::gpu::FramePixels,
 }
 
 struct WindowVideoPipeline {
@@ -1585,11 +1585,11 @@ async fn run_window_video_pipeline(
             let mut enc = encoder.take().unwrap();
             let q = quality;
             let encoded_res = tokio::task::spawn_blocking(move || {
-                let frame = enc.encode_bgra(raw.width, raw.height, pts_ns, &raw.bgra, q);
-                (enc, frame)
+                let res = enc.encode_frame(raw.width, raw.height, pts_ns, &raw.pixels, q);
+                (enc, res)
             })
             .await;
-            let (enc, frame) = match encoded_res {
+            let (enc, frame_res) = match encoded_res {
                 Ok(pair) => pair,
                 Err(err) => {
                     warn!(window_id, error = %err, "video encoder task panicked");
@@ -1598,6 +1598,13 @@ async fn run_window_video_pipeline(
                 }
             };
             encoder = Some(enc);
+            let frame = match frame_res {
+                Ok(f) => f,
+                Err(err) => {
+                    warn!(window_id, error = %format!("{err:#}"), "video frame encode failed");
+                    continue;
+                }
+            };
             (logical_width, logical_height, geometry, input_bounds, frame)
         };
         let encode_elapsed = encode_start.elapsed();

@@ -22,6 +22,9 @@ pub mod simd;
 #[path = "smart_tile_gpu.rs"]
 pub mod gpu;
 
+#[path = "smart_tile_vram.rs"]
+pub mod vram;
+
 #[path = "smart_tile_rans.rs"]
 pub mod rans;
 
@@ -1910,12 +1913,16 @@ pub struct SmartTilePacket {
 pub struct SmartTileEncoder {
     width: u32,
     height: u32,
-    /// Bit-exact reconstructed reference framebuffer matching the client decoder.
+    /// Bit-exact reconstructed reference framebuffer matching the client decoder (empty when `vram_resident`).
     ref_bgra: Vec<u8>,
     /// Reusable snapshot of `ref_bgra` before the current frame, used only when a frame MV is active.
     prev_ref_bgra: Vec<u8>,
-    /// Most recent lossless source framebuffer (used for automatic idle lossless refinement).
+    /// Most recent lossless source framebuffer (used for automatic idle lossless refinement when CPU-resident).
     source_bgra: Vec<u8>,
+    /// Persistent VRAM buffers when encoding zero-copy GPU `Dmabuf` textures.
+    vram_state: Option<Box<vram::VramWindowState>>,
+    /// True when `ref_bgra` and `source_bgra` reside in `vram_state` on the GPU rather than CPU RAM.
+    vram_resident: bool,
     tiles: Vec<TileTrack>,
     scratch_packet: Vec<u8>,
     /// Hysteresis latch for 2x2 half-res mode on HiDPI (enter under congestion/full-screen video,
@@ -1949,6 +1956,20 @@ impl SmartTileEncoder {
         let total_tiles = cols * rows;
         let now = Instant::now();
 
+        if self.vram_resident && width == self.width && height == self.height {
+            if let Some(vs) = self.vram_state.as_ref() {
+                if let Some(dl_ref) = vs.download_ref_bgra() {
+                    self.ref_bgra = dl_ref;
+                }
+                if self.has_pending_lossless_refresh() {
+                    if let Some(dl_cur) = vs.download_cur_bgra() {
+                        self.source_bgra = dl_cur;
+                    }
+                }
+            }
+            self.vram_resident = false;
+        }
+
         let is_keyframe = width != self.width
             || height != self.height
             || self.ref_bgra.len() != expected_len
@@ -1957,6 +1978,7 @@ impl SmartTileEncoder {
         if is_keyframe {
             self.width = width;
             self.height = height;
+            self.vram_resident = false;
             self.ref_bgra.resize(expected_len, 0);
             self.prev_ref_bgra.clear();
             self.source_bgra.clear();
@@ -2290,6 +2312,463 @@ impl SmartTileEncoder {
         }
     }
 
+    /// Encode a GPU-resident `GpuTextureFrame` (`Dmabuf` window) directly in VRAM without copying
+    /// full window framebuffers to CPU memory. Falls back to `read_to_cpu_bgra` only if GPU
+    /// compute is disabled (`FORCE_DISABLE_GPU`) or VRAM allocation fails.
+    pub fn encode_gpu_texture(
+        &mut self,
+        frame: &vram::GpuTextureFrame,
+        quality: u8,
+    ) -> Result<SmartTilePacket> {
+        let width = frame.width;
+        let height = frame.height;
+        if width == 0 || height == 0 {
+            bail!("empty GpuTextureFrame");
+        }
+        if !use_gpu() {
+            let cpu_bgra = frame
+                .read_to_cpu_bgra()
+                .context("failed to read GpuTextureFrame for CPU fallback")?;
+            return Ok(self.encode(width, height, &cpu_bgra, quality));
+        }
+
+        let cols = width.div_ceil(TILE_SIZE) as usize;
+        let rows = height.div_ceil(TILE_SIZE) as usize;
+        let total_tiles = cols * rows;
+        let now = Instant::now();
+
+        let mut is_keyframe =
+            width != self.width || height != self.height || self.tiles.len() != total_tiles;
+
+        if self.vram_state.is_none() {
+            self.vram_state = Some(Box::new(vram::VramWindowState::new(Arc::clone(
+                &frame.engine,
+            ))));
+        }
+
+        if !is_keyframe && !self.vram_resident {
+            let expected_len = (width as usize) * (height as usize) * 4;
+            if self.ref_bgra.len() == expected_len {
+                if !self
+                    .vram_state
+                    .as_mut()
+                    .unwrap()
+                    .upload_ref_bgra(width, height, &self.ref_bgra)
+                {
+                    is_keyframe = true;
+                }
+            } else {
+                is_keyframe = true;
+            }
+        }
+
+        if is_keyframe {
+            self.width = width;
+            self.height = height;
+            self.tiles.clear();
+            self.tiles.resize(total_tiles, TileTrack::default());
+            self.in_half_res = false;
+            self.in_quarter_res = false;
+            self.no_scroll_streak = 0;
+        }
+        // Release any CPU-side full-frame buffers once VRAM-resident.
+        if !self.ref_bgra.is_empty() {
+            self.ref_bgra = Vec::new();
+        }
+        if !self.prev_ref_bgra.is_empty() {
+            self.prev_ref_bgra = Vec::new();
+        }
+        if !self.source_bgra.is_empty() {
+            self.source_bgra = Vec::new();
+        }
+        self.vram_resident = true;
+
+        let probe_scroll =
+            !is_keyframe && (self.no_scroll_streak < 3 || self.no_scroll_streak >= 10);
+
+        let Some((scan_words_slice, gpu_scroll_mv)) = self
+            .vram_state
+            .as_mut()
+            .unwrap()
+            .ingest_and_scan(frame, is_keyframe, probe_scroll)
+        else {
+            self.vram_resident = false;
+            let cpu_bgra = frame
+                .read_to_cpu_bgra()
+                .context("failed to read GpuTextureFrame after VRAM scan failure")?;
+            return Ok(self.encode(width, height, &cpu_bgra, quality));
+        };
+
+        let mut dirty_tiles = Vec::new();
+        for ty in 0..rows {
+            let y0 = (ty as u32) * TILE_SIZE;
+            let th = (height - y0).min(TILE_SIZE);
+            for tx in 0..cols {
+                let x0 = (tx as u32) * TILE_SIZE;
+                let tw = (width - x0).min(TILE_SIZE);
+                let tidx = ty * cols + tx;
+                let flags = scan_words_slice[tidx * 2];
+                let solid_px = scan_words_slice[tidx * 2 + 1];
+                let dirty = is_keyframe || (flags & vram::SCAN_FLAG_DIRTY) != 0;
+                if dirty {
+                    let tr = &mut self.tiles[tidx];
+                    if is_keyframe {
+                        tr.motion_streak = 0;
+                    } else if let Some(prev_t) = tr.last_change {
+                        if now.duration_since(prev_t) <= MOTION_WINDOW {
+                            tr.motion_streak = tr.motion_streak.saturating_add(1);
+                        } else {
+                            tr.motion_streak = 1;
+                        }
+                    } else {
+                        tr.motion_streak = 1;
+                    }
+                    tr.last_change = Some(now);
+                    dirty_tiles.push((tx, ty, x0, y0, tw, th, tidx, flags, solid_px));
+                } else if let Some(prev_t) = self.tiles[tidx].last_change {
+                    if now.duration_since(prev_t) > MOTION_WINDOW {
+                        self.tiles[tidx].motion_streak = 0;
+                    }
+                }
+            }
+        }
+
+        let can_scroll = !is_keyframe && dirty_tiles.len() >= 12;
+        if !can_scroll {
+            self.no_scroll_streak = 0;
+        }
+        let frame_mv = if can_scroll && probe_scroll {
+            gpu_scroll_mv
+        } else {
+            None
+        };
+        if frame_mv.is_some() {
+            self.no_scroll_streak = 0;
+        } else if can_scroll {
+            self.no_scroll_streak = if self.no_scroll_streak >= 10 {
+                3
+            } else {
+                self.no_scroll_streak + 1
+            };
+        }
+
+        let massive_motion = !is_keyframe && dirty_tiles.len() >= (total_tiles / 6).max(12);
+        let enable_local_mv = !is_keyframe && frame_mv.is_none() && massive_motion;
+        let is_hidpi = width >= 1600 || height >= 1000;
+        let full_screen_video =
+            !is_keyframe && frame_mv.is_none() && dirty_tiles.len() * 2 >= total_tiles;
+
+        let quality = quality.clamp(20, 95);
+        if !is_hidpi || !massive_motion {
+            self.in_half_res = false;
+        } else if quality <= 56 || (full_screen_video && quality <= 68) {
+            self.in_half_res = true;
+        } else if quality >= 68 && !full_screen_video {
+            self.in_half_res = false;
+        }
+        let prefer_half_res = self.in_half_res;
+
+        if !is_hidpi || !massive_motion {
+            self.in_quarter_res = false;
+        } else if quality <= 28 {
+            self.in_quarter_res = true;
+        } else if quality >= 40 {
+            self.in_quarter_res = false;
+        }
+        let prefer_quarter_res = self.in_quarter_res;
+
+        let scale: u32 = if prefer_quarter_res {
+            4
+        } else if prefer_half_res {
+            2
+        } else {
+            1
+        };
+        let luma_q = build_quant_table(&BASE_LUMA_QUANT, quality);
+        let chroma_q = build_quant_table(&BASE_CHROMA_QUANT, quality);
+
+        let dirty_tile_count = dirty_tiles.len();
+        self.scratch_packet.clear();
+        self.scratch_packet.push(PACKET_VERSION);
+        let mut pkt_flags = 0u8;
+        if is_keyframe {
+            pkt_flags |= FLAG_KEYFRAME;
+        }
+        if frame_mv.is_some() {
+            pkt_flags |= FLAG_FRAME_MV;
+        }
+        self.scratch_packet.push(pkt_flags);
+        self.scratch_packet.push(quality);
+        self.scratch_packet.push(0); // 0 copy rects
+        if let Some((mv_dx, mv_dy)) = frame_mv {
+            self.scratch_packet.extend_from_slice(&mv_dx.to_le_bytes());
+            self.scratch_packet.extend_from_slice(&mv_dy.to_le_bytes());
+        }
+        self.scratch_packet
+            .extend_from_slice(&(dirty_tile_count as u32).to_le_bytes());
+
+        let mut cmds = Vec::with_capacity(dirty_tile_count);
+        let mut num_lossy_opaque = 0usize;
+        let mut num_extract = 0usize;
+        for &(_tx, _ty, x0, y0, tw, th, tidx, sflags, _solid_px) in &dirty_tiles {
+            let wants_lossy = !is_keyframe
+                && (self.tiles[tidx].motion_streak >= MOTION_STREAK_THRESHOLD || massive_motion);
+            let is_opaque = (sflags & vram::SCAN_FLAG_OPAQUE) != 0;
+            let is_solid = (sflags & vram::SCAN_FLAG_SOLID) != 0;
+
+            let mut cflags = 0u32;
+            if wants_lossy {
+                cflags |= vram::CMD_FLAG_WANTS_LOSSY;
+            }
+            if is_opaque {
+                cflags |= vram::CMD_FLAG_OPAQUE;
+            }
+            if is_solid {
+                cflags |= vram::CMD_FLAG_SOLID;
+            }
+
+            let (batch_idx, extract_idx) = if wants_lossy && is_opaque {
+                let b = num_lossy_opaque as u32;
+                num_lossy_opaque += 1;
+                (b, u32::MAX)
+            } else if !wants_lossy && is_solid {
+                (u32::MAX, u32::MAX)
+            } else {
+                let e = num_extract as u32;
+                num_extract += 1;
+                (u32::MAX, e)
+            };
+
+            cmds.push(vram::VramTileCmd {
+                x0,
+                y0,
+                tw,
+                th,
+                flags: cflags,
+                batch_idx,
+                extract_idx,
+                _pad: 0,
+            });
+        }
+
+        let mut alpha_scatter_rects: Vec<vram::TileRect> = Vec::new();
+        let mut alpha_scatter_pixels: Vec<u8> = Vec::new();
+        let tiles_slice = &mut self.tiles;
+        let out_buf = &mut self.scratch_packet;
+
+        let pass_res = self.vram_state.as_mut().unwrap().execute_encode_pass(
+            &cmds,
+            num_lossy_opaque,
+            num_extract,
+            scale,
+            frame_mv,
+            enable_local_mv,
+            &luma_q,
+            &chroma_q,
+            |mv_res, qblocks_flat, extract_bytes| {
+                let unpack_blk = |words: &[i32]| -> [i32; 64] {
+                    let mut blk = [0i32; 64];
+                    for i in 0..32 {
+                        let w = words[i] as u32;
+                        blk[i * 2] = (w & 0xFFFF) as u16 as i16 as i32;
+                        blk[i * 2 + 1] = (w >> 16) as u16 as i16 as i32;
+                    }
+                    blk
+                };
+
+                let mut any_lossy = false;
+                let mut any_local_mv = false;
+                let mut plane_blks = [[0i32; 64]; 64];
+
+                for (cmd_idx, &(tx, ty, x0, y0, tw, th, tidx, _sflags, solid_px)) in
+                    dirty_tiles.iter().enumerate()
+                {
+                    let cmd = cmds[cmd_idx];
+                    let mv_word = mv_res[cmd_idx];
+                    if (mv_word & vram::MV_RESULT_SKIP) != 0 {
+                        out_buf.extend_from_slice(&(tx as u16).to_le_bytes());
+                        out_buf.extend_from_slice(&(ty as u16).to_le_bytes());
+                        out_buf.push(MODE_MV_SKIP);
+                        tiles_slice[tidx].is_lossy = false;
+                        continue;
+                    }
+
+                    let wants_lossy = (cmd.flags & vram::CMD_FLAG_WANTS_LOSSY) != 0;
+                    let is_opaque = (cmd.flags & vram::CMD_FLAG_OPAQUE) != 0;
+                    let is_solid = (cmd.flags & vram::CMD_FLAG_SOLID) != 0;
+
+                    if wants_lossy && is_opaque {
+                        any_lossy = true;
+                        tiles_slice[tidx].is_lossy = true;
+                        out_buf.extend_from_slice(&(tx as u16).to_le_bytes());
+                        out_buf.extend_from_slice(&(ty as u16).to_le_bytes());
+
+                        let batch_idx = cmd.batch_idx as usize;
+                        let q_tile_base = batch_idx * 3073;
+                        let use_inter = qblocks_flat[q_tile_base] != 0;
+                        let q_blocks_base = q_tile_base + 1;
+
+                        let mv_flag = (mv_word & 0xFF) as u8;
+                        let (mode_inter, mode_intra, scaled_w, scaled_h) = match scale {
+                            4 => (
+                                MODE_DCT_QUARTER_INTER,
+                                MODE_DCT_QUARTER_INTRA,
+                                (tw as usize).div_ceil(4),
+                                (th as usize).div_ceil(4),
+                            ),
+                            2 => (
+                                MODE_DCT_HALF_INTER,
+                                MODE_DCT_HALF_INTRA,
+                                (tw as usize).div_ceil(2),
+                                (th as usize).div_ceil(2),
+                            ),
+                            _ => (MODE_DCT_INTER, MODE_DCT_INTRA, tw as usize, th as usize),
+                        };
+                        let luma_bx = scaled_w.div_ceil(8);
+                        let luma_by = scaled_h.div_ceil(8);
+                        let chroma_bx = scaled_w.div_ceil(2).div_ceil(8);
+                        let chroma_by = scaled_h.div_ceil(2).div_ceil(8);
+                        let num_luma = luma_bx * luma_by;
+                        let num_chroma = chroma_bx * chroma_by;
+
+                        if use_inter {
+                            out_buf.push(mode_inter | mv_flag);
+                            if mv_flag == MODE_FLAG_LOCAL_MV {
+                                let ldx = ((mv_word >> 8) & 0xFF) as u8;
+                                let ldy = ((mv_word >> 16) & 0xFF) as u8;
+                                out_buf.push(ldx);
+                                out_buf.push(ldy);
+                                any_local_mv = true;
+                            }
+                        } else {
+                            out_buf.push(mode_intra);
+                        }
+
+                        let mut seq_blk = 0usize;
+                        for blk_dst in plane_blks.iter_mut().take(num_luma) {
+                            let s = q_blocks_base + seq_blk * 32;
+                            *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
+                            seq_blk += 1;
+                        }
+                        encode_plane_qblocks(
+                            &mut plane_blks[..num_luma],
+                            luma_bx,
+                            luma_by,
+                            out_buf,
+                        );
+
+                        for blk_dst in plane_blks.iter_mut().take(num_chroma) {
+                            let s = q_blocks_base + seq_blk * 32;
+                            *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
+                            seq_blk += 1;
+                        }
+                        encode_plane_qblocks(
+                            &mut plane_blks[..num_chroma],
+                            chroma_bx,
+                            chroma_by,
+                            out_buf,
+                        );
+
+                        for blk_dst in plane_blks.iter_mut().take(num_chroma) {
+                            let s = q_blocks_base + seq_blk * 32;
+                            *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
+                            seq_blk += 1;
+                        }
+                        encode_plane_qblocks(
+                            &mut plane_blks[..num_chroma],
+                            chroma_bx,
+                            chroma_by,
+                            out_buf,
+                        );
+                    } else if !wants_lossy && is_solid {
+                        out_buf.extend_from_slice(&(tx as u16).to_le_bytes());
+                        out_buf.extend_from_slice(&(ty as u16).to_le_bytes());
+                        out_buf.push(MODE_LOSSLESS_RAW);
+                        let px_bytes = solid_px.to_le_bytes();
+                        let count = (tw as usize) * (th as usize);
+                        out_buf.reserve(count * 4);
+                        for _ in 0..count {
+                            out_buf.extend_from_slice(&px_bytes);
+                        }
+                        tiles_slice[tidx].is_lossy = false;
+                    } else if !wants_lossy {
+                        out_buf.extend_from_slice(&(tx as u16).to_le_bytes());
+                        out_buf.extend_from_slice(&(ty as u16).to_le_bytes());
+                        let ex_base = (cmd.extract_idx as usize) * 32768;
+                        let cur_tile = &extract_bytes[ex_base..ex_base + 16384];
+                        let ref_tile = &extract_bytes[ex_base + 16384..ex_base + 32768];
+                        write_lossless_tile_extracted(
+                            cur_tile,
+                            ref_tile,
+                            tw,
+                            th,
+                            is_keyframe,
+                            out_buf,
+                        );
+                        tiles_slice[tidx].is_lossy = false;
+                    } else {
+                        // Semi-transparent lossy alpha tile: encode on 64x64 local buffer with zero-MV
+                        let ex_base = (cmd.extract_idx as usize) * 32768;
+                        let cur_tile = &extract_bytes[ex_base..ex_base + 16384];
+                        let mut ref_local = [0u8; 16384];
+                        ref_local.copy_from_slice(&extract_bytes[ex_base + 16384..ex_base + 32768]);
+                        let mut dummy_track = [tiles_slice[tidx]];
+                        let mut local_lossy = false;
+                        let mut local_mv_unused = false;
+                        encode_tile_batch(
+                            &mut ref_local,
+                            None,
+                            cur_tile,
+                            &mut dummy_track,
+                            64,
+                            64,
+                            0,
+                            0,
+                            &[(tx, ty, 0, 0, tw, th, 0)],
+                            false,
+                            massive_motion,
+                            prefer_half_res,
+                            prefer_quarter_res,
+                            None,
+                            &luma_q,
+                            &chroma_q,
+                            out_buf,
+                            &mut local_lossy,
+                            &mut local_mv_unused,
+                        );
+                        any_lossy |= local_lossy;
+                        tiles_slice[tidx].is_lossy = dummy_track[0].is_lossy;
+                        alpha_scatter_rects.push(vram::TileRect { x0, y0, tw, th });
+                        alpha_scatter_pixels.extend_from_slice(&ref_local);
+                    }
+                }
+                (any_lossy, any_local_mv)
+            },
+        );
+
+        let (used_lossy, used_local_mv) = pass_res.context("VRAM SmartTile encode pass failed")?;
+
+        if !alpha_scatter_rects.is_empty() {
+            self.vram_state
+                .as_mut()
+                .unwrap()
+                .scatter_recon_tiles(&alpha_scatter_rects, &alpha_scatter_pixels);
+        }
+
+        if used_local_mv {
+            self.scratch_packet[1] |= FLAG_PREV_REF;
+        }
+
+        let payload = compress_packet_adaptive(&self.scratch_packet, used_lossy);
+        Ok(SmartTilePacket {
+            is_keyframe,
+            used_lossy,
+            had_copy_rect: frame_mv.is_some(),
+            dirty_tiles: dirty_tile_count,
+            payload,
+        })
+    }
+
     /// Encode a progressive lossless refinement chunk for up to `max_tiles` lossy tiles,
     /// stopping early once the compressed packet approaches `max_compressed_bytes`.
     /// Returns `None` if all tiles are already lossless.
@@ -2305,6 +2784,113 @@ impl SmartTileEncoder {
         let byte_budget = max_compressed_bytes.max(16 * 1024);
         let cols = self.width.div_ceil(TILE_SIZE) as usize;
         let rows = self.height.div_ceil(TILE_SIZE) as usize;
+
+        if self.vram_resident {
+            let vram_state = self.vram_state.as_mut()?;
+            let mut candidates = Vec::with_capacity(tile_limit);
+            let mut rects = Vec::with_capacity(tile_limit);
+            'collect: for ty in 0..rows {
+                let y0 = (ty as u32) * TILE_SIZE;
+                let th = (self.height - y0).min(TILE_SIZE);
+                for tx in 0..cols {
+                    let tidx = ty * cols + tx;
+                    if !self.tiles[tidx].is_lossy {
+                        continue;
+                    }
+                    let x0 = (tx as u32) * TILE_SIZE;
+                    let tw = (self.width - x0).min(TILE_SIZE);
+                    candidates.push((tx, ty, tw, th, tidx));
+                    rects.push(vram::TileRect { x0, y0, tw, th });
+                    if candidates.len() >= tile_limit {
+                        break 'collect;
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                return None;
+            }
+
+            self.scratch_packet.clear();
+            self.scratch_packet.push(PACKET_VERSION);
+            self.scratch_packet.push(0);
+            self.scratch_packet.push(80);
+            self.scratch_packet.push(0);
+            self.scratch_packet.extend_from_slice(&0u32.to_le_bytes());
+
+            let scratch_packet = &mut self.scratch_packet;
+            let tiles_slice = &mut self.tiles;
+            let mut refresh_count = 0usize;
+            let mut ready_payload: Option<Vec<u8>> = None;
+
+            vram_state.gather_refresh_tiles(&rects, |extract_bytes| {
+                let mut next_check_raw_len = byte_budget;
+                let mut residual_samples =
+                    Vec::with_capacity((TILE_SIZE as usize) * (TILE_SIZE as usize) * 4);
+                let mut ref_local = [0u8; 16384];
+
+                for (idx, &(tx, ty, tw, th, tidx)) in candidates.iter().enumerate() {
+                    let ex_base = idx * 32768;
+                    let cur_tile = &extract_bytes[ex_base..ex_base + 16384];
+                    ref_local.copy_from_slice(&extract_bytes[ex_base + 16384..ex_base + 32768]);
+
+                    scratch_packet.extend_from_slice(&(tx as u16).to_le_bytes());
+                    scratch_packet.extend_from_slice(&(ty as u16).to_le_bytes());
+                    write_lossless_refinement_tile(
+                        &mut ref_local,
+                        cur_tile,
+                        64,
+                        0,
+                        0,
+                        tw,
+                        th,
+                        &mut residual_samples,
+                        scratch_packet,
+                    );
+                    tiles_slice[tidx].is_lossy = false;
+                    tiles_slice[tidx].motion_streak = 0;
+                    refresh_count += 1;
+
+                    if scratch_packet.len() >= next_check_raw_len {
+                        scratch_packet[4..8].copy_from_slice(&(refresh_count as u32).to_le_bytes());
+                        let compressed = lz4_flex::compress_prepend_size(scratch_packet);
+                        if compressed.len() >= byte_budget {
+                            ready_payload = Some(compressed);
+                            break;
+                        }
+                        let remaining_comp = byte_budget - compressed.len();
+                        let raw_per_comp =
+                            (scratch_packet.len() / compressed.len().max(1)).clamp(1, 32);
+                        let extra_raw = (remaining_comp * raw_per_comp).max(16 * 1024);
+                        next_check_raw_len = scratch_packet.len() + extra_raw;
+                    }
+                }
+            })?;
+
+            if refresh_count == 0 {
+                return None;
+            }
+            vram_state.commit_cur_to_ref_tiles(&rects[..refresh_count]);
+            if !self.has_pending_lossless_refresh() {
+                self.in_half_res = false;
+                self.in_quarter_res = false;
+                self.no_scroll_streak = 0;
+            }
+            let payload = match ready_payload {
+                Some(p) => p,
+                None => {
+                    self.scratch_packet[4..8]
+                        .copy_from_slice(&(refresh_count as u32).to_le_bytes());
+                    lz4_flex::compress_prepend_size(&self.scratch_packet)
+                }
+            };
+            return Some(SmartTilePacket {
+                is_keyframe: false,
+                used_lossy: false,
+                had_copy_rect: false,
+                dirty_tiles: refresh_count,
+                payload,
+            });
+        }
 
         self.scratch_packet.clear();
         self.scratch_packet.push(PACKET_VERSION);
@@ -4042,6 +4628,43 @@ fn write_lossless_tile(
             let off = (y0 as usize + py) * stride + (x0 as usize) * 4;
             out.extend_from_slice(&cur_bgra[off..off + row_bytes]);
             ref_bgra[off..off + row_bytes].copy_from_slice(&cur_bgra[off..off + row_bytes]);
+        }
+    }
+}
+
+fn write_lossless_tile_extracted(
+    cur_tile_64: &[u8],
+    ref_tile_64: &[u8],
+    tw: u32,
+    th: u32,
+    force_raw: bool,
+    out: &mut Vec<u8>,
+) {
+    let stride = 64usize * 4;
+    let row_bytes = tw as usize * 4;
+    let use_xor = if force_raw {
+        false
+    } else {
+        let same = count_identical_pixels(ref_tile_64, cur_tile_64, 64, 0, 0, tw, th);
+        let total = (tw as usize) * (th as usize);
+        same * 5 >= total * 2
+    };
+
+    if use_xor {
+        out.push(MODE_LOSSLESS_XOR);
+        out.reserve(row_bytes * (th as usize));
+        for py in 0..(th as usize) {
+            let off = py * stride;
+            for b in 0..row_bytes {
+                out.push(cur_tile_64[off + b] ^ ref_tile_64[off + b]);
+            }
+        }
+    } else {
+        out.push(MODE_LOSSLESS_RAW);
+        out.reserve(row_bytes * (th as usize));
+        for py in 0..(th as usize) {
+            let off = py * stride;
+            out.extend_from_slice(&cur_tile_64[off..off + row_bytes]);
         }
     }
 }
@@ -6714,6 +7337,239 @@ mod tests {
             hdr1 & rans::RANS_MAGIC_BIT,
             0,
             "Expected lossy SmartTilePacket to select LZ4 + 4-way rANS compression"
+        );
+    }
+
+    #[test]
+    fn vram_resident_gpu_texture_encoding_is_bit_exact_and_zero_cpu_buffer() {
+        let Some(engine) = gpu::SmartTileGpuEngine::try_new_any().map(Arc::new) else {
+            eprintln!("Skipping VRAM texture test: no wgpu adapter available");
+            return;
+        };
+
+        let (crop_x, crop_y) = (16u32, 12u32);
+        let (w, h) = (1600u32, 1024u32);
+        let (tex_w, tex_h) = (w + crop_x + 8, h + crop_y + 8);
+
+        let tex = engine.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_vram_win_tex"),
+            size: wgpu::Extent3d {
+                width: tex_w,
+                height: tex_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let upload_window_to_tex = |win_bgra: &[u8]| {
+            let mut padded = vec![77u8; (tex_w * tex_h * 4) as usize];
+            for y in 0..h as usize {
+                let s = y * (w as usize) * 4;
+                let d = ((crop_y as usize + y) * (tex_w as usize) + (crop_x as usize)) * 4;
+                padded[d..d + (w as usize) * 4].copy_from_slice(&win_bgra[s..s + (w as usize) * 4]);
+            }
+            engine.queue().write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &padded,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(tex_w * 4),
+                    rows_per_image: Some(tex_h),
+                },
+                wgpu::Extent3d {
+                    width: tex_w,
+                    height: tex_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+
+        let make_scene = |shift_x: i32, shift_y: i32| -> Vec<u8> {
+            let mut fb = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let idx = ((y as u32 * w + x as u32) * 4) as usize;
+                    // Top-left 128x128: solid UI header; bottom-right 64x64: translucent alpha badge
+                    if x < 128 && y < 128 {
+                        fb[idx] = 40;
+                        fb[idx + 1] = 44;
+                        fb[idx + 2] = 52;
+                        fb[idx + 3] = 255;
+                    } else if x >= (w as i32 - 64) && y >= (h as i32 - 64) {
+                        let a = 180u8;
+                        fb[idx] = (((x + shift_x) * 3) as u8).min(a);
+                        fb[idx + 1] = (((y + shift_y) * 5) as u8).min(a);
+                        fb[idx + 2] = 120u8.min(a);
+                        fb[idx + 3] = a;
+                    } else {
+                        let sx = (x + shift_x).rem_euclid(512);
+                        let sy = (y + shift_y).rem_euclid(512);
+                        fb[idx] = ((sx * 5 + sy * 3) & 0xFF) as u8;
+                        fb[idx + 1] = (((sx * 7) ^ (sy * 11)) & 0xFF) as u8;
+                        fb[idx + 2] = ((sx * 13 + sy * 17) & 0xFF) as u8;
+                        fb[idx + 3] = 255;
+                    }
+                }
+            }
+            fb
+        };
+
+        let gpu_frame = vram::GpuTextureFrame {
+            engine: Arc::clone(&engine),
+            texture: tex.clone(),
+            view,
+            crop_x,
+            crop_y,
+            width: w,
+            height: h,
+            rb_swizzle: false,
+            external_memory: false,
+        };
+
+        let assert_frames_eq = |got: &[u8], exp: &[u8], label: &str| {
+            assert_eq!(got.len(), exp.len(), "{label}: len mismatch");
+            if got != exp {
+                for i in (0..got.len()).step_by(4) {
+                    if got[i..i + 4] != exp[i..i + 4] {
+                        let px_idx = (i / 4) as u32;
+                        let x = px_idx % w;
+                        let y = px_idx / w;
+                        panic!(
+                            "{label}: first pixel mismatch at ({x}, {y}) tile=({}, {}): got={:?} exp={:?}",
+                            x / 64,
+                            y / 64,
+                            &got[i..i + 4],
+                            &exp[i..i + 4]
+                        );
+                    }
+                }
+            }
+        };
+
+        let mut enc = SmartTileEncoder::new();
+        let mut dec = SmartTileDecoder::new();
+
+        // 1. Keyframe (solid + lossless + alpha)
+        let f0 = make_scene(0, 0);
+        upload_window_to_tex(&f0);
+        let pkt0 = enc.encode_gpu_texture(&gpu_frame, 75).unwrap();
+        assert!(pkt0.is_keyframe);
+        assert_eq!(
+            enc.ref_bgra.capacity(),
+            0,
+            "CPU ref_bgra must stay unallocated"
+        );
+        assert_eq!(
+            enc.source_bgra.capacity(),
+            0,
+            "CPU source_bgra must stay unallocated"
+        );
+        let dec0 = dec.decode(w, h, &pkt0.payload).unwrap().to_vec();
+        assert_frames_eq(&dec0, &f0, "Keyframe");
+
+        // 2. Small 1-tile cursor blink update
+        let mut f_cursor = f0.clone();
+        for py in 16..32 {
+            for px in 16..24 {
+                let idx = ((py * w + px) * 4) as usize;
+                f_cursor[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        upload_window_to_tex(&f_cursor);
+        let pkt_cur = enc.encode_gpu_texture(&gpu_frame, 75).unwrap();
+        assert_eq!(pkt_cur.dirty_tiles, 1);
+        let dec_cur = dec.decode(w, h, &pkt_cur.payload).unwrap().to_vec();
+        assert_frames_eq(&dec_cur, &f_cursor, "Single-tile UI update");
+
+        // 3. Vertical scroll (+32 px) -> exercises GPU scroll detector + MV_SKIP
+        let mut f_scroll = f_cursor.clone();
+        let stride = (w * 4) as usize;
+        for y in (160..(h as usize - 96)).rev() {
+            let src = (y - 32) * stride + 128 * 4;
+            let dst = y * stride + 128 * 4;
+            let len = (w as usize - 256) * 4;
+            f_scroll.copy_within(src..src + len, dst);
+        }
+        upload_window_to_tex(&f_scroll);
+        let pkt_scr = enc.encode_gpu_texture(&gpu_frame, 75).unwrap();
+        assert!(
+            pkt_scr.had_copy_rect,
+            "Expected GPU scroll summary to detect vertical scroll"
+        );
+        let dec_scr = dec.decode(w, h, &pkt_scr.payload).unwrap().to_vec();
+        let vram_ref_scr = enc
+            .vram_state
+            .as_ref()
+            .unwrap()
+            .download_ref_bgra()
+            .unwrap();
+        assert_frames_eq(
+            &dec_scr,
+            &vram_ref_scr,
+            "Zero drift after GPU scroll encode",
+        );
+
+        // 4. Full-res (Q=75), Half-res (Q=50), and Quarter-res (Q=26) motion frames + 1/2-pel local MV!
+        let mut last_src = f_scroll;
+        for &(step, q) in &[(1, 75u8), (2, 75u8), (3, 50u8), (4, 26u8), (5, 78u8)] {
+            last_src = make_scene(step * 5, step * 3);
+            upload_window_to_tex(&last_src);
+            let pkt = enc.encode_gpu_texture(&gpu_frame, q).unwrap();
+            assert!(pkt.used_lossy);
+            assert_eq!(enc.ref_bgra.capacity(), 0);
+            assert_eq!(enc.source_bgra.capacity(), 0);
+            let dec_frame = dec.decode(w, h, &pkt.payload).unwrap().to_vec();
+            let vram_ref = enc
+                .vram_state
+                .as_ref()
+                .unwrap()
+                .download_ref_bgra()
+                .unwrap();
+            assert_frames_eq(
+                &dec_frame,
+                &vram_ref,
+                &format!("VRAM vs Decoder step={step} Q={q}"),
+            );
+        }
+
+        // 5. Progressive idle lossless refresh directly from VRAM -> 100% bit-identical to `last_src`!
+        assert!(enc.has_pending_lossless_refresh());
+        let mut chunks = 0usize;
+        let mut latest_dec = Vec::new();
+        while let Some(ref_pkt) = enc.encode_lossless_refresh(48, 256 * 1024) {
+            latest_dec = dec.decode(w, h, &ref_pkt.payload).unwrap();
+            chunks += 1;
+            assert!(chunks <= 64);
+        }
+        assert!(!enc.has_pending_lossless_refresh());
+        assert_eq!(enc.ref_bgra.capacity(), 0);
+        assert_eq!(enc.source_bgra.capacity(), 0);
+        let vram_final = enc
+            .vram_state
+            .as_ref()
+            .unwrap()
+            .download_ref_bgra()
+            .unwrap();
+        assert_frames_eq(
+            &latest_dec,
+            &last_src,
+            "Final idle lossless refresh (decoder)",
+        );
+        assert_frames_eq(
+            &vram_final,
+            &last_src,
+            "Final idle lossless refresh (VRAM ref)",
         );
     }
 }

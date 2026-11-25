@@ -19,6 +19,7 @@ type_complexity = "allow"
 
 [workspace.dependencies]
 anyhow = "1.0"
+ash = "0.38"
 bytes = "1.7"
 bytemuck = { version = "1.22", features = ["derive"] }
 calloop = "0.14"

@@ -2485,8 +2485,10 @@ name = "remotewayland-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "bytemuck",
  "bytes",
+ "libc",
  "lz4_flex",
  "pollster",
  "postcard",
