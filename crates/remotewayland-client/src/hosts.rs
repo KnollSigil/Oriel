@@ -213,8 +213,10 @@ pub fn ssh_bootstrap(
         Some(ports) => format!("0.0.0.0:{ports}"),
         None => "0.0.0.0".to_string(),
     };
+    // Bind the token to this process's TLS certificate. The fingerprint is not secret.
+    let client_fp = &crate::quic::client_identity()?.fingerprint;
     let remote_cmd = format!(
-        "{} attach --listen {} --host {}",
+        "{} attach --listen {} --host {} --client-fp {client_fp}",
         shell_escape(bin),
         shell_escape(&listen),
         shell_escape(connect_host),

@@ -19,6 +19,7 @@ lz4_flex.workspace = true
 opus.workspace = true
 pipewire.workspace = true
 quinn.workspace = true
+rcgen.workspace = true
 remotewayland-proto.workspace = true
 rustls.workspace = true
 serde.workspace = true

@@ -24,32 +24,127 @@ use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
 use crate::media::WindowVideoEncoder;
 
+/// A single-use session token waiting to be used.
+#[derive(Debug, Clone)]
+pub struct TokenGrant {
+    pub expires: Instant,
+    /// SHA-256 hex fingerprint of the client certificate the token is bound to. A bound token
+    /// is only accepted from a connection that presented that certificate, so it is useless
+    /// to anyone who learns it without also holding the client's private key.
+    pub client_fp: Option<String>,
+}
+
+/// Single-use session tokens waiting to be used, by token.
+pub type TokenMap = Arc<Mutex<HashMap<String, TokenGrant>>>;
+
 /// Holds the ephemeral TLS certificate fingerprint and single-use expiring session tokens.
 pub struct EphemeralCredentials {
     pub server_config: ServerConfig,
     pub cert_sha256_hex: String,
-    pub valid_tokens: Arc<Mutex<HashMap<String, Instant>>>,
+    pub valid_tokens: TokenMap,
 }
 
 impl EphemeralCredentials {
-    /// Add a newly minted single-use session token with the given TTL.
-    pub fn add_token(&self, token: String, ttl: Duration) {
+    /// Add a newly minted single-use session token with the given TTL, optionally bound to
+    /// a client certificate fingerprint.
+    pub fn add_token(&self, token: String, ttl: Duration, client_fp: Option<String>) {
         let now = Instant::now();
         if let Ok(mut map) = self.valid_tokens.lock() {
-            map.retain(|_, exp| *exp > now);
-            map.insert(token, now + ttl);
+            map.retain(|_, grant| grant.expires > now);
+            map.insert(
+                token,
+                TokenGrant {
+                    expires: now + ttl,
+                    client_fp: client_fp.map(|fp| fp.to_ascii_lowercase()),
+                },
+            );
         }
     }
 }
 
-/// Consume a single-use session token, returning `true` only if it existed and was not expired.
-fn consume_token(valid_tokens: &Mutex<HashMap<String, Instant>>, token: &str) -> bool {
+/// Consume a single-use session token, returning `true` only if it existed, was not expired,
+/// and, when bound to a client certificate, `presented_fp` is that certificate's fingerprint.
+/// A token presented with the wrong certificate stays valid, so whoever tried it cannot keep
+/// the client it was minted for from using it.
+fn consume_token(
+    valid_tokens: &Mutex<HashMap<String, TokenGrant>>,
+    token: &str,
+    presented_fp: Option<&str>,
+) -> bool {
     let now = Instant::now();
     let Ok(mut map) = valid_tokens.lock() else {
         return false;
     };
-    map.retain(|_, exp| *exp > now);
-    map.remove(token).is_some_and(|exp| exp > now)
+    map.retain(|_, grant| grant.expires > now);
+    let Some(grant) = map.get(token) else {
+        return false;
+    };
+    if let Some(bound) = &grant.client_fp {
+        if presented_fp != Some(bound.as_str()) {
+            return false;
+        }
+    }
+    map.remove(token);
+    true
+}
+
+/// Asks every client for a certificate without requiring one, and accepts any certificate
+/// whose handshake signature checks out: it is the client's proof that it holds the key
+/// whose fingerprint a token may be bound to. Which certificates are acceptable is decided
+/// per token by [`consume_token`], not here.
+#[derive(Debug)]
+struct AnyClientCertVerifier {
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::server::danger::ClientCertVerifier for AnyClientCertVerifier {
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
+/// SHA-256 hex fingerprint of the certificate the peer of `conn` presented, if any.
+fn peer_cert_fingerprint(conn: &quinn::Connection) -> Option<String> {
+    let identity = conn.peer_identity()?;
+    let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    certs
+        .first()
+        .map(|cert| hex_encode(&sha256_bytes(cert.as_ref())))
 }
 
 /// Generate a self-signed TLS 1.3 certificate and ephemeral session token.
@@ -65,8 +160,11 @@ pub fn generate_ephemeral_credentials(
     let digest = sha256_bytes(cert_der.as_ref());
     let cert_sha256_hex = hex_encode(&digest);
 
+    let client_verifier = Arc::new(AnyClientCertVerifier {
+        supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+    });
     let mut rustls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![cert_der], key_der)
         .context("failed to build rustls ServerConfig")?;
     rustls_config.alpn_protocols = vec![b"remotewayland/1".to_vec()];
@@ -83,7 +181,13 @@ pub fn generate_ephemeral_credentials(
     server_config.transport_config(Arc::new(transport));
 
     let mut tokens = HashMap::new();
-    tokens.insert(initial_token, Instant::now() + initial_ttl);
+    tokens.insert(
+        initial_token,
+        TokenGrant {
+            expires: Instant::now() + initial_ttl,
+            client_fp: None,
+        },
+    );
 
     Ok(EphemeralCredentials {
         server_config,
@@ -187,7 +291,7 @@ const TAKEOVER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// State shared by every connection to this server.
 struct Shared {
-    valid_tokens: Arc<Mutex<HashMap<String, Instant>>>,
+    valid_tokens: TokenMap,
     cmd_tx: calloop::channel::Sender<CompositorCommand>,
     events: broadcast::Sender<CompositorEvent>,
     pty_mgr: Arc<crate::pty::PtyManager>,
@@ -291,7 +395,8 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         }
     };
 
-    if !consume_token(&shared.valid_tokens, &token) {
+    let client_fp = peer_cert_fingerprint(&conn);
+    if !consume_token(&shared.valid_tokens, &token, client_fp.as_deref()) {
         reject_auth(&mut send, "invalid or expired session token".into()).await?;
         return Ok(());
     }
@@ -1704,29 +1809,50 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn grant(expires: Instant, client_fp: Option<&str>) -> TokenGrant {
+        TokenGrant {
+            expires,
+            client_fp: client_fp.map(str::to_string),
+        }
+    }
+
     #[test]
     fn single_use_and_expiring_tokens() {
         let map = Mutex::new(HashMap::new());
         {
             let mut guard = map.lock().unwrap();
-            guard.insert(
-                "valid".to_string(),
-                Instant::now() + Duration::from_secs(60),
-            );
+            let later = Instant::now() + Duration::from_secs(60);
+            guard.insert("valid".to_string(), grant(later, None));
             guard.insert(
                 "expired".to_string(),
-                Instant::now() - Duration::from_secs(1),
+                grant(Instant::now() - Duration::from_secs(1), None),
             );
         }
 
-        // First use of valid token succeeds; second use fails (single-use).
-        assert!(consume_token(&map, "valid"));
-        assert!(!consume_token(&map, "valid"));
+        // First use of valid token succeeds; second use fails (single-use). An unbound token
+        // does not care whether a client certificate was presented.
+        assert!(consume_token(&map, "valid", Some("ab")));
+        assert!(!consume_token(&map, "valid", None));
 
         // Expired token is rejected and pruned.
-        assert!(!consume_token(&map, "expired"));
-        assert!(!consume_token(&map, "nonexistent"));
+        assert!(!consume_token(&map, "expired", None));
+        assert!(!consume_token(&map, "nonexistent", None));
         assert!(map.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bound_tokens_need_the_bound_certificate() {
+        let map = Mutex::new(HashMap::new());
+        let later = Instant::now() + Duration::from_secs(60);
+        map.lock()
+            .unwrap()
+            .insert("bound".to_string(), grant(later, Some("aa")));
+
+        // Wrong or missing certificate: rejected, and the token stays usable.
+        assert!(!consume_token(&map, "bound", None));
+        assert!(!consume_token(&map, "bound", Some("bb")));
+        assert!(consume_token(&map, "bound", Some("aa")));
+        assert!(!consume_token(&map, "bound", Some("aa")));
     }
 
     #[test]

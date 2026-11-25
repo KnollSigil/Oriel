@@ -4,7 +4,7 @@ use std::fs::{self, Permissions};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -17,7 +17,7 @@ use remotewayland_proto::{
     CLOSE_CODE_SUPERSEDED,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -26,6 +26,39 @@ use tracing::{info, warn};
 use crate::audio::{start_mic_capture, AudioPlaybackSink};
 use crate::media::WindowVideoDecoder;
 use crate::window::{ClientUiEvent, UiSender};
+
+/// This client process's TLS identity: a self-signed certificate made at startup whose
+/// private key never leaves memory. Its fingerprint goes to `remotewayland-server attach
+/// --client-fp`, which binds the minted token to it, so a token that leaks (through a
+/// process list, a log, a shoulder) is useless without this process's key.
+pub struct ClientIdentity {
+    cert: CertificateDer<'static>,
+    key: PrivatePkcs8KeyDer<'static>,
+    /// SHA-256 hex fingerprint of `cert`.
+    pub fingerprint: String,
+}
+
+/// The process-wide client identity, generated on first use.
+pub fn client_identity() -> Result<&'static ClientIdentity> {
+    static IDENTITY: OnceLock<ClientIdentity> = OnceLock::new();
+    if let Some(identity) = IDENTITY.get() {
+        return Ok(identity);
+    }
+    let cert = rcgen::generate_simple_self_signed(vec!["remotewayland-client.local".to_string()])
+        .context("failed to generate the client TLS certificate")?;
+    let cert_der = CertificateDer::from(cert.cert);
+    let fingerprint = Sha256::digest(cert_der.as_ref())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let identity = ClientIdentity {
+        key: PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+        cert: cert_der,
+        fingerprint,
+    };
+    // Another thread may have won the race; either identity is fine, but use the stored one.
+    Ok(IDENTITY.get_or_init(|| identity))
+}
 
 #[derive(Debug)]
 struct PinnedCertVerifier {
@@ -131,10 +164,15 @@ pub async fn connect_and_auth(
     VideoCodec,
 )> {
     let verifier = Arc::new(PinnedCertVerifier::new(fingerprint_sha256));
+    let identity = client_identity()?;
     let mut rustls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(
+            vec![identity.cert.clone()],
+            PrivateKeyDer::Pkcs8(identity.key.clone_key()),
+        )
+        .context("failed to set the client TLS certificate")?;
     rustls_config.alpn_protocols = vec![b"remotewayland/1".to_vec()];
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)

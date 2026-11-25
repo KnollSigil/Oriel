@@ -2467,6 +2467,7 @@ dependencies = [
  "opus",
  "pipewire",
  "quinn",
+ "rcgen",
  "remotewayland-proto",
  "rustls",
  "serde",

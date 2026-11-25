@@ -88,6 +88,11 @@ enum ServerSubcommand {
         #[arg(long)]
         no_xwayland: bool,
 
+        /// Bind the printed URI's token to the client certificate with this SHA-256 hex
+        /// fingerprint: only a client holding that certificate's private key can use it.
+        #[arg(long, value_name = "SHA256", value_parser = parse_cert_fingerprint)]
+        client_fp: Option<String>,
+
         #[command(flatten)]
         gpu: GpuArgs,
     },
@@ -127,11 +132,31 @@ impl GpuArgs {
     }
 }
 
+/// What `attach` asks the daemon for over the control socket, as one JSON line.
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlSockRequest {
+    /// Client certificate fingerprint to bind the minted token to.
+    #[serde(default)]
+    client_fp: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlSockInfo {
     port: u16,
     fp: String,
     token: String,
+}
+
+/// How long the daemon waits for `attach`'s request line.
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A SHA-256 certificate fingerprint: 64 hex digits, normalized to lowercase.
+fn parse_cert_fingerprint(s: &str) -> Result<String, String> {
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(s.to_ascii_lowercase())
+    } else {
+        Err("expected a SHA-256 fingerprint of 64 hex digits".into())
+    }
 }
 
 fn main() -> Result<()> {
@@ -158,10 +183,12 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
         listen,
         host,
         no_xwayland,
+        client_fp,
         gpu,
     }) = cli.subcommand
     {
-        return run_attach(&host_runtime_dir, listen, host, no_xwayland, &gpu).await;
+        let request = ControlSockRequest { client_fp };
+        return run_attach(&host_runtime_dir, listen, host, no_xwayland, &gpu, &request).await;
     }
 
     tracing_subscriber::fmt()
@@ -312,25 +339,49 @@ async fn run_control_socket(
     info!("run `remotewayland-server attach --host <addr>` to print a connect URI");
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        let token = match generate_ephemeral_token() {
-            Ok(t) => t,
-            Err(err) => {
-                warn!(error = %err, "failed to generate CSPRNG session token");
-                continue;
+        let (stream, _) = listener.accept().await?;
+        let creds = Arc::clone(&creds);
+        tokio::spawn(async move {
+            if let Err(err) = answer_control_request(stream, port, &creds).await {
+                warn!(error = %err, "control socket request failed");
             }
-        };
-        creds.add_token(token.clone(), ATTACH_TOKEN_TTL);
-        let info = ControlSockInfo {
-            port,
-            fp: creds.cert_sha256_hex.clone(),
-            token,
-        };
-        if let Ok(mut json) = serde_json::to_string(&info) {
-            json.push('\n');
-            let _ = stream.write_all(json.as_bytes()).await;
-        }
+        });
     }
+}
+
+/// Mint a token for one `attach` on the control socket and send it the connect details.
+async fn answer_control_request(
+    stream: UnixStream,
+    port: u16,
+    creds: &quic::EphemeralCredentials,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let n = tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .context("timed out waiting for the control socket request")?
+        .context("failed to read the control socket request")?;
+    if n == 0 {
+        // A server checking whether this socket is live connects and leaves.
+        return Ok(());
+    }
+    let request: ControlSockRequest =
+        serde_json::from_str(line.trim()).context("invalid control socket request")?;
+    let client_fp = match request.client_fp {
+        Some(fp) => Some(parse_cert_fingerprint(&fp).map_err(anyhow::Error::msg)?),
+        None => None,
+    };
+    let token = generate_ephemeral_token().context("failed to generate CSPRNG session token")?;
+    creds.add_token(token.clone(), ATTACH_TOKEN_TTL, client_fp);
+    let info = ControlSockInfo {
+        port,
+        fp: creds.cert_sha256_hex.clone(),
+        token,
+    };
+    let mut json = serde_json::to_string(&info)?;
+    json.push('\n');
+    reader.get_mut().write_all(json.as_bytes()).await?;
+    Ok(())
 }
 
 async fn run_attach(
@@ -339,9 +390,10 @@ async fn run_attach(
     host: Option<String>,
     no_xwayland: bool,
     gpu: &GpuArgs,
+    request: &ControlSockRequest,
 ) -> Result<()> {
     let sock_path = session::control_socket_path(host_runtime_dir);
-    if let Ok(info) = query_control_socket(&sock_path).await {
+    if let Ok(info) = query_control_socket(&sock_path, request).await {
         if let Some(range) = listen.ports.filter(|r| !r.contains(info.port)) {
             anyhow::bail!(
                 "a RemoteWayland server is already running for this user on UDP port {}, \
@@ -444,7 +496,7 @@ async fn run_attach(
 
     for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Ok(info) = query_control_socket(&sock_path).await {
+        if let Ok(info) = query_control_socket(&sock_path, request).await {
             print_attach_uri(&host, listen, &info);
             return Ok(());
         }
@@ -479,8 +531,14 @@ fn daemon_startup_error(log_path: &Path, log_start: u64) -> Option<String> {
     (!err.is_empty()).then(|| err.to_string())
 }
 
-async fn query_control_socket(path: &Path) -> Result<ControlSockInfo> {
-    let stream = UnixStream::connect(path).await?;
+async fn query_control_socket(
+    path: &Path,
+    request: &ControlSockRequest,
+) -> Result<ControlSockInfo> {
+    let mut stream = UnixStream::connect(path).await?;
+    let mut json = serde_json::to_string(request)?;
+    json.push('\n');
+    stream.write_all(json.as_bytes()).await?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
