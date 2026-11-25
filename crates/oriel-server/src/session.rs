@@ -208,12 +208,13 @@ impl SessionGuard {
             .ok()
             .filter(|s| !s.trim().is_empty());
         let detected_backend = detect_portal_backend(inherited_desktop.as_deref());
-        let xdg_current_desktop = inherited_desktop.or_else(|| {
+        let base_desktop = inherited_desktop.or_else(|| {
             detected_backend.as_ref().map(|b| match b {
                 PortalBackend::Kde(_) => "KDE".to_string(),
                 PortalBackend::Gtk(_) => "GNOME".to_string(),
             })
         });
+        let xdg_current_desktop = Some(session_desktop_names(base_desktop.as_deref()));
         let inherited_gtk_modules = std::env::var("GTK_MODULES").ok();
         let gtk_modules = build_gtk_modules(
             inherited_gtk_modules.as_deref(),
@@ -648,6 +649,27 @@ fn find_gtk_portal_backend() -> Option<PathBuf> {
     ])
 }
 
+/// `XDG_CURRENT_DESKTOP` for apps: Oriel's own name first, so `.desktop` entries and apps
+/// can target it, then the host desktop (`base`, itself a `:`-separated list) whose
+/// platform integration (Qt/GTK themes) the session imitates.
+fn session_desktop_names(base: Option<&str>) -> String {
+    let mut names = vec![crate::apps::DESKTOP_NAME];
+    names.extend(
+        base.unwrap_or("")
+            .split(':')
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(crate::apps::DESKTOP_NAME)),
+    );
+    names.join(":")
+}
+
+/// Whether the `:`-separated desktop list `desktops` names `name` (ignoring case).
+fn desktop_list_has(desktops: &str, name: &str) -> bool {
+    desktops
+        .split(':')
+        .any(|d| d.trim().eq_ignore_ascii_case(name))
+}
+
 fn detect_portal_backend(preferred_desktop: Option<&str>) -> Option<PortalBackend> {
     let kde = find_kde_portal_backend();
     let gtk = find_gtk_portal_backend();
@@ -899,7 +921,7 @@ fn sync_dbus_activation_env() {
     }
     if let Some(ref desk) = info.xdg_current_desktop {
         vars.push("XDG_CURRENT_DESKTOP");
-        if desk.eq_ignore_ascii_case("kde") {
+        if desktop_list_has(desk, "kde") {
             vars.push("QT_QPA_PLATFORMTHEME");
         }
     }
@@ -1943,7 +1965,7 @@ pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
             }
             if let Some(desk) = &info.xdg_current_desktop {
                 cmd.env("XDG_CURRENT_DESKTOP", desk);
-                if desk.eq_ignore_ascii_case("kde")
+                if desktop_list_has(desk, "kde")
                     && std::env::var_os("QT_QPA_PLATFORMTHEME").is_none()
                 {
                     cmd.env("QT_QPA_PLATFORMTHEME", "kde");
@@ -1984,6 +2006,18 @@ pub fn apply_session_env(cmd: &mut Command, wayland_override: Option<&OsStr>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_desktop_names_puts_oriel_first_and_keeps_host_desktop() {
+        assert_eq!(session_desktop_names(None), "ORIEL");
+        assert_eq!(session_desktop_names(Some("KDE")), "ORIEL:KDE");
+        assert_eq!(
+            session_desktop_names(Some("Oriel:ubuntu:GNOME")),
+            "ORIEL:ubuntu:GNOME"
+        );
+        assert!(desktop_list_has("ORIEL:KDE", "kde"));
+        assert!(!desktop_list_has("ORIEL:GNOME", "kde"));
+    }
 
     struct TestTempDir(PathBuf);
 

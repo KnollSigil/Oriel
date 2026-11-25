@@ -8,6 +8,10 @@ use oriel_proto::RemoteAppEntry;
 
 const MAX_ICON_BYTES: usize = 256 * 1024;
 
+/// Oriel's desktop name: first entry of apps' `XDG_CURRENT_DESKTOP`, and the name matched
+/// against `.desktop` files' `OnlyShowIn=`/`NotShowIn=` lists (ignoring case).
+pub const DESKTOP_NAME: &str = "ORIEL";
+
 /// Scan standard XDG `.desktop` directories and return sorted `RemoteAppEntry` items.
 pub fn discover_apps() -> Vec<RemoteAppEntry> {
     let app_dirs = xdg_application_dirs();
@@ -141,6 +145,22 @@ fn parse_desktop_content(content: &str, id: &str, icon_dirs: &[PathBuf]) -> Opti
     {
         return None;
     }
+    // `OnlyShowIn=` restricts an entry to the listed desktops (an empty list restricts
+    // nothing); `NotShowIn=` hides it on the listed ones.
+    let lists_us = |key: &str| {
+        fields.get(key).map(|s| {
+            let names = parse_semicolon_list(s);
+            let ours = names.iter().any(|d| d.eq_ignore_ascii_case(DESKTOP_NAME));
+            (names.is_empty(), ours)
+        })
+    };
+    if let Some((false, false)) = lists_us("OnlyShowIn") {
+        return None;
+    }
+    if let Some((_, true)) = lists_us("NotShowIn") {
+        return None;
+    }
+
     let terminal = fields.get("Terminal").map(|s| s.as_str()) == Some("true");
 
     let name = fields.get("Name")?.trim().to_string();
@@ -277,9 +297,29 @@ mod tests {
         assert!(!app.terminal);
 
         let tui = "[Desktop Entry]\nType=Application\nName=htop\nExec=htop\nTerminal=true\n";
-        assert!(parse_desktop_content(tui, "htop.desktop", &[]).unwrap().terminal);
+        assert!(
+            parse_desktop_content(tui, "htop.desktop", &[])
+                .unwrap()
+                .terminal
+        );
 
         let hidden = "[Desktop Entry]\nType=Application\nName=Hidden\nExec=true\nNoDisplay=true\n";
         assert!(parse_desktop_content(hidden, "hidden.desktop", &[]).is_none());
+    }
+
+    #[test]
+    fn parse_desktop_content_honors_only_show_in_and_not_show_in() {
+        let shown = |line: &str| {
+            let content =
+                format!("[Desktop Entry]\nType=Application\nName=App\nExec=app\n{line}\n");
+            parse_desktop_content(&content, "a.desktop", &[]).is_some()
+        };
+        assert!(!shown("OnlyShowIn=KDE;"));
+        assert!(shown("OnlyShowIn=GNOME;ORIEL;"));
+        assert!(shown("OnlyShowIn=Oriel;"));
+        assert!(shown("OnlyShowIn="));
+        assert!(!shown("NotShowIn=KDE;ORIEL;"));
+        assert!(shown("NotShowIn=KDE;"));
+        assert!(shown("NotShowIn="));
     }
 }
