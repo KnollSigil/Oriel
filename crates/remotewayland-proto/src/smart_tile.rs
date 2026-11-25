@@ -1943,6 +1943,30 @@ struct TileTrack {
     is_lossy: bool,
 }
 
+/// Per tile (row-major, `cols` x `rows`), whether any of the `rects` `(x, y, w, h)` touches it.
+fn damaged_tile_mask(
+    rects: &[(u32, u32, u32, u32)],
+    width: u32,
+    height: u32,
+    cols: usize,
+    rows: usize,
+) -> Vec<bool> {
+    let mut mask = vec![false; cols * rows];
+    for &(x, y, w, h) in rects {
+        if w == 0 || h == 0 || x >= width || y >= height {
+            continue;
+        }
+        let x1 = x.saturating_add(w).min(width);
+        let y1 = y.saturating_add(h).min(height);
+        let (tx0, tx1) = ((x / TILE_SIZE) as usize, ((x1 - 1) / TILE_SIZE) as usize);
+        let (ty0, ty1) = ((y / TILE_SIZE) as usize, ((y1 - 1) / TILE_SIZE) as usize);
+        for ty in ty0..=ty1 {
+            mask[ty * cols + tx0..=ty * cols + tx1].fill(true);
+        }
+    }
+    mask
+}
+
 /// Output of `SmartTileEncoder::encode` or `encode_lossless_refresh`.
 pub struct SmartTilePacket {
     pub is_keyframe: bool,
@@ -2038,6 +2062,21 @@ impl SmartTileEncoder {
 
     /// Encode a new `BGRA` frame at the given DCT quality (`1..=100`).
     pub fn encode(&mut self, width: u32, height: u32, bgra: &[u8], quality: u8) -> SmartTilePacket {
+        self.encode_with_damage(width, height, bgra, quality, None)
+    }
+
+    /// Like [`Self::encode`], given which pixels changed since the previous frame passed to this
+    /// encoder: `damage` rectangles `(x, y, w, h)`, or `None` for anywhere. Tiles outside the
+    /// damage are taken as unchanged without comparing them, so damage that misses a change
+    /// leaves the client showing stale pixels until the tile is damaged again.
+    pub fn encode_with_damage(
+        &mut self,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+        quality: u8,
+        damage: Option<&[(u32, u32, u32, u32)]>,
+    ) -> SmartTilePacket {
         let expected_len = (width as usize) * (height as usize) * 4;
         assert_eq!(bgra.len(), expected_len, "BGRA buffer size mismatch");
 
@@ -2081,6 +2120,9 @@ impl SmartTileEncoder {
 
         // 1. Identify dirty 64x64 tiles and update per-tile motion streaks.
         let source_valid = !is_keyframe && self.source_bgra.len() == expected_len;
+        let damaged = damage
+            .filter(|_| !is_keyframe)
+            .map(|rects| damaged_tile_mask(rects, width, height, cols, rows));
         let mut dirty_tiles = Vec::new();
         for ty in 0..rows {
             let y0 = (ty as u32) * TILE_SIZE;
@@ -2098,7 +2140,9 @@ impl SmartTileEncoder {
                 } else {
                     &self.ref_bgra
                 };
-                let dirty = is_keyframe || !tile_equals(cmp_base, bgra, width, x0, y0, tw, th);
+                let maybe_changed = damaged.as_ref().is_none_or(|mask| mask[tidx]);
+                let dirty = is_keyframe
+                    || (maybe_changed && !tile_equals(cmp_base, bgra, width, x0, y0, tw, th));
                 if dirty {
                     let tr = &mut self.tiles[tidx];
                     if is_keyframe {
@@ -5921,6 +5965,61 @@ impl SmartTileDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damaged_tile_mask_marks_touched_tiles() {
+        // 3x2 tiles over a 150x100 frame.
+        let mask = damaged_tile_mask(&[(60, 10, 10, 10), (140, 90, 50, 50)], 150, 100, 3, 2);
+        assert_eq!(mask, vec![true, true, false, false, false, true]);
+        assert_eq!(damaged_tile_mask(&[], 150, 100, 3, 2), vec![false; 6]);
+        assert_eq!(
+            damaged_tile_mask(&[(500, 500, 10, 10), (0, 0, 0, 10)], 150, 100, 3, 2),
+            vec![false; 6]
+        );
+    }
+
+    #[test]
+    fn encode_with_damage_compares_only_damaged_tiles() {
+        let (w, h) = (256u32, 128u32);
+        let mut enc = SmartTileEncoder::new();
+        let mut dec = SmartTileDecoder::new();
+        let mut frame = vec![0x40u8; (w * h * 4) as usize];
+        let key = enc.encode_with_damage(w, h, &frame, 90, Some(&[]));
+        assert!(key.is_keyframe, "damage never skips a keyframe's tiles");
+        assert_eq!(key.dirty_tiles, 8);
+        dec.decode(w, h, &key.payload).unwrap();
+
+        let paint = |frame: &mut [u8], x: u32, y: u32, v: u8| {
+            let i = ((y * w + x) * 4) as usize;
+            frame[i..i + 4].copy_from_slice(&[v, v, v, 0xff]);
+        };
+        // Two tiles change; damage names one of them and an unchanged one.
+        paint(&mut frame, 10, 10, 0x90);
+        paint(&mut frame, 200, 100, 0x90);
+        let pkt = enc.encode_with_damage(w, h, &frame, 90, Some(&[(0, 0, 20, 20), (70, 70, 4, 4)]));
+        assert!(!pkt.is_keyframe);
+        assert_eq!(pkt.dirty_tiles, 1);
+        let out = dec.decode(w, h, &pkt.payload).unwrap();
+        assert_eq!(
+            &out[((10 * w + 10) * 4) as usize..][..4],
+            &[0x90, 0x90, 0x90, 0xff]
+        );
+        // The undamaged change is trusted away, as a compositor would.
+        assert_eq!(&out[((100 * w + 200) * 4) as usize..][..4], &[0x40; 4]);
+
+        // Full damage finds it.
+        let pkt = enc.encode_with_damage(w, h, &frame, 90, None);
+        assert_eq!(pkt.dirty_tiles, 1);
+        let out = dec.decode(w, h, &pkt.payload).unwrap();
+        assert_eq!(
+            &out[((100 * w + 200) * 4) as usize..][..4],
+            &[0x90, 0x90, 0x90, 0xff]
+        );
+
+        // No damage: nothing is encoded.
+        let pkt = enc.encode_with_damage(w, h, &frame, 90, Some(&[]));
+        assert_eq!(pkt.dirty_tiles, 0);
+    }
 
     #[test]
     fn dct_idct_8x8_roundtrip_is_accurate() {

@@ -10,6 +10,7 @@ use remotewayland_proto::smart_tile::{
 };
 use remotewayland_proto::VideoCodec;
 
+use crate::damage::FrameDamage;
 use crate::gpu::FramePixels;
 
 /// An encoded video frame (keyframe or delta/tile packet).
@@ -44,9 +45,11 @@ impl WindowVideoEncoder {
         height: u32,
         pts_ns: u64,
         pixels: &FramePixels,
+        damage: &FrameDamage,
         quality: u8,
     ) -> Result<EncodedFrame> {
         match (self, pixels) {
+            // The VRAM scan compares every tile on the GPU, so damage would save it little.
             (Self::SmartTile(enc), FramePixels::Gpu(gpu_handle)) => {
                 let pkt = enc.encode_gpu_texture(&gpu_handle.as_texture_frame(), quality)?;
                 Ok(EncodedFrame {
@@ -61,7 +64,8 @@ impl WindowVideoEncoder {
                 })
             }
             (Self::SmartTile(enc), FramePixels::Cpu(bgra)) => {
-                let pkt = enc.encode(width, height, bgra, quality);
+                let rects = damage.clipped_rects(width, height);
+                let pkt = enc.encode_with_damage(width, height, bgra, quality, rects.as_deref());
                 Ok(EncodedFrame {
                     pts_ns,
                     width,

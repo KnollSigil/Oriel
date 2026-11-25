@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
+use crate::damage::FrameDamage;
 use crate::media::WindowVideoEncoder;
 
 /// A single-use session token waiting to be used.
@@ -1376,6 +1377,7 @@ impl EventForwarder {
                 geometry,
                 input_bounds,
                 pixels,
+                damage,
             } => {
                 let (conn, selected_codec, session_start) =
                     (&self.conn, self.selected_codec, self.session_start);
@@ -1395,6 +1397,7 @@ impl EventForwarder {
                     geometry,
                     input_bounds,
                     pixels,
+                    damage,
                 });
             }
             CompositorEvent::SnapshotTaken { .. } => {}
@@ -1462,6 +1465,8 @@ struct RawVideoFrame {
     geometry: FrameRect,
     input_bounds: FrameRect,
     pixels: crate::gpu::FramePixels,
+    /// What changed since the frame before it.
+    damage: FrameDamage,
 }
 
 struct WindowVideoPipeline {
@@ -1472,8 +1477,21 @@ struct WindowVideoPipeline {
 }
 
 impl WindowVideoPipeline {
-    fn push_frame(&self, frame: RawVideoFrame) {
-        *self.latest_frame.lock().unwrap() = Some(frame);
+    fn push_frame(&self, mut frame: RawVideoFrame) {
+        let mut latest = self.latest_frame.lock().unwrap();
+        // A frame replaced before it was encoded still counts: the next encode is relative
+        // to the frame encoded before it.
+        if let Some(skipped) = latest.take() {
+            if (skipped.width, skipped.height) == (frame.width, frame.height) {
+                let mut damage = skipped.damage;
+                damage.merge(std::mem::take(&mut frame.damage));
+                frame.damage = damage;
+            } else {
+                frame.damage = FrameDamage::Full;
+            }
+        }
+        *latest = Some(frame);
+        drop(latest);
         self.notify.notify_one();
     }
 
@@ -1554,6 +1572,8 @@ async fn run_window_video_pipeline(
     let mut last_congestion: Option<Instant> = None;
     let mut last_dims: Option<(u32, u32, u32, u32, FrameRect, FrameRect)> = None;
     let mut refining_idle = false;
+    // After a failed encode, the next frame's damage no longer describes what the encoder has.
+    let mut damage_valid = true;
     const IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
     const CONGESTION_COOLDOWN: Duration = Duration::from_millis(500);
     const LOSSY_CLIMB_BYTE_CAP: usize = 95_000;
@@ -1636,6 +1656,8 @@ async fn run_window_video_pipeline(
         let pts_ns = raw_pts.max(last_pts_ns.saturating_add(1));
 
         let encode_start = Instant::now();
+        // Rectangles the frame's damage named; `None` for full damage or an idle refresh.
+        let mut damage_rects: Option<usize> = None;
         let (logical_width, logical_height, geometry, input_bounds, frame) = if do_idle_refresh {
             // Re-check mailbox in case a new frame arrived while waiting for credit.
             if latest_frame.lock().unwrap().is_some() {
@@ -1692,8 +1714,16 @@ async fn run_window_video_pipeline(
             // 4. Encode off the async runtime thread so control/input latency stays unaffected.
             let mut enc = encoder.take().unwrap();
             let q = quality;
+            let damage = if damage_valid {
+                raw.damage
+            } else {
+                FrameDamage::Full
+            };
+            if let FrameDamage::Rects(rects) = &damage {
+                damage_rects = Some(rects.len());
+            }
             let encoded_res = tokio::task::spawn_blocking(move || {
-                let res = enc.encode_frame(raw.width, raw.height, pts_ns, &raw.pixels, q);
+                let res = enc.encode_frame(raw.width, raw.height, pts_ns, &raw.pixels, &damage, q);
                 (enc, res)
             })
             .await;
@@ -1706,6 +1736,7 @@ async fn run_window_video_pipeline(
                 }
             };
             encoder = Some(enc);
+            damage_valid = frame_res.is_ok();
             let frame = match frame_res {
                 Ok(f) => f,
                 Err(err) => {
@@ -1758,6 +1789,8 @@ async fn run_window_video_pipeline(
             h = frame.height,
             copy_rect = frame.had_copy_rect,
             dirty_tiles = frame.dirty_tiles,
+            ?damage_rects,
+            refresh = do_idle_refresh,
             lossy = frame.used_lossy,
             quality,
             bytes = frame.data.len(),

@@ -983,6 +983,7 @@ fn open_syncobj_device(node: &DrmNode) -> Option<DrmDeviceFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::damage::FrameDamage;
     use crate::media::WindowVideoEncoder;
     use remotewayland_proto::smart_tile::SmartTileDecoder;
     use remotewayland_proto::VideoCodec;
@@ -1140,7 +1141,9 @@ mod tests {
             "Expected zero-copy FramePixels::Gpu from GpuImporter"
         );
         let expected_f0 = px0.to_cpu_bgra();
-        let enc0 = win_enc.encode_frame(w, h, 1_000_000, &px0, 75).unwrap();
+        let enc0 = win_enc
+            .encode_frame(w, h, 1_000_000, &px0, &FrameDamage::Full, 75)
+            .unwrap();
         assert!(enc0.is_keyframe);
         let dec0 = dec.decode(w, h, &enc0.data).unwrap();
         assert_eq!(
@@ -1167,7 +1170,14 @@ mod tests {
             assert!(matches!(px, FramePixels::Gpu(_)));
             let t_enc = Instant::now();
             let encoded = win_enc
-                .encode_frame(w, h, (step as u64 + 1) * 16_666_667, &px, 75)
+                .encode_frame(
+                    w,
+                    h,
+                    (step as u64 + 1) * 16_666_667,
+                    &px,
+                    &FrameDamage::Full,
+                    75,
+                )
                 .unwrap();
             total_encode_us += t_enc.elapsed().as_micros();
 
@@ -1215,7 +1225,14 @@ mod tests {
             ui_imp_us += t_ui0.elapsed().as_micros();
             let t_ui_enc0 = Instant::now();
             let enc_ui = win_enc
-                .encode_frame(w, h, 500_000_000 + (b as u64) * 300_000_000, &px_ui, 75)
+                .encode_frame(
+                    w,
+                    h,
+                    500_000_000 + (b as u64) * 300_000_000,
+                    &px_ui,
+                    &FrameDamage::Full,
+                    75,
+                )
                 .unwrap();
             ui_enc_us += t_ui_enc0.elapsed().as_micros();
             assert_eq!(enc_ui.dirty_tiles, 1);

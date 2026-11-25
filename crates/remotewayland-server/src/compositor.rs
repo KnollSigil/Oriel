@@ -107,6 +107,7 @@ use smithay::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::damage::{surface_damage_to_frame, FrameDamage, SurfaceView};
 use crate::gpu::{
     BgraFrame, CompositeLayer, FramePixels, GpuImporter, GpuMode, ImportedFrame, PendingReadback,
     Readback,
@@ -195,6 +196,8 @@ pub enum CompositorEvent {
         geometry: FrameRect,
         input_bounds: FrameRect,
         pixels: FramePixels,
+        /// What changed since the window's previous `FrameCommitted`.
+        damage: FrameDamage,
     },
     CursorUpdate {
         window_id: WindowId,
@@ -340,12 +343,59 @@ const WINDOW_LAUNCH_ID_BASE: u64 = 1u64 << 62;
 /// callbacks), so comparing this first avoids GPU readbacks and full-window blends per commit.
 #[derive(Clone, PartialEq)]
 struct CompositeSignature {
-    /// Per surface with a buffer, in paint order: buffer generation, buffer size, logical size,
-    /// and position in the tree (logical).
-    surfaces: Vec<(u64, u32, u32, u32, u32, i32, i32)>,
+    /// Per surface with a buffer, in paint order.
+    surfaces: Vec<SurfaceSignature>,
     scale_bits: (u64, u64),
     geometry: FrameRect,
     input_bounds: FrameRect,
+}
+
+impl CompositeSignature {
+    /// Whether both composites place the same surfaces at the same sizes and positions, so only
+    /// the damage of the surfaces themselves differs between them.
+    fn same_layout(&self, other: &Self) -> bool {
+        self.scale_bits == other.scale_bits
+            && self.surfaces.len() == other.surfaces.len()
+            && self
+                .surfaces
+                .iter()
+                .zip(&other.surfaces)
+                .all(|(a, b)| a.same_placement(b))
+    }
+
+    /// Whether the window-level metadata sent along with a frame is unchanged.
+    fn same_metadata(&self, other: &Self) -> bool {
+        self.geometry == other.geometry && self.input_bounds == other.input_bounds
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct SurfaceSignature {
+    id: ObjectId,
+    /// Buffer generation.
+    gen: u64,
+    buffer_size: (u32, u32),
+    logical_size: (u32, u32),
+    /// Position in the tree (logical).
+    pos: (i32, i32),
+}
+
+impl SurfaceSignature {
+    fn same_placement(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.buffer_size == other.buffer_size
+            && self.logical_size == other.logical_size
+            && self.pos == other.pos
+    }
+}
+
+/// Damage a surface's clients reported since its frame was last composited.
+#[derive(Default)]
+struct SurfaceDamageState {
+    pending: FrameDamage,
+    /// How the stored frame was derived from its buffer; damage is relative to a frame with
+    /// the same view.
+    view: Option<SurfaceView>,
 }
 
 #[derive(Clone)]
@@ -589,6 +639,8 @@ struct AppState {
     /// Generation of each entry in `surface_buffers`, bumped whenever a new buffer is stored.
     surface_buffer_gens: HashMap<ObjectId, u64>,
     next_buffer_gen: u64,
+    /// Damage reported per `WlSurface::id()` since its frame was last composited.
+    surface_damage: HashMap<ObjectId, SurfaceDamageState>,
     /// KDE server-decoration modes set on a `WlSurface` before `xdg_surface.get_toplevel`.
     pending_kde_decorations: HashMap<ObjectId, bool>,
     windows: HashMap<WindowId, TrackedWindow>,
@@ -1519,6 +1571,7 @@ impl AppState {
                         geometry: frame.geometry,
                         input_bounds: frame.input_bounds,
                         pixels: frame.pixels.clone(),
+                        damage: FrameDamage::Full,
                     });
                 }
             }
@@ -1584,6 +1637,7 @@ impl AppState {
                         geometry: frame.geometry,
                         input_bounds: frame.input_bounds,
                         pixels: frame.pixels.clone(),
+                        damage: FrameDamage::Full,
                     });
                 }
             }
@@ -1627,7 +1681,7 @@ impl AppState {
     }
 
     /// The buffered surfaces of the tree under `root` as `CompositeSignature::surfaces`.
-    fn tree_buffer_signature(&self, root: &WlSurface) -> Vec<(u64, u32, u32, u32, u32, i32, i32)> {
+    fn tree_buffer_signature(&self, root: &WlSurface) -> Vec<SurfaceSignature> {
         let mut out = Vec::new();
         with_surface_tree_downward(
             root,
@@ -1644,7 +1698,13 @@ impl AppState {
                 if let Some((sw, sh, _)) = self.surface_buffers.get(&id) {
                     let (log_w, log_h) = surface_logical_size_from_states(states, *sw, *sh);
                     let gen = self.surface_buffer_gens.get(&id).copied().unwrap_or(0);
-                    out.push((gen, *sw, *sh, log_w, log_h, nx, ny));
+                    out.push(SurfaceSignature {
+                        id,
+                        gen,
+                        buffer_size: (*sw, *sh),
+                        logical_size: (log_w, log_h),
+                        pos: (nx, ny),
+                    });
                 }
                 TraversalAction::DoChildren((nx, ny))
             },
@@ -1791,54 +1851,89 @@ impl AppState {
             geometry,
             input_bounds,
         };
-        if let Some(tracked) = self.windows.get_mut(&window_id) {
-            if tracked.last_composite_sig.as_ref() == Some(&sig) {
-                return;
+        let Some(tracked) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        if tracked.last_composite_sig.as_ref() == Some(&sig) {
+            return;
+        }
+        let prev_sig = tracked.last_composite_sig.replace(sig.clone());
+        let announced = tracked.announced;
+
+        // Each buffered surface, bottom to top, with its destination rectangle.
+        let mut layers: Vec<(ObjectId, CompositeLayer)> = Vec::new();
+        with_surface_tree_downward(
+            root_surface,
+            (0, 0),
+            |surf, states, (ox, oy)| {
+                let (nx, ny) = if surf == root_surface {
+                    (*ox, *oy)
+                } else {
+                    let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
+                    let loc = sub_state.current().location;
+                    (ox + loc.x, oy + loc.y)
+                };
+                if let Some((sw, sh, spixels)) = self.surface_buffers.get(&surf.id()) {
+                    let (sub_log_w, sub_log_h) = surface_logical_size_from_states(states, *sw, *sh);
+                    let dst_x = (nx as f64 * comp_sx).round() as i32;
+                    let dst_y = (ny as f64 * comp_sy).round() as i32;
+                    let (dst_w, dst_h) = if surf == root_surface {
+                        (win_phys_w, win_phys_h)
+                    } else {
+                        (
+                            ((sub_log_w as f64 * comp_sx).round() as u32).max(1),
+                            ((sub_log_h as f64 * comp_sy).round() as u32).max(1),
+                        )
+                    };
+                    let dst =
+                        Rectangle::new((dst_x, dst_y).into(), (dst_w as i32, dst_h as i32).into());
+                    layers.push((surf.id(), (spixels.clone(), *sw, *sh, dst)));
+                }
+                TraversalAction::DoChildren((nx, ny))
+            },
+            |_, _, _| {},
+            |_, _, _| true,
+        );
+
+        // What changed since the last composite: the surfaces' own damage when they kept their
+        // places, otherwise everything.
+        let same_layout = prev_sig.as_ref().is_some_and(|prev| prev.same_layout(&sig));
+        let mut damage = if same_layout {
+            FrameDamage::empty()
+        } else {
+            FrameDamage::Full
+        };
+        for (id, (_, sw, sh, dst)) in &layers {
+            let surface_damage = self.take_surface_damage(id);
+            if same_layout {
+                damage.merge(surface_damage.placed(*sw, *sh, *dst));
             }
-            tracked.last_composite_sig = Some(sig);
+        }
+
+        // The client attached new buffers without damaging anything: nothing to send.
+        let metadata_unchanged = prev_sig
+            .as_ref()
+            .is_some_and(|prev| prev.same_metadata(&sig));
+        if damage.is_empty() && announced && metadata_unchanged {
+            if !has_subsurfaces {
+                // Drop the old buffer for the identical new one, so it can be reused.
+                let pixels = self.surface_buffers.get(&root_id).unwrap().2.clone();
+                if let Some(frame) = self
+                    .windows
+                    .get_mut(&window_id)
+                    .and_then(|t| t.latest_bgra.as_mut())
+                {
+                    frame.pixels = pixels;
+                }
+            }
+            return;
         }
 
         let composite: FramePixels = if !has_subsurfaces {
             // Zero-copy fast path for single-surface windows (both VRAM Dmabuf and SHM).
             self.surface_buffers.get(&root_id).unwrap().2.clone()
         } else {
-            // Each buffered surface, bottom to top, with its destination rectangle.
-            let mut layers: Vec<CompositeLayer> = Vec::new();
-            with_surface_tree_downward(
-                root_surface,
-                (0, 0),
-                |surf, states, (ox, oy)| {
-                    let (nx, ny) = if surf == root_surface {
-                        (*ox, *oy)
-                    } else {
-                        let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
-                        let loc = sub_state.current().location;
-                        (ox + loc.x, oy + loc.y)
-                    };
-                    if let Some((sw, sh, spixels)) = self.surface_buffers.get(&surf.id()) {
-                        let (sub_log_w, sub_log_h) =
-                            surface_logical_size_from_states(states, *sw, *sh);
-                        let dst_x = (nx as f64 * comp_sx).round() as i32;
-                        let dst_y = (ny as f64 * comp_sy).round() as i32;
-                        let (dst_w, dst_h) = if surf == root_surface {
-                            (win_phys_w, win_phys_h)
-                        } else {
-                            (
-                                ((sub_log_w as f64 * comp_sx).round() as u32).max(1),
-                                ((sub_log_h as f64 * comp_sy).round() as u32).max(1),
-                            )
-                        };
-                        let dst = Rectangle::new(
-                            (dst_x, dst_y).into(),
-                            (dst_w as i32, dst_h as i32).into(),
-                        );
-                        layers.push((spixels.clone(), *sw, *sh, dst));
-                    }
-                    TraversalAction::DoChildren((nx, ny))
-                },
-                |_, _, _| {},
-                |_, _, _| true,
-            );
+            let layers: Vec<CompositeLayer> = layers.into_iter().map(|(_, layer)| layer).collect();
             self.composite_layers(win_phys_w, win_phys_h, &layers)
         };
 
@@ -1937,6 +2032,7 @@ impl AppState {
             geometry: new_frame.geometry,
             input_bounds: new_frame.input_bounds,
             pixels: new_frame.pixels,
+            damage,
         });
     }
 
@@ -2106,14 +2202,33 @@ impl CompositorHandler for AppState {
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
 
-        let buffer_opt = with_states(surface, |states| {
-            let mut attrs = states
-                .cached_state
-                .get::<smithay::wayland::compositor::SurfaceAttributes>();
-            let buffer = match attrs.current().buffer.take() {
-                Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buf)) => Some(buf),
-                _ => None,
+        let state = with_states(surface, |states| {
+            let (buffer, damage, scale, transform) = {
+                let mut attrs = states
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>();
+                let current = attrs.current();
+                let buffer = match current.buffer.take() {
+                    Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(buf)) => {
+                        Some(buf)
+                    }
+                    _ => None,
+                };
+                // Drained on every commit: smithay appends each commit's damage to the
+                // current state, which would otherwise grow for the surface's lifetime.
+                let damage = std::mem::take(&mut current.damage);
+                (
+                    buffer,
+                    damage,
+                    current.buffer_scale,
+                    Transform::from(current.buffer_transform),
+                )
             };
+            let viewport_src = states
+                .cached_state
+                .get::<ViewportCachedState>()
+                .current()
+                .src;
             let release_point = states
                 .cached_state
                 .get::<DrmSyncobjCachedState>()
@@ -2127,43 +2242,59 @@ impl CompositorHandler for AppState {
                 .current()
                 .job
                 .take();
-            (buffer, release_point, readback_job)
+            (
+                buffer,
+                damage,
+                scale,
+                transform,
+                viewport_src,
+                release_point,
+                readback_job,
+            )
         });
-        let (buffer_opt, release_point, readback_job) = buffer_opt;
+        let (buffer_opt, damage, scale, transform, viewport_src, release_point, readback_job) =
+            state;
         let readback_frame = readback_job.and_then(|id| self.take_readback(surface, id));
 
         if let Some(buffer) = buffer_opt {
-            let frame: Option<ImportedFrame> = if get_dmabuf(&buffer).is_ok() {
+            let (frame, crop): (Option<ImportedFrame>, _) = if let Ok(dmabuf) = get_dmabuf(&buffer)
+            {
                 // Imported/blitted before this commit was applied (see `queue_buffer_readback`).
-                readback_frame
+                let crop = buffer_crop(viewport_src, dmabuf.size(), scale, transform);
+                (readback_frame, crop)
             } else {
-                read_shm_buffer(&buffer).map(|frame| {
-                    let crop = with_states(surface, |states| {
-                        let (scale, transform) = {
-                            let mut attrs = states
-                                .cached_state
-                                .get::<smithay::wayland::compositor::SurfaceAttributes>(
-                            );
-                            let current = attrs.current();
-                            (current.buffer_scale, current.buffer_transform)
-                        };
-                        let src = states
-                            .cached_state
-                            .get::<ViewportCachedState>()
-                            .current()
-                            .src;
+                match read_shm_buffer(&buffer) {
+                    Some(frame) => {
                         let size = (frame.0 as i32, frame.1 as i32).into();
-                        buffer_crop(src, size, scale, transform.into())
-                    });
-                    let (w, h, bgra) = match crop {
-                        Some(rect) => crop_frame(&frame, rect),
-                        None => frame,
-                    };
-                    (w, h, FramePixels::Cpu(Arc::new(bgra)))
-                })
+                        let crop = buffer_crop(viewport_src, size, scale, transform);
+                        let (w, h, bgra) = match crop {
+                            Some(rect) => crop_frame(&frame, rect),
+                            None => frame,
+                        };
+                        (Some((w, h, FramePixels::Cpu(Arc::new(bgra)))), crop)
+                    }
+                    None => (None, None),
+                }
             };
-            if let Some(frame) = frame {
-                self.store_surface_buffer(surface, frame);
+            match frame {
+                Some(frame) => {
+                    let (w, h) = (frame.0, frame.1);
+                    let view = SurfaceView {
+                        frame_size: (w, h),
+                        logical_size: surface_logical_size(surface, w, h),
+                        buffer_scale: scale,
+                        transform,
+                        crop,
+                    };
+                    self.record_surface_damage(surface, &damage, view);
+                    self.store_surface_buffer(surface, frame);
+                }
+                // The stored frame stays behind the client's, which the next commit's
+                // damage is relative to.
+                None => {
+                    self.surface_damage.entry(surface.id()).or_default().pending =
+                        FrameDamage::Full;
+                }
             }
             release_buffer(buffer, release_point);
         }
@@ -2172,8 +2303,7 @@ impl CompositorHandler for AppState {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
-        self.surface_buffers.remove(&surface.id());
-        self.surface_buffer_gens.remove(&surface.id());
+        self.forget_surface_buffer(&surface.id());
         if let Some(jobs) = self.surface_readbacks.remove(&surface.id()) {
             for id in jobs {
                 self.readback_jobs.remove(&id);
@@ -2464,6 +2594,39 @@ impl AppState {
         self.readback_jobs.remove(&id)?.frame
     }
 
+    /// Add one commit's damage to what `surface` has pending for its next composite. A frame
+    /// derived from its buffer differently than the last one is damaged as a whole.
+    fn record_surface_damage(
+        &mut self,
+        surface: &WlSurface,
+        damage: &[smithay::wayland::compositor::Damage],
+        view: SurfaceView,
+    ) {
+        let entry = self.surface_damage.entry(surface.id()).or_default();
+        let frame_damage = if entry.view.as_ref() == Some(&view) {
+            surface_damage_to_frame(damage, &view)
+        } else {
+            FrameDamage::Full
+        };
+        entry.pending.merge(frame_damage);
+        entry.view = Some(view);
+    }
+
+    /// Take the damage pending for the surface `id`.
+    fn take_surface_damage(&mut self, id: &ObjectId) -> FrameDamage {
+        self.surface_damage
+            .get_mut(id)
+            .map(|state| std::mem::replace(&mut state.pending, FrameDamage::empty()))
+            .unwrap_or(FrameDamage::Full)
+    }
+
+    /// Drop the stored frame of the surface `id` and everything derived from it.
+    fn forget_surface_buffer(&mut self, id: &ObjectId) {
+        self.surface_buffers.remove(id);
+        self.surface_buffer_gens.remove(id);
+        self.surface_damage.remove(id);
+    }
+
     fn store_surface_buffer(&mut self, surface: &WlSurface, (w, h, pixels): ImportedFrame) {
         if w > 0 && h > 0 {
             self.next_buffer_gen += 1;
@@ -2660,7 +2823,7 @@ impl XdgShellHandler for AppState {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let surf_id = surface.wl_surface().id();
-        self.surface_buffers.remove(&surf_id);
+        self.forget_surface_buffer(&surf_id);
         self.pending_kde_decorations.remove(&surf_id);
         if let Some(window_id) = self.surface_to_window.remove(&surf_id) {
             if let Some(tracked) = self.windows.remove(&window_id) {
@@ -2831,7 +2994,7 @@ impl XdgShellHandler for AppState {
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         let surf_id = surface.wl_surface().id();
-        self.surface_buffers.remove(&surf_id);
+        self.forget_surface_buffer(&surf_id);
         if let Some(window_id) = self.surface_to_window.remove(&surf_id) {
             if let Some(popup) = self.popup_windows.remove(&window_id) {
                 if popup.announced {
@@ -3182,6 +3345,28 @@ impl AppState {
         if frame_unchanged {
             return;
         }
+        let same_layout = xwin.latest_bgra.as_ref().is_some_and(|prev| {
+            (
+                prev.width,
+                prev.height,
+                prev.logical_width,
+                prev.logical_height,
+            ) == (w, h, log_w, log_h)
+        });
+        let surface_damage = self.take_surface_damage(&wl_surface.id());
+        let damage = if same_layout {
+            surface_damage
+        } else {
+            FrameDamage::Full
+        };
+        let Some(xwin) = self.x11_windows.get_mut(&window_id) else {
+            return;
+        };
+        // A new buffer without damage: the client's contents are unchanged.
+        if damage.is_empty() && xwin.announced && !title_or_app_changed {
+            xwin.latest_bgra = Some(new_frame);
+            return;
+        }
 
         xwin.last_title = title.clone();
         xwin.last_app_id = app_id.clone();
@@ -3252,6 +3437,7 @@ impl AppState {
             geometry: new_frame.geometry,
             input_bounds: new_frame.input_bounds,
             pixels: new_frame.pixels,
+            damage,
         });
     }
 
@@ -3357,7 +3543,7 @@ impl AppState {
         if let Some(xwin) = self.x11_windows.remove(&window_id) {
             if let Some(wl) = xwin.surface.wl_surface() {
                 self.surface_to_window.remove(&wl.id());
-                self.surface_buffers.remove(&wl.id());
+                self.forget_surface_buffer(&wl.id());
             }
             if self.last_focused_x11_window_id == Some(window_id) {
                 self.last_focused_x11_window_id = self.x11_windows.keys().next().copied();
@@ -3383,7 +3569,7 @@ impl AppState {
             );
             if let Some(wl) = xpop.surface.wl_surface() {
                 self.surface_to_window.remove(&wl.id());
-                self.surface_buffers.remove(&wl.id());
+                self.forget_surface_buffer(&wl.id());
             }
             if xpop.announced {
                 let _ = self
@@ -4421,6 +4607,7 @@ fn run_compositor_loop(
         surface_buffers: HashMap::new(),
         surface_buffer_gens: HashMap::new(),
         next_buffer_gen: 0,
+        surface_damage: HashMap::new(),
         pending_kde_decorations: HashMap::new(),
         windows: HashMap::new(),
         popup_windows: HashMap::new(),
@@ -4541,7 +4728,7 @@ fn run_compositor_loop(
                     );
                 } else {
                     let id = cs.id();
-                    state.surface_buffers.remove(&id);
+                    state.forget_surface_buffer(&id);
                     state.cursor_surface = None;
                     state.last_cursor_bitmap = None;
                 }
