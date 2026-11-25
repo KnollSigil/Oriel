@@ -984,6 +984,53 @@ fn encode_plane_qblocks(
     }
 }
 
+/// Like [`encode_plane_qblocks`], but reads blocks straight from the GPU's packed layout (32 words
+/// per block, two `i16` coefficients per word in natural order) and emits identical bytes.
+/// Blocks without AC coefficients, the common case on UI content, skip unpacking and the
+/// zigzag scan.
+fn encode_plane_packed(words: &[i32], blocks_x: usize, blocks_y: usize, out: &mut Vec<u8>) {
+    let count = blocks_x * blocks_y;
+    let mut dcs = [0i32; 64];
+    for (i, dc) in dcs.iter_mut().enumerate().take(count) {
+        *dc = (words[i * 32] as u32 & 0xFFFF) as u16 as i16 as i32;
+    }
+    apply_fwd_superblock_wht_dcs(&mut dcs[..count], blocks_x, blocks_y);
+
+    let mut prev_dc = 0i32;
+    let sb_x = blocks_x / 2;
+    let sb_y = blocks_y / 2;
+    for (i, &dc) in dcs.iter().enumerate().take(count) {
+        let by = i / blocks_x;
+        let bx = i % blocks_x;
+        let in_sb = by < sb_y * 2 && bx < sb_x * 2;
+        // Superblock WHT detail coefficients (w01, w10, w11) are already zero-centered.
+        let mut zero_pred = 0i32;
+        let pred = if in_sb && ((by & 1) != 0 || (bx & 1) != 0) {
+            &mut zero_pred
+        } else {
+            &mut prev_dc
+        };
+        let blk = &words[i * 32..i * 32 + 32];
+        let ac_bits = blk[1..]
+            .iter()
+            .fold((blk[0] as u32) >> 16, |acc, &w| acc | w as u32);
+        if ac_bits == 0 {
+            write_coeff(out, dc - *pred);
+            *pred = dc;
+            out.push(0); // EOB immediately
+        } else {
+            let mut q = [0i32; 64];
+            for (j, &w) in blk.iter().enumerate() {
+                let w = w as u32;
+                q[j * 2] = (w & 0xFFFF) as u16 as i16 as i32;
+                q[j * 2 + 1] = (w >> 16) as u16 as i16 as i32;
+            }
+            q[0] = dc;
+            encode_rle_block(&q, pred, out);
+        }
+    }
+}
+
 /// Encode a single plane (`plane_w x plane_w`, 64 or 32) of 8x8 DCT blocks and reconstruct
 /// the exact decoded plane in-place (into `recon_plane`) so encoder and decoder stay bit-identical.
 #[allow(clippy::too_many_arguments)]
@@ -2755,20 +2802,9 @@ impl SmartTileEncoder {
             &luma_q,
             &chroma_q,
             |mv_res, qblocks_flat, extract_bytes| {
-                let unpack_blk = |words: &[i32]| -> [i32; 64] {
-                    let mut blk = [0i32; 64];
-                    for i in 0..32 {
-                        let w = words[i] as u32;
-                        blk[i * 2] = (w & 0xFFFF) as u16 as i16 as i32;
-                        blk[i * 2 + 1] = (w >> 16) as u16 as i16 as i32;
-                    }
-                    blk
-                };
-
                 let mut any_lossy = false;
                 let mut any_local_mv = false;
-                let mut plane_blks = [[0i32; 64]; 64];
-                let mut refine_ref_local = [0u8; 16384];
+                let mut refine_ref_local: Vec<u8> = Vec::new();
                 let mut refine_samples = Vec::new();
 
                 for (cmd_idx, &(tx, ty, x0, y0, tw, th, tidx, _sflags, solid_px)) in
@@ -2835,38 +2871,23 @@ impl SmartTileEncoder {
                             out_buf.push(mode_intra);
                         }
 
-                        let mut seq_blk = 0usize;
-                        for blk_dst in plane_blks.iter_mut().take(num_luma) {
-                            let s = q_blocks_base + seq_blk * 32;
-                            *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
-                            seq_blk += 1;
-                        }
-                        encode_plane_qblocks(
-                            &mut plane_blks[..num_luma],
+                        let luma_end = q_blocks_base + num_luma * 32;
+                        let cb_end = luma_end + num_chroma * 32;
+                        let cr_end = cb_end + num_chroma * 32;
+                        encode_plane_packed(
+                            &qblocks_flat[q_blocks_base..luma_end],
                             luma_bx,
                             luma_by,
                             out_buf,
                         );
-
-                        for blk_dst in plane_blks.iter_mut().take(num_chroma) {
-                            let s = q_blocks_base + seq_blk * 32;
-                            *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
-                            seq_blk += 1;
-                        }
-                        encode_plane_qblocks(
-                            &mut plane_blks[..num_chroma],
+                        encode_plane_packed(
+                            &qblocks_flat[luma_end..cb_end],
                             chroma_bx,
                             chroma_by,
                             out_buf,
                         );
-
-                        for blk_dst in plane_blks.iter_mut().take(num_chroma) {
-                            let s = q_blocks_base + seq_blk * 32;
-                            *blk_dst = unpack_blk(&qblocks_flat[s..s + 32]);
-                            seq_blk += 1;
-                        }
-                        encode_plane_qblocks(
-                            &mut plane_blks[..num_chroma],
+                        encode_plane_packed(
+                            &qblocks_flat[cb_end..cr_end],
                             chroma_bx,
                             chroma_by,
                             out_buf,
@@ -2890,7 +2911,8 @@ impl SmartTileEncoder {
                         let ref_tile = &extract_bytes[ex_base + 16384..ex_base + 32768];
                         if cmd_idx >= num_changed {
                             // Settled lossy tile: residual against the lossy preview on the client.
-                            refine_ref_local.copy_from_slice(ref_tile);
+                            refine_ref_local.clear();
+                            refine_ref_local.extend_from_slice(ref_tile);
                             write_lossless_refinement_tile(
                                 &mut refine_ref_local,
                                 cur_tile,
@@ -8103,5 +8125,42 @@ mod tests {
             &last_src,
             "Final idle lossless refresh (VRAM ref)",
         );
+    }
+
+    #[test]
+    fn packed_plane_encoder_matches_unpacked() {
+        let mut rng = 0x1234_5678u32;
+        let mut next = || {
+            rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            rng >> 8
+        };
+        for (bx, by) in [(8usize, 8usize), (4, 4), (3, 5), (8, 3), (1, 1), (7, 8)] {
+            for density in [0u32, 2, 10, 60] {
+                let count = bx * by;
+                let mut words = vec![0i32; count * 32];
+                let mut blocks = vec![[0i32; 64]; count];
+                for b in 0..count {
+                    for c in 0..64 {
+                        let v = if c == 0 {
+                            (next() % 2001) as i32 - 1000
+                        } else if next() % 100 < density {
+                            let mag = if next() % 10 == 0 { 3000 } else { 40 };
+                            (next() % (2 * mag + 1)) as i32 - mag as i32
+                        } else {
+                            0
+                        };
+                        blocks[b][c] = v;
+                        let w = &mut words[b * 32 + c / 2];
+                        let bits = (v as i16 as u16 as u32) << (16 * (c % 2));
+                        *w = (*w as u32 | bits) as i32;
+                    }
+                }
+                let mut expected = Vec::new();
+                encode_plane_qblocks(&mut blocks, bx, by, &mut expected);
+                let mut got = Vec::new();
+                encode_plane_packed(&words, bx, by, &mut got);
+                assert_eq!(got, expected, "{bx}x{by} density {density}");
+            }
+        }
     }
 }

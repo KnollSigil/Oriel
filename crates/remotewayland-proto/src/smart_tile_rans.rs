@@ -133,7 +133,8 @@ fn encode_rans_core(stage_input: &[u8], raw_len: usize, lz4_stage_len: u32) -> V
     for s in 0..256 {
         let f = freqs[s] as u32;
         if f > 0 {
-            let rcp = (1u128 << 63).div_ceil(f as u128) as u64;
+            // ceil(2^63 / f) without a software u128 division; 2^63 + f - 1 fits in u64.
+            let rcp = (1u64 << 63).div_ceil(f as u64);
             enc_tab[s] = SymEnc {
                 x_max: ((RANS_L >> PROB_BITS) << 16) * f,
                 rcp,
