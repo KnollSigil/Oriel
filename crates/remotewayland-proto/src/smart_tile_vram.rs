@@ -2174,6 +2174,25 @@ impl ExportedDmabufTexture {
     }
 }
 
+/// Ingest bind groups kept per window. Each keeps its frame's texture (and dmabuf) alive,
+/// and every live dmabuf makes each GPU submission slightly more expensive.
+const INGEST_BG_CACHE_LEN: usize = 4;
+
+/// Write `bytes` to `buffer` unless they are what was last written (`last`).
+fn write_uniform_if_changed(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    last: &mut Vec<u8>,
+    bytes: &[u8],
+) {
+    if last.as_slice() == bytes {
+        return;
+    }
+    queue.write_buffer(buffer, 0, bytes);
+    last.clear();
+    last.extend_from_slice(bytes);
+}
+
 /// Build a Vulkan memory-visibility barrier command buffer (`MEMORY_WRITE -> SHADER_READ`)
 /// so external GLES/EGL writes to a shared `DMA-BUF` invalidate Vulkan L0/L1/GL2 caches.
 fn build_external_memory_barrier_cmd(device: &wgpu::Device) -> Option<wgpu::CommandBuffer> {
@@ -2235,6 +2254,14 @@ pub struct VramWindowState {
     prev_ref_buf: Option<wgpu::Buffer>,
 
     ingest_uniform: wgpu::Buffer,
+    /// Bytes last written to `ingest_uniform`/`scroll_uniform`, so unchanged parameters
+    /// aren't re-uploaded every frame (each `write_buffer` costs a staging buffer and an
+    /// extra command buffer at submit).
+    last_ingest_uniform: Vec<u8>,
+    last_scroll_uniform: Vec<u8>,
+    /// Ingest bind groups by frame view and bound buffers (see `INGEST_BG_CACHE_LEN`).
+    ingest_bg_cache: Vec<(wgpu::TextureView, [wgpu::Buffer; 4], wgpu::BindGroup)>,
+    scroll_bg_cache: Option<([wgpu::Buffer; 4], wgpu::BindGroup)>,
     scroll_uniform: wgpu::Buffer,
     prep_uniform: wgpu::Buffer,
     batch_uniform: wgpu::Buffer,
@@ -2292,6 +2319,10 @@ impl VramWindowState {
             mapped_at_creation: false,
         });
         Self {
+            last_ingest_uniform: Vec::new(),
+            last_scroll_uniform: Vec::new(),
+            ingest_bg_cache: Vec::new(),
+            scroll_bg_cache: None,
             ingest_uniform: mk_uni(
                 "vram_ingest_uni",
                 std::mem::size_of::<IngestParamsUniform>(),
@@ -2367,6 +2398,13 @@ impl VramWindowState {
         let total_tiles = cols * rows;
         if total_tiles == 0 || total_tiles > 65535 {
             return false;
+        }
+
+        if (width, height) != (self.width, self.height) {
+            // Frames of the old size won't come back, and buffers may be reallocated below;
+            // don't keep their textures and buffers alive in cached bind groups.
+            self.ingest_bg_cache.clear();
+            self.scroll_bg_cache = None;
         }
 
         let dev = self.engine.device();
@@ -2567,7 +2605,12 @@ impl VramWindowState {
             rb_swizzle: u32::from(frame.rb_swizzle),
             is_keyframe: ingest_flags,
         };
-        queue.write_buffer(&self.ingest_uniform, 0, bytemuck::bytes_of(&ingest_uni));
+        write_uniform_if_changed(
+            queue,
+            &self.ingest_uniform,
+            &mut self.last_ingest_uniform,
+            bytemuck::bytes_of(&ingest_uni),
+        );
 
         let ref_buf = self.ref_buf.as_ref()?;
         let cur_buf = self.cur_buf.as_ref()?;
@@ -2579,36 +2622,59 @@ impl VramWindowState {
             &self.dummy_buf
         };
 
-        let ingest_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vram_ingest_bg"),
-            layout: &pipes.ingest_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.ingest_uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&frame.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: ref_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: cur_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: scan_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: fast_ex_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let ingest_key = [
+            ref_buf.clone(),
+            cur_buf.clone(),
+            scan_buf.clone(),
+            fast_ex_buf.clone(),
+        ];
+        let cached_ingest = self
+            .ingest_bg_cache
+            .iter()
+            .find(|(view, bufs, _)| *view == frame.view && *bufs == ingest_key)
+            .map(|(_, _, bg)| bg.clone());
+        let ingest_bg = if let Some(bg) = cached_ingest {
+            bg
+        } else {
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vram_ingest_bg"),
+                layout: &pipes.ingest_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ingest_uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&frame.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: ref_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: cur_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: scan_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: fast_ex_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            // Frames come from a small pool of slots, so their views repeat. Keep only a few:
+            // a cached bind group keeps its slot's texture (and dmabuf) alive.
+            if self.ingest_bg_cache.len() >= INGEST_BG_CACHE_LEN {
+                self.ingest_bg_cache.remove(0);
+            }
+            self.ingest_bg_cache
+                .push((frame.view.clone(), ingest_key, bg.clone()));
+            bg
+        };
 
         let scroll_bytes = ((frame.width as usize + frame.height as usize) * 16) as u64;
         let scroll_bg = if do_scroll {
@@ -2618,33 +2684,52 @@ impl VramWindowState {
                 _pad0: 0,
                 _pad1: 0,
             };
-            queue.write_buffer(&self.scroll_uniform, 0, bytemuck::bytes_of(&s_uni));
-            Some(dev.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("vram_scroll_bg"),
-                layout: &pipes.scroll_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.scroll_uniform.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: ref_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: cur_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.scroll_buf.as_ref()?.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: scan_buf.as_entire_binding(),
-                    },
-                ],
-            }))
+            write_uniform_if_changed(
+                queue,
+                &self.scroll_uniform,
+                &mut self.last_scroll_uniform,
+                bytemuck::bytes_of(&s_uni),
+            );
+            let scroll_buf = self.scroll_buf.as_ref()?;
+            let scroll_key = [
+                ref_buf.clone(),
+                cur_buf.clone(),
+                scroll_buf.clone(),
+                scan_buf.clone(),
+            ];
+            match &self.scroll_bg_cache {
+                Some((key, bg)) if *key == scroll_key => Some(bg.clone()),
+                _ => {
+                    let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("vram_scroll_bg"),
+                        layout: &pipes.scroll_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.scroll_uniform.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: ref_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: cur_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: scroll_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: scan_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    self.scroll_bg_cache = Some((scroll_key, bg.clone()));
+                    Some(bg)
+                }
+            }
         } else {
             None
         };
