@@ -21,6 +21,9 @@ use super::{CopyRectOp, MODE_FLAG_LOCAL_MV, MODE_FLAG_MV, TILE_SIZE};
 pub const SCAN_FLAG_DIRTY: u32 = 1 << 0;
 pub const SCAN_FLAG_OPAQUE: u32 = 1 << 1;
 pub const SCAN_FLAG_SOLID: u32 = 1 << 2;
+/// Tile differs from the previous frame's ingested source (`cur_bgra` before this ingest).
+/// Unlike `SCAN_FLAG_DIRTY` (vs. the possibly-lossy reference), this ignores DCT error.
+pub const SCAN_FLAG_SRC_CHANGED: u32 = 1 << 3;
 
 pub const FAST_UI_MAX_TILES: usize = 8;
 
@@ -120,6 +123,7 @@ struct ScanOutBuffer {
 @group(0) @binding(5) var<storage, read_write> ingest_fast_extract: array<u32>;
 
 var<workgroup> wg_scan_dirty: atomic<u32>;
+var<workgroup> wg_scan_src_changed: atomic<u32>;
 var<workgroup> wg_scan_non_opaque: atomic<u32>;
 var<workgroup> wg_scan_non_solid: atomic<u32>;
 var<workgroup> wg_top_left_px: u32;
@@ -156,6 +160,7 @@ fn ingest_and_scan_vram(
 
     if (lid.x == 0u) {
         atomicStore(&wg_scan_dirty, 0u);
+        atomicStore(&wg_scan_src_changed, 0u);
         atomicStore(&wg_scan_non_opaque, 0u);
         atomicStore(&wg_scan_non_solid, 0u);
         wg_top_left_px = load_tex_bgra(
@@ -174,6 +179,7 @@ fn ingest_and_scan_vram(
     if (py < th) {
         let row_base = (y0 + py) * ingest_params.fb_w + x0;
         var row_dirty = select(0u, 1u, force_dirty);
+        var row_src_changed = select(0u, 1u, force_dirty);
         var row_non_opaque = 0u;
         var row_non_solid = 0u;
         for (var px = 0u; px < tw; px = px + 1u) {
@@ -185,6 +191,9 @@ fn ingest_and_scan_vram(
                 ingest_params.rb_swizzle,
             );
             let idx = row_base + px;
+            if (row_src_changed == 0u && cur_px != ingest_cur_bgra[idx]) {
+                row_src_changed = 1u;
+            }
             ingest_cur_bgra[idx] = cur_px;
             if (row_dirty == 0u && cur_px != ingest_ref_bgra[idx]) {
                 row_dirty = 1u;
@@ -199,6 +208,9 @@ fn ingest_and_scan_vram(
         if (row_dirty != 0u) {
             atomicOr(&wg_scan_dirty, 1u);
         }
+        if (row_src_changed != 0u) {
+            atomicOr(&wg_scan_src_changed, 1u);
+        }
         if (row_non_opaque != 0u) {
             atomicOr(&wg_scan_non_opaque, 1u);
         }
@@ -212,6 +224,7 @@ fn ingest_and_scan_vram(
         let dirty = atomicLoad(&wg_scan_dirty);
         let opaque = select(2u, 0u, atomicLoad(&wg_scan_non_opaque) != 0u);
         let solid = select(4u, 0u, atomicLoad(&wg_scan_non_solid) != 0u);
+        let src_changed = select(0u, 8u, atomicLoad(&wg_scan_src_changed) != 0u);
         var slot = 0xFFFFu;
         if (dirty != 0u) {
             atomicAdd(&ingest_scan_out.dirty_count, 1u);
@@ -221,7 +234,7 @@ fn ingest_and_scan_vram(
         }
         wg_fast_slot = slot;
         let slot_enc = select(0u, (slot + 1u) << 8u, slot < 8u);
-        ingest_scan_out.tiles[tidx * 2u] = dirty | opaque | solid | slot_enc;
+        ingest_scan_out.tiles[tidx * 2u] = dirty | opaque | solid | src_changed | slot_enc;
         ingest_scan_out.tiles[tidx * 2u + 1u] = solid_ref;
     }
     workgroupBarrier();

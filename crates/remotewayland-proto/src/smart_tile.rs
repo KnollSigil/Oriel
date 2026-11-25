@@ -121,6 +121,16 @@ const MOTION_WINDOW: Duration = Duration::from_millis(220);
 /// Number of consecutive motion updates before an opaque tile switches to lossy DCT.
 const MOTION_STREAK_THRESHOLD: u8 = 2;
 
+/// How long a lossy tile must stay unchanged before it is refined inside a regular frame
+/// while other regions (e.g. a playing video) keep the window from going idle.
+const SETTLED_REFINE_DELAY: Duration = Duration::from_millis(250);
+
+/// Maximum settled lossy tiles refined per regular frame (bounded further by raw bytes).
+const SETTLED_REFINE_MAX_TILES: usize = 6;
+
+/// Raw (pre-LZ4) byte cap for settled refinement tiles appended to a single regular frame.
+const SETTLED_REFINE_MAX_RAW_BYTES: usize = 48 * 1024;
+
 /// Maximum number of lossy tiles refined losslessly per progressive refinement packet,
 /// keeping Wi-Fi latency low and allowing immediate preemption by new motion frames.
 pub const DEFAULT_REFRESH_CHUNK_TILES: usize = 48;
@@ -1933,6 +1943,52 @@ impl SmartTileEncoder {
         self.tiles.iter().any(|t| t.is_lossy)
     }
 
+    /// Lossy tiles left unchanged for at least `SETTLED_REFINE_DELAY`, eligible for lossless
+    /// refinement inside a regular frame. Must be called after this frame's dirty scan so that
+    /// tiles changed in this frame have a fresh `last_change` and are excluded.
+    fn settled_refine_candidates(
+        tiles: &[TileTrack],
+        cols: usize,
+        rows: usize,
+        quality: u8,
+        now: Instant,
+    ) -> Vec<(usize, usize, usize)> {
+        let limit = if quality <= 40 {
+            1
+        } else {
+            SETTLED_REFINE_MAX_TILES
+        };
+        let mut out = Vec::new();
+        for ty in 0..rows {
+            for tx in 0..cols {
+                let tidx = ty * cols + tx;
+                let t = &tiles[tidx];
+                if !t.is_lossy {
+                    continue;
+                }
+                let settled = t
+                    .last_change
+                    .is_none_or(|lc| now.duration_since(lc) >= SETTLED_REFINE_DELAY);
+                if settled {
+                    out.push((tx, ty, tidx));
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Rewrite the `u32` tile count in `scratch_packet` (located after any frame MV).
+    fn patch_tile_count(&mut self, count: usize) {
+        let mut off = 4;
+        if (self.scratch_packet[1] & FLAG_FRAME_MV) != 0 {
+            off += 4;
+        }
+        self.scratch_packet[off..off + 4].copy_from_slice(&(count as u32).to_le_bytes());
+    }
+
     /// Encode a new `BGRA` frame at the given DCT quality (`1..=100`).
     pub fn encode(&mut self, width: u32, height: u32, bgra: &[u8], quality: u8) -> SmartTilePacket {
         let expected_len = (width as usize) * (height as usize) * 4;
@@ -1977,6 +2033,7 @@ impl SmartTileEncoder {
         }
 
         // 1. Identify dirty 64x64 tiles and update per-tile motion streaks.
+        let source_valid = !is_keyframe && self.source_bgra.len() == expected_len;
         let mut dirty_tiles = Vec::new();
         for ty in 0..rows {
             let y0 = (ty as u32) * TILE_SIZE;
@@ -1986,8 +2043,15 @@ impl SmartTileEncoder {
                 let tw = (width - x0).min(TILE_SIZE);
                 let tidx = ty * cols + tx;
 
-                let dirty =
-                    is_keyframe || !tile_equals(&self.ref_bgra, bgra, width, x0, y0, tw, th);
+                // A lossy tile's reference holds a DCT approximation that never equals the source,
+                // so compare it against the last lossless source frame instead; otherwise it would be
+                // re-encoded (lossy) on every frame for as long as anything else keeps changing.
+                let cmp_base = if source_valid && self.tiles[tidx].is_lossy {
+                    &self.source_bgra
+                } else {
+                    &self.ref_bgra
+                };
+                let dirty = is_keyframe || !tile_equals(cmp_base, bgra, width, x0, y0, tw, th);
                 if dirty {
                     let tr = &mut self.tiles[tidx];
                     if is_keyframe {
@@ -2284,6 +2348,46 @@ impl SmartTileEncoder {
             self.scratch_packet[1] |= FLAG_PREV_REF;
         }
 
+        // Piggyback lossless refinement of settled lossy tiles (e.g. UI next to a playing video)
+        // so they sharpen while other regions keep streaming instead of waiting for full idle.
+        if !is_keyframe {
+            let refine = Self::settled_refine_candidates(&self.tiles, cols, rows, quality, now);
+            if !refine.is_empty() {
+                let mut residual_samples =
+                    Vec::with_capacity((TILE_SIZE as usize) * (TILE_SIZE as usize) * 4);
+                let raw_start = self.scratch_packet.len();
+                let mut refined = 0usize;
+                for &(tx, ty, tidx) in &refine {
+                    if self.scratch_packet.len() - raw_start >= SETTLED_REFINE_MAX_RAW_BYTES {
+                        break;
+                    }
+                    let x0 = (tx as u32) * TILE_SIZE;
+                    let y0 = (ty as u32) * TILE_SIZE;
+                    let tw = (width - x0).min(TILE_SIZE);
+                    let th = (height - y0).min(TILE_SIZE);
+                    self.scratch_packet
+                        .extend_from_slice(&(tx as u16).to_le_bytes());
+                    self.scratch_packet
+                        .extend_from_slice(&(ty as u16).to_le_bytes());
+                    write_lossless_refinement_tile(
+                        &mut self.ref_bgra,
+                        bgra,
+                        width,
+                        x0,
+                        y0,
+                        tw,
+                        th,
+                        &mut residual_samples,
+                        &mut self.scratch_packet,
+                    );
+                    self.tiles[tidx].is_lossy = false;
+                    self.tiles[tidx].motion_streak = 0;
+                    refined += 1;
+                }
+                self.patch_tile_count(dirty_tile_count + refined);
+            }
+        }
+
         // Only keep a lossless source copy when at least one tile is lossy and awaits idle refresh.
         // Saves a full 33 MB memcpy on every lossless UI frame at 4K!
         if !source_copied_during_gpu && (used_lossy || self.has_pending_lossless_refresh()) {
@@ -2328,6 +2432,9 @@ impl SmartTileEncoder {
 
         let mut is_keyframe =
             width != self.width || height != self.height || self.tiles.len() != total_tiles;
+
+        // `cur_buf` only holds the previous frame's source if the last frame was VRAM-encoded too.
+        let cur_holds_prev_source = self.vram_resident;
 
         if self.vram_state.is_none() {
             self.vram_state = Some(Box::new(vram::VramWindowState::new(Arc::clone(
@@ -2399,7 +2506,13 @@ impl SmartTileEncoder {
                 let tidx = ty * cols + tx;
                 let flags = scan_words_slice[tidx * 2];
                 let solid_px = scan_words_slice[tidx * 2 + 1];
-                let dirty = is_keyframe || (flags & vram::SCAN_FLAG_DIRTY) != 0;
+                // Lossy tiles never match their DCT reference; judge them by source changes only.
+                let dirty_flag = if cur_holds_prev_source && self.tiles[tidx].is_lossy {
+                    vram::SCAN_FLAG_SRC_CHANGED
+                } else {
+                    vram::SCAN_FLAG_DIRTY
+                };
+                let dirty = is_keyframe || (flags & dirty_flag) != 0;
                 if dirty {
                     let tr = &mut self.tiles[tidx];
                     if is_keyframe {
@@ -2476,6 +2589,23 @@ impl SmartTileEncoder {
         };
         let luma_q = build_quant_table(&BASE_LUMA_QUANT, quality);
         let chroma_q = build_quant_table(&BASE_CHROMA_QUANT, quality);
+
+        // Append settled lossy tiles as lossless refinements (forced non-lossy below), so they
+        // sharpen while other regions keep the window busy.
+        let num_changed = dirty_tiles.len();
+        if !is_keyframe {
+            for (tx, ty, tidx) in
+                Self::settled_refine_candidates(&self.tiles, cols, rows, quality, now)
+            {
+                let x0 = (tx as u32) * TILE_SIZE;
+                let y0 = (ty as u32) * TILE_SIZE;
+                let tw = (width - x0).min(TILE_SIZE);
+                let th = (height - y0).min(TILE_SIZE);
+                let flags = scan_words_slice[tidx * 2];
+                let solid_px = scan_words_slice[tidx * 2 + 1];
+                dirty_tiles.push((tx, ty, x0, y0, tw, th, tidx, flags, solid_px));
+            }
+        }
 
         let dirty_tile_count = dirty_tiles.len();
         self.scratch_packet.clear();
@@ -2566,8 +2696,11 @@ impl SmartTileEncoder {
         let mut cmds = Vec::with_capacity(dirty_tile_count);
         let mut num_lossy_opaque = 0usize;
         let mut num_extract = 0usize;
-        for &(_tx, _ty, x0, y0, tw, th, tidx, sflags, _solid_px) in &dirty_tiles {
+        for (i, &(_tx, _ty, x0, y0, tw, th, tidx, sflags, _solid_px)) in
+            dirty_tiles.iter().enumerate()
+        {
             let wants_lossy = !is_keyframe
+                && i < num_changed
                 && (self.tiles[tidx].motion_streak >= MOTION_STREAK_THRESHOLD || massive_motion);
             let is_opaque = (sflags & vram::SCAN_FLAG_OPAQUE) != 0;
             let is_solid = (sflags & vram::SCAN_FLAG_SOLID) != 0;
@@ -2635,6 +2768,8 @@ impl SmartTileEncoder {
                 let mut any_lossy = false;
                 let mut any_local_mv = false;
                 let mut plane_blks = [[0i32; 64]; 64];
+                let mut refine_ref_local = [0u8; 16384];
+                let mut refine_samples = Vec::new();
 
                 for (cmd_idx, &(tx, ty, x0, y0, tw, th, tidx, _sflags, solid_px)) in
                     dirty_tiles.iter().enumerate()
@@ -2753,14 +2888,31 @@ impl SmartTileEncoder {
                         let ex_base = (cmd.extract_idx as usize) * 32768;
                         let cur_tile = &extract_bytes[ex_base..ex_base + 16384];
                         let ref_tile = &extract_bytes[ex_base + 16384..ex_base + 32768];
-                        write_lossless_tile_extracted(
-                            cur_tile,
-                            ref_tile,
-                            tw,
-                            th,
-                            is_keyframe,
-                            out_buf,
-                        );
+                        if cmd_idx >= num_changed {
+                            // Settled lossy tile: residual against the lossy preview on the client.
+                            refine_ref_local.copy_from_slice(ref_tile);
+                            write_lossless_refinement_tile(
+                                &mut refine_ref_local,
+                                cur_tile,
+                                64,
+                                0,
+                                0,
+                                tw,
+                                th,
+                                &mut refine_samples,
+                                out_buf,
+                            );
+                            tiles_slice[tidx].motion_streak = 0;
+                        } else {
+                            write_lossless_tile_extracted(
+                                cur_tile,
+                                ref_tile,
+                                tw,
+                                th,
+                                is_keyframe,
+                                out_buf,
+                            );
+                        }
                         tiles_slice[tidx].is_lossy = false;
                     } else {
                         // Semi-transparent lossy alpha tile: encode on 64x64 local buffer with zero-MV
@@ -5982,6 +6134,94 @@ mod tests {
     }
 
     #[test]
+    fn static_ui_tile_beside_playing_video_settles_without_idle() {
+        apply_test_overrides((false, true));
+        let w = 1920u32;
+        let h = 1080u32;
+        let mut enc = SmartTileEncoder::new();
+        let mut dec = SmartTileDecoder::new();
+        let cols = w.div_ceil(TILE_SIZE) as usize;
+        let ui_tidx = cols + 1; // tile (1, 1): outside the video region
+
+        let make_frame = |video_seed: u32, ui_on: bool| -> Vec<u8> {
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            let mut rng = video_seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = ((y * w + x) * 4) as usize;
+                    let px = if x >= 384 && y >= 192 {
+                        rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        let n = (rng >> 24) as u8;
+                        [
+                            n,
+                            (n / 2).wrapping_add(x as u8),
+                            (n / 3).wrapping_add(y as u8),
+                        ]
+                    } else if ui_on && (64..128).contains(&x) && (64..128).contains(&y) {
+                        // Sharp text-like pattern that DCT cannot reproduce exactly.
+                        let on = (x * 7 + y * 3) % 5 < 2;
+                        if on {
+                            [250, 250, 250]
+                        } else {
+                            [20, 30, 40]
+                        }
+                    } else {
+                        [35, 35, 40]
+                    };
+                    buf[idx..idx + 4].copy_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+            }
+            buf
+        };
+
+        let mut decode_and_check = |enc: &SmartTileEncoder, pkt: &SmartTilePacket| -> Vec<u8> {
+            let out = dec.decode(w, h, &pkt.payload).unwrap();
+            assert_eq!(out, enc.ref_bgra, "decoder must track encoder reference");
+            out
+        };
+
+        let f = make_frame(0, false);
+        let p0 = enc.encode(w, h, &f, 50);
+        decode_and_check(&enc, &p0);
+        for i in 1..3 {
+            let pkt = enc.encode(w, h, &make_frame(i, false), 50);
+            decode_and_check(&enc, &pkt);
+        }
+
+        // UI tile changes once mid-playback: massive motion makes it lossy (half-res).
+        let p = enc.encode(w, h, &make_frame(3, true), 50);
+        decode_and_check(&enc, &p);
+        assert!(enc.tiles[ui_tidx].is_lossy);
+        let changed_at = enc.tiles[ui_tidx].last_change;
+
+        // Video keeps playing; the unchanged UI tile must not be re-encoded every frame.
+        for i in 4..7 {
+            let pkt = enc.encode(w, h, &make_frame(i, true), 50);
+            decode_and_check(&enc, &pkt);
+            assert_eq!(
+                enc.tiles[ui_tidx].last_change, changed_at,
+                "unchanged lossy UI tile was treated as dirty"
+            );
+        }
+
+        // Once settled, it is refined losslessly inside a regular video frame.
+        std::thread::sleep(SETTLED_REFINE_DELAY + Duration::from_millis(20));
+        let src = make_frame(7, true);
+        let pkt = enc.encode(w, h, &src, 50);
+        let out = decode_and_check(&enc, &pkt);
+        assert!(!enc.tiles[ui_tidx].is_lossy, "UI tile should be refined");
+        for y in 64..128usize {
+            let off = (y * w as usize + 64) * 4;
+            assert_eq!(
+                out[off..off + 256],
+                src[off..off + 256],
+                "UI row {y} not lossless"
+            );
+        }
+        apply_test_overrides((false, false));
+    }
+
+    #[test]
     fn hidpi_progressive_half_res_motion_and_chunked_lossless_refinement() {
         let w = 1920u32;
         let h = 1080u32;
@@ -7498,6 +7738,138 @@ mod tests {
             0,
             "Expected lossy SmartTilePacket to select LZ4 + 4-way rANS compression"
         );
+    }
+
+    #[test]
+    fn vram_static_ui_tile_beside_playing_video_settles_without_idle() {
+        let Some(engine) = gpu::SmartTileGpuEngine::try_new_any().map(Arc::new) else {
+            eprintln!("Skipping VRAM settle test: no wgpu adapter available");
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let tex = engine.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_vram_settle_tex"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let upload = |bgra: &[u8]| {
+            engine.queue().write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bgra,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        let frame = vram::GpuTextureFrame {
+            engine: Arc::clone(&engine),
+            texture: tex.clone(),
+            view,
+            crop_x: 0,
+            crop_y: 0,
+            width: w,
+            height: h,
+            rb_swizzle: false,
+            external_memory: false,
+        };
+        let make_frame = |video_seed: u32, ui_on: bool| -> Vec<u8> {
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            let mut rng = video_seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = ((y * w + x) * 4) as usize;
+                    let px = if x >= 384 && y >= 192 {
+                        rng = rng.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        let n = (rng >> 24) as u8;
+                        [
+                            n,
+                            (n / 2).wrapping_add(x as u8),
+                            (n / 3).wrapping_add(y as u8),
+                        ]
+                    } else if ui_on && (64..128).contains(&x) && (64..128).contains(&y) {
+                        let on = (x * 7 + y * 3) % 5 < 2;
+                        if on {
+                            [250, 250, 250]
+                        } else {
+                            [20, 30, 40]
+                        }
+                    } else {
+                        [35, 35, 40]
+                    };
+                    buf[idx..idx + 4].copy_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+            }
+            buf
+        };
+
+        let cols = w.div_ceil(TILE_SIZE) as usize;
+        let ui_tidx = cols + 1;
+        let mut enc = SmartTileEncoder::new();
+        let mut dec = SmartTileDecoder::new();
+        let mut step = |enc: &mut SmartTileEncoder, src: &[u8]| -> Vec<u8> {
+            upload(src);
+            let pkt = enc.encode_gpu_texture(&frame, 50).unwrap();
+            dec.decode(w, h, &pkt.payload).unwrap().to_vec()
+        };
+
+        for i in 0..3 {
+            step(&mut enc, &make_frame(i, false));
+        }
+        step(&mut enc, &make_frame(3, true));
+        assert!(enc.vram_resident);
+        assert!(enc.tiles[ui_tidx].is_lossy);
+        let changed_at = enc.tiles[ui_tidx].last_change;
+        for i in 4..7 {
+            step(&mut enc, &make_frame(i, true));
+            assert_eq!(
+                enc.tiles[ui_tidx].last_change, changed_at,
+                "unchanged lossy UI tile was treated as dirty (VRAM)"
+            );
+        }
+        std::thread::sleep(SETTLED_REFINE_DELAY + Duration::from_millis(20));
+        let src = make_frame(7, true);
+        let out = step(&mut enc, &src);
+        assert!(
+            !enc.tiles[ui_tidx].is_lossy,
+            "UI tile should be refined (VRAM)"
+        );
+        for y in 64..128usize {
+            let off = (y * w as usize + 64) * 4;
+            assert_eq!(
+                out[off..off + 256],
+                src[off..off + 256],
+                "UI row {y} not lossless"
+            );
+        }
+        // Remaining lossy video converges bit-exactly via idle refresh.
+        while let Some(pkt) =
+            enc.encode_lossless_refresh(DEFAULT_REFRESH_CHUNK_TILES, DEFAULT_REFRESH_MAX_BYTES)
+        {
+            let _ = dec.decode(w, h, &pkt.payload).unwrap();
+        }
+        assert!(*dec.bgra == src, "VRAM stream must converge losslessly");
     }
 
     #[test]
