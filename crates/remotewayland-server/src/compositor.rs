@@ -108,7 +108,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::gpu::{
-    BgraFrame, FramePixels, GpuImporter, GpuMode, ImportedFrame, PendingReadback, Readback,
+    BgraFrame, CompositeLayer, FramePixels, GpuImporter, GpuMode, ImportedFrame, PendingReadback,
+    Readback,
 };
 use calloop::timer::{TimeoutAction, Timer};
 use smithay::backend::egl::fence::EGLFence;
@@ -1653,6 +1654,41 @@ impl AppState {
         out
     }
 
+    /// Composite surface frames, bottom to top, onto a transparent `width`x`height` frame:
+    /// on the GPU when any frame is in VRAM, otherwise on the CPU.
+    fn composite_layers(
+        &mut self,
+        width: u32,
+        height: u32,
+        layers: &[CompositeLayer],
+    ) -> FramePixels {
+        // A tree of only CPU frames is blended where it already is.
+        let any_in_vram = layers
+            .iter()
+            .any(|(pixels, ..)| matches!(pixels, FramePixels::Gpu(_)));
+        if let Some(gpu) = self.gpu.as_mut().filter(|_| any_in_vram) {
+            if let Some(handle) = gpu.composite(width, height, layers) {
+                return FramePixels::Gpu(handle);
+            }
+        }
+
+        let mut buf = vec![0u8; (width * height * 4) as usize];
+        for (pixels, sw, sh, dst) in layers {
+            let srgba = pixels.to_cpu_bgra();
+            let (dst_w, dst_h) = (dst.size.w as u32, dst.size.h as u32);
+            if dst_w == *sw && dst_h == *sh {
+                blit_rgba_over(
+                    &mut buf, width, height, &srgba, *sw, *sh, dst.loc.x, dst.loc.y,
+                );
+            } else {
+                blit_rgba_over_scaled(
+                    &mut buf, width, height, &srgba, *sw, *sh, dst.loc.x, dst.loc.y, dst_w, dst_h,
+                );
+            }
+        }
+        FramePixels::Cpu(Arc::new(buf))
+    }
+
     fn recomposite_window(&mut self, window_id: WindowId, root_surface: &WlSurface) {
         let root_id = root_surface.id();
         let Some((surf_w, surf_h, _)) = self.surface_buffers.get(&root_id) else {
@@ -1766,7 +1802,8 @@ impl AppState {
             // Zero-copy fast path for single-surface windows (both VRAM Dmabuf and SHM).
             self.surface_buffers.get(&root_id).unwrap().2.clone()
         } else {
-            let mut buf = vec![0u8; (win_phys_w * win_phys_h * 4) as usize];
+            // Each buffered surface, bottom to top, with its destination rectangle.
+            let mut layers: Vec<CompositeLayer> = Vec::new();
             with_surface_tree_downward(
                 root_surface,
                 (0, 0),
@@ -1779,7 +1816,6 @@ impl AppState {
                         (ox + loc.x, oy + loc.y)
                     };
                     if let Some((sw, sh, spixels)) = self.surface_buffers.get(&surf.id()) {
-                        let srgba = spixels.to_cpu_bgra();
                         let (sub_log_w, sub_log_h) =
                             surface_logical_size_from_states(states, *sw, *sh);
                         let dst_x = (nx as f64 * comp_sx).round() as i32;
@@ -1792,23 +1828,18 @@ impl AppState {
                                 ((sub_log_h as f64 * comp_sy).round() as u32).max(1),
                             )
                         };
-                        if dst_w == *sw && dst_h == *sh {
-                            blit_rgba_over(
-                                &mut buf, win_phys_w, win_phys_h, &srgba, *sw, *sh, dst_x, dst_y,
-                            );
-                        } else {
-                            blit_rgba_over_scaled(
-                                &mut buf, win_phys_w, win_phys_h, &srgba, *sw, *sh, dst_x, dst_y,
-                                dst_w, dst_h,
-                            );
-                        }
+                        let dst = Rectangle::new(
+                            (dst_x, dst_y).into(),
+                            (dst_w as i32, dst_h as i32).into(),
+                        );
+                        layers.push((spixels.clone(), *sw, *sh, dst));
                     }
                     TraversalAction::DoChildren((nx, ny))
                 },
                 |_, _, _| {},
                 |_, _, _| true,
             );
-            FramePixels::Cpu(Arc::new(buf))
+            self.composite_layers(win_phys_w, win_phys_h, &layers)
         };
 
         let Some(tracked) = self.windows.get_mut(&window_id) else {

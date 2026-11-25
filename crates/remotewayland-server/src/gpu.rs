@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{anyhow, bail, Context, Result};
 use remotewayland_proto::smart_tile::gpu::{engine_for_drm_dev, SmartTileGpuEngine};
@@ -26,7 +26,7 @@ use smithay::backend::egl::fence::EGLFence;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::{GlesMapping, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, Texture,
+    Bind, Color32F, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer, Texture,
 };
 use smithay::utils::{Buffer as BufferCoord, DeviceFd, Physical, Rectangle, Size, Transform};
 use smithay::wayland::drm_syncobj::supports_syncobj_eventfd;
@@ -35,6 +35,9 @@ use tracing::{debug, info, warn};
 /// Readback textures kept for reuse; one per buffer size, so windows and subsurfaces of
 /// different sizes don't reallocate on every frame.
 const MAX_CACHED_TARGETS: usize = 8;
+
+/// CPU surface frames kept uploaded for compositing.
+const MAX_CACHED_UPLOADS: usize = 16;
 
 /// Maximum idle pooled zero-copy Vulkan/GLES DMABUF slots retained across window sizes.
 const MAX_IDLE_ZERO_COPY_SLOTS: usize = 16;
@@ -171,6 +174,9 @@ impl FramePixels {
 /// A committed surface frame `(width, height, pixels)`.
 pub type ImportedFrame = (u32, u32, FramePixels);
 
+/// A surface frame `(pixels, width, height, destination)` for [`GpuImporter::composite`].
+pub type CompositeLayer = (FramePixels, u32, u32, Rectangle<i32, Physical>);
+
 /// A GPU copy or zero-copy VRAM blit that has been queued.
 pub enum PendingReadback {
     ZeroCopy(GpuFrameHandle),
@@ -224,6 +230,9 @@ pub struct GpuImporter {
     targets: HashMap<(i32, i32), GlesTexture>,
     /// Whether the driver reads back `GL_BGRA` directly; otherwise read RGBA and swizzle.
     bgra_readback: bool,
+    /// Textures of CPU surface frames uploaded for [`GpuImporter::composite`], keyed by
+    /// the (immutable) frame bytes they hold.
+    uploads: Vec<(Weak<Vec<u8>>, GlesTexture)>,
 }
 
 impl GpuImporter {
@@ -308,6 +317,7 @@ impl GpuImporter {
             zero_copy,
             targets: HashMap::new(),
             bgra_readback,
+            uploads: Vec::new(),
         })
     }
 
@@ -455,27 +465,7 @@ impl GpuImporter {
         let zc = self.zero_copy.as_ref()?;
         let w = size.w as u32;
         let h = size.h as u32;
-
-        let pooled = zc.pool.lock().ok().and_then(|mut guard| {
-            let pos = guard
-                .free_slots
-                .iter()
-                .position(|s| s.exported.width == w && s.exported.height == h)?;
-            Some(guard.free_slots.swap_remove(pos))
-        });
-
-        let mut slot = match pooled {
-            Some(s) => s,
-            None => allocate_zero_copy_slot(
-                &zc.engine,
-                self.node,
-                w,
-                h,
-                zc.fourcc,
-                zc.bgra_format,
-                zc.rb_swizzle,
-            )?,
-        };
+        let mut slot = self.checkout_zero_copy_slot(w, h)?;
 
         let out_size: Size<i32, Physical> = (size.w, size.h).into();
         let full = Rectangle::from_size(out_size);
@@ -537,6 +527,148 @@ impl GpuImporter {
                 self.finish_readback(readback).ok().map(Readback::Ready)
             }
         }
+    }
+
+    /// A free pooled zero-copy slot of `width`x`height`, or a newly allocated one.
+    fn checkout_zero_copy_slot(&self, width: u32, height: u32) -> Option<ZeroCopySlot> {
+        let zc = self.zero_copy.as_ref()?;
+        let pooled = zc.pool.lock().ok().and_then(|mut guard| {
+            let pos = guard
+                .free_slots
+                .iter()
+                .position(|s| s.exported.width == width && s.exported.height == height)?;
+            Some(guard.free_slots.swap_remove(pos))
+        });
+        match pooled {
+            Some(slot) => Some(slot),
+            None => allocate_zero_copy_slot(
+                &zc.engine,
+                self.node,
+                width,
+                height,
+                zc.fourcc,
+                zc.bgra_format,
+                zc.rb_swizzle,
+            ),
+        }
+    }
+
+    /// Draw `layers` bottom to top, each scaled into its destination rectangle, onto a
+    /// transparent `width`x`height` VRAM frame, so a window's surface tree is composited
+    /// without reading any surface back to the CPU. CPU layers (`wl_shm`) are uploaded, once
+    /// per buffer. Blocks until the GPU has finished.
+    ///
+    /// Returns `None` without zero-copy support or if any step fails; the caller then
+    /// composites on the CPU instead.
+    pub fn composite(
+        &mut self,
+        width: u32,
+        height: u32,
+        layers: &[CompositeLayer],
+    ) -> Option<GpuFrameHandle> {
+        let render_transform = self.zero_copy.as_ref()?.render_transform;
+        let pool = Arc::clone(&self.zero_copy.as_ref()?.pool);
+        let mut slot = self.checkout_zero_copy_slot(width, height)?;
+        self.uploads.retain(|(bytes, _)| bytes.strong_count() > 0);
+
+        let drawn = (|| -> Result<()> {
+            let mut textures = Vec::with_capacity(layers.len());
+            for (pixels, w, h, dst) in layers {
+                let (texture, src) = match pixels {
+                    FramePixels::Gpu(handle) => {
+                        let source = handle.inner.slot.as_ref().expect("CheckedOutSlot live");
+                        let texture = self
+                            .renderer
+                            .import_dmabuf(&source.dmabuf, None)
+                            .map_err(|e| anyhow!("failed to import surface frame: {e:?}"))?;
+                        let src = Rectangle::<i32, BufferCoord>::new(
+                            (handle.crop_x as i32, handle.crop_y as i32).into(),
+                            (handle.width as i32, handle.height as i32).into(),
+                        );
+                        (texture, src)
+                    }
+                    FramePixels::Cpu(bytes) => {
+                        let size: Size<i32, BufferCoord> = (*w as i32, *h as i32).into();
+                        (self.upload(bytes, size)?, Rectangle::from_size(size))
+                    }
+                };
+                textures.push((texture, src.to_f64(), *dst));
+            }
+
+            let out_size: Size<i32, Physical> = (width as i32, height as i32).into();
+            let full = Rectangle::from_size(out_size);
+            let mut fb = self
+                .renderer
+                .bind(&mut slot.dmabuf)
+                .map_err(|e| anyhow!("failed to bind composite target: {e:?}"))?;
+            let mut frame = self
+                .renderer
+                .render(&mut fb, out_size, render_transform)
+                .map_err(|e| anyhow!("failed to start composite frame: {e:?}"))?;
+            frame
+                .clear(Color32F::TRANSPARENT, &[full])
+                .map_err(|e| anyhow!("{e:?}"))?;
+            for (texture, src, dst) in &textures {
+                // Damage is relative to `dst`.
+                let damage = [Rectangle::from_size(dst.size)];
+                Frame::render_texture_from_to(
+                    &mut frame,
+                    texture,
+                    *src,
+                    *dst,
+                    &damage,
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                )
+                .map_err(|e| anyhow!("failed to draw surface frame: {e:?}"))?;
+            }
+            let _ = frame
+                .finish()
+                .map_err(|e| anyhow!("failed to finish composite frame: {e:?}"))?;
+            Ok(())
+        })();
+        if let Err(err) = drawn {
+            debug!(error = %format!("{err:#}"), "GPU composite failed; compositing on the CPU");
+            return None;
+        }
+        // The encoder reads the slot through Vulkan, which doesn't wait for GL work.
+        let _ = self.renderer.with_context(|gl| unsafe { gl.Finish() });
+
+        Some(GpuFrameHandle {
+            inner: Arc::new(CheckedOutSlot {
+                slot: Some(slot),
+                pool,
+            }),
+            crop_x: 0,
+            crop_y: 0,
+            width,
+            height,
+        })
+    }
+
+    /// A texture holding CPU `BGRA` bytes, reused while the same buffer stays current.
+    fn upload(
+        &mut self,
+        bytes: &Arc<Vec<u8>>,
+        size: Size<i32, BufferCoord>,
+    ) -> Result<GlesTexture> {
+        let weak = Arc::downgrade(bytes);
+        if let Some((_, texture)) = self.uploads.iter().find(|(b, _)| b.ptr_eq(&weak)) {
+            return Ok(texture.clone());
+        }
+        if bytes.len() != (size.w * size.h * 4) as usize {
+            bail!("CPU layer has {} bytes for {size:?}", bytes.len());
+        }
+        let texture = self
+            .renderer
+            .import_memory(bytes, Fourcc::Argb8888, size, false)
+            .map_err(|e| anyhow!("failed to upload surface frame: {e:?}"))?;
+        if self.uploads.len() >= MAX_CACHED_UPLOADS {
+            self.uploads.remove(0);
+        }
+        self.uploads.push((weak, texture.clone()));
+        Ok(texture)
     }
 
     /// Complete a queued zero-copy VRAM blit or map a fallback CPU copy once its fence signals.
@@ -878,6 +1010,76 @@ mod tests {
                 gpu.finish_readback(readback)
             }
         }
+    }
+
+    #[test]
+    fn composite_draws_scaled_layers_in_vram() {
+        let Ok(Some(mut gpu)) = GpuImporter::new(&GpuMode::Auto) else {
+            eprintln!("Skipping GPU composite test: no hardware EGL GPU available");
+            return;
+        };
+        let Some(zc) = gpu.zero_copy.as_ref() else {
+            eprintln!("Skipping GPU composite test: adapter does not support DMABUF sharing");
+            return;
+        };
+        let (engine, fourcc, bgra) = (Arc::clone(&zc.engine), zc.fourcc, zc.bgra_format);
+        let node = gpu.node();
+
+        // A client surface filled with `fill`, with `corner` in its top-left quadrant.
+        let mut client_frame = |w: u32, h: u32, fill: Color32F, corner: Color32F| {
+            let mut slot = allocate_zero_copy_slot(&engine, node, w, h, fourcc, bgra, false)
+                .expect("allocate client dmabuf");
+            {
+                let mut fb = gpu.renderer.bind(&mut slot.dmabuf).unwrap();
+                let size: Size<i32, Physical> = (w as i32, h as i32).into();
+                let mut frame = gpu
+                    .renderer
+                    .render(&mut fb, size, Transform::Normal)
+                    .unwrap();
+                frame.clear(fill, &[Rectangle::from_size(size)]).unwrap();
+                let quadrant = Rectangle::from_size((w as i32 / 2, h as i32 / 2).into());
+                frame.clear(corner, &[quadrant]).unwrap();
+                let _ = frame.finish().unwrap();
+                let _ = gpu.renderer.with_context(|gl| unsafe { gl.Finish() });
+            }
+            let rb = gpu.start_readback(&slot.dmabuf, None).unwrap();
+            match wait_readback_ready(&mut gpu, rb).unwrap().2 {
+                FramePixels::Gpu(handle) => (slot, handle),
+                FramePixels::Cpu(_) => panic!("expected a zero-copy frame"),
+            }
+        };
+        let red = Color32F::new(1.0, 0.0, 0.0, 1.0);
+        let blue = Color32F::new(0.0, 0.0, 1.0, 1.0);
+        let green = Color32F::new(0.0, 1.0, 0.0, 1.0);
+        let white = Color32F::new(1.0, 1.0, 1.0, 1.0);
+        let (_root_slot, root) = client_frame(64, 48, blue, red);
+        let (_sub_slot, sub) = client_frame(8, 8, green, white);
+
+        let rect = |x, y, w, h| Rectangle::new((x, y).into(), (w, h).into());
+        // The subsurface also as a CPU (`wl_shm`) frame.
+        let sub_cpu = FramePixels::Cpu(Arc::new(sub.read_to_cpu_bgra().unwrap()));
+        let layers = [
+            (FramePixels::Gpu(root), 64, 48, rect(0, 0, 64, 48)),
+            // Upscaled 2x.
+            (FramePixels::Gpu(sub), 8, 8, rect(24, 16, 16, 16)),
+            // Hanging off the bottom-right corner.
+            (sub_cpu, 8, 8, rect(52, 36, 16, 16)),
+        ];
+        let out = gpu.composite(64, 48, &layers).expect("GPU composite");
+        let px = out.read_to_cpu_bgra().expect("read composite");
+        let at = |x: usize, y: usize| <[u8; 4]>::try_from(&px[(y * 64 + x) * 4..][..4]).unwrap();
+        const RED: [u8; 4] = [0, 0, 255, 255];
+        const BLUE: [u8; 4] = [255, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        const WHITE: [u8; 4] = [255, 255, 255, 255];
+        assert_eq!(at(4, 4), RED, "root top-left quadrant");
+        assert_eq!(at(60, 4), BLUE, "root outside its quadrant");
+        assert_eq!(at(4, 44), BLUE, "root outside its quadrant");
+        assert_eq!(at(26, 18), WHITE, "subsurface top-left quadrant, scaled");
+        assert_eq!(at(37, 29), GREEN, "subsurface, scaled");
+        assert_eq!(at(22, 30), BLUE, "left of the subsurface");
+        assert_eq!(at(53, 37), WHITE, "clipped subsurface top-left quadrant");
+        assert_eq!(at(63, 47), GREEN, "clipped subsurface");
     }
 
     #[test]
