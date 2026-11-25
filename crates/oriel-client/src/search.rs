@@ -183,6 +183,7 @@ mod tests {
             keywords: keywords.iter().map(|s| (*s).to_string()).collect(),
             exec: exec.to_string(),
             categories: Vec::new(),
+            terminal: false,
             icon_mime: None,
             icon_data: Vec::new(),
         };

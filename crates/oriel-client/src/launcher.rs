@@ -186,7 +186,14 @@ mod cli_ui {
                     let mut pick = String::new();
                     io::stdin().lock().read_line(&mut pick)?;
                     if let Ok(idx) = pick.trim().parse::<usize>() {
-                        if idx >= 1 && idx <= matches.len() {
+                        if idx >= 1 && idx <= matches.len() && matches[idx - 1].terminal {
+                            let exec = matches[idx - 1].exec.as_str();
+                            if let Err(err) =
+                                spawn_local_terminal_pty_socket(&pty_sock, None, Some(exec))
+                            {
+                                eprintln!("Failed to open remote terminal: {err}");
+                            }
+                        } else if idx >= 1 && idx <= matches.len() {
                             let id = next_id;
                             next_id += 1;
                             let _ = ctrl_tx.send(ControlMessage::LaunchApp {

@@ -141,10 +141,7 @@ fn parse_desktop_content(content: &str, id: &str, icon_dirs: &[PathBuf]) -> Opti
     {
         return None;
     }
-    if fields.get("Terminal").map(|s| s.as_str()) == Some("true") {
-        // Keep terminal apps out or include them? They still launch fine inside a terminal or skipped;
-        // let's include them if they have Name and Exec.
-    }
+    let terminal = fields.get("Terminal").map(|s| s.as_str()) == Some("true");
 
     let name = fields.get("Name")?.trim().to_string();
     let raw_exec = fields.get("Exec")?.trim();
@@ -182,6 +179,7 @@ fn parse_desktop_content(content: &str, id: &str, icon_dirs: &[PathBuf]) -> Opti
         keywords,
         exec,
         categories,
+        terminal,
         icon_mime,
         icon_data,
     })
@@ -276,6 +274,10 @@ mod tests {
         assert_eq!(app.generic_name, None);
         assert!(app.keywords.is_empty());
         assert_eq!(app.exec, "xterm");
+        assert!(!app.terminal);
+
+        let tui = "[Desktop Entry]\nType=Application\nName=htop\nExec=htop\nTerminal=true\n";
+        assert!(parse_desktop_content(tui, "htop.desktop", &[]).unwrap().terminal);
 
         let hidden = "[Desktop Entry]\nType=Application\nName=Hidden\nExec=true\nNoDisplay=true\n";
         assert!(parse_desktop_content(hidden, "hidden.desktop", &[]).is_none());

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -242,6 +242,9 @@ pub struct RemoteAppEntry {
     pub keywords: Vec<String>,
     pub exec: String,
     pub categories: Vec<String>,
+    /// `Terminal=true`: the program needs a terminal, so the client runs `exec` in a
+    /// remote PTY shown in a local terminal emulator instead of as a GUI launch.
+    pub terminal: bool,
     pub icon_mime: Option<String>,
     pub icon_data: Vec<u8>,
 }
@@ -1028,6 +1031,7 @@ mod tests {
                     keywords: vec!["internet".into(), "www".into()],
                     exec: "firefox".into(),
                     categories: vec!["Network".into()],
+                    terminal: false,
                     icon_mime: None,
                     icon_data: Vec::new(),
                 },
@@ -1038,6 +1042,7 @@ mod tests {
                     keywords: Vec::new(),
                     exec: "xterm".into(),
                     categories: Vec::new(),
+                    terminal: true,
                     icon_mime: None,
                     icon_data: Vec::new(),
                 },

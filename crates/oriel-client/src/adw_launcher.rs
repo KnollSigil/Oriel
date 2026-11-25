@@ -890,6 +890,26 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         })
     };
 
+    // Grid apps: `Terminal=true` entries open in a local terminal over a remote PTY.
+    let launch_app: Rc<dyn Fn(RemoteAppEntry)> = {
+        let state = Rc::clone(&state);
+        let search_entry = search_entry.clone();
+        let toasts = toasts.clone();
+        let launch_exec_or_app = Rc::clone(&launch_exec_or_app);
+        Rc::new(move |app: RemoteAppEntry| {
+            if !app.terminal {
+                launch_exec_or_app(app.name, app.exec);
+                return;
+            }
+            if let Err(err) = state.borrow().sessions.launch_in_terminal(&app.exec) {
+                tracing::warn!(error = %err, exec = %app.exec, "failed to open terminal app");
+                show_toast(&toasts, &format!("Couldn't open {}: {err}", app.name));
+            }
+            search_entry.set_text("");
+            search_entry.grab_focus();
+        })
+    };
+
     let select_first_visible: Rc<dyn Fn()> = {
         let flow = flow.clone();
         let state = Rc::clone(&state);
@@ -1134,6 +1154,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         let current_filter = Rc::clone(&current_filter);
         let apply_filter = Rc::clone(&apply_filter);
         let launch_exec_or_app = Rc::clone(&launch_exec_or_app);
+        let launch_app = Rc::clone(&launch_app);
         move |e| {
             let typed = e.text().trim().to_string();
             if let Some(cmd) = search::explicit_command(&typed) {
@@ -1164,7 +1185,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                     .cloned()
             };
             if let Some(app) = picked {
-                launch_exec_or_app(app.name, app.exec);
+                launch_app(app);
             } else if !typed.is_empty() {
                 launch_exec_or_app(typed.clone(), typed);
             }
@@ -1334,12 +1355,12 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     // Clicking or activating a grid item launches & resets.
     flow.connect_child_activated({
         let state = Rc::clone(&state);
-        let launch_exec_or_app = Rc::clone(&launch_exec_or_app);
+        let launch_app = Rc::clone(&launch_app);
         move |_, child| {
             let picked = flow_child_app_idx(child)
                 .and_then(|idx| state.borrow().grid_apps.get(idx).cloned());
             if let Some(app) = picked {
-                launch_exec_or_app(app.name, app.exec);
+                launch_app(app);
             }
         }
     });

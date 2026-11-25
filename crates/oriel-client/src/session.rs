@@ -768,7 +768,16 @@ impl SessionManager {
         let sess = self
             .active_session()
             .ok_or_else(|| anyhow!("not connected"))?;
-        spawn_terminal(sess.connected_pty_socket()?, None, terminal)
+        spawn_terminal(sess.connected_pty_socket()?, None, None, terminal)
+    }
+
+    /// Run `exec` (a `Terminal=true` app) on the active host in a new remote PTY shown in
+    /// the default local terminal emulator. The server announces the PTY back as a program.
+    pub fn launch_in_terminal(&self, exec: &str) -> Result<()> {
+        let sess = self
+            .active_session()
+            .ok_or_else(|| anyhow!("not connected"))?;
+        spawn_terminal(sess.connected_pty_socket()?, None, Some(exec), None)
     }
 
     /// Reattach a detached persistent PTY of `target` in the default terminal emulator.
@@ -779,6 +788,7 @@ impl SessionManager {
         spawn_terminal(
             sess.connected_pty_socket()?,
             Some(launch_id & !PTY_LAUNCH_ID_BASE),
+            None,
             None,
         )
     }
@@ -1041,8 +1051,14 @@ fn track_program_state(
 }
 
 /// Spawn a local terminal attached to a remote PTY and reap it in the background.
-fn spawn_terminal(socket: &Path, pty_id: Option<u64>, terminal: Option<&str>) -> Result<()> {
-    let mut child = spawn_local_terminal_pty_socket_with_terminal(socket, pty_id, None, terminal)?;
+fn spawn_terminal(
+    socket: &Path,
+    pty_id: Option<u64>,
+    command: Option<&str>,
+    terminal: Option<&str>,
+) -> Result<()> {
+    let mut child =
+        spawn_local_terminal_pty_socket_with_terminal(socket, pty_id, command, terminal)?;
     std::thread::Builder::new()
         .name("oriel-pty-reap".into())
         .spawn(move || {
