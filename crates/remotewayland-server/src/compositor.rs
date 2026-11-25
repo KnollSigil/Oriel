@@ -255,6 +255,9 @@ pub enum CompositorCommand {
         x: f64,
         y: f64,
     },
+    PointerLeave {
+        window_id: WindowId,
+    },
     PointerButton {
         window_id: WindowId,
         button: u32,
@@ -901,6 +904,17 @@ impl AppState {
         hit
     }
 
+    /// The window `surface` belongs to, walking up subsurface parents.
+    fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
+        let mut cur = surface.clone();
+        loop {
+            if let Some(&wid) = self.surface_to_window.get(&cur.id()) {
+                return Some(wid);
+            }
+            cur = get_parent(&cur)?;
+        }
+    }
+
     fn keyboard_focus_target_for_window(
         &mut self,
         window_id: WindowId,
@@ -1119,6 +1133,27 @@ impl AppState {
                         },
                     );
                     pointer.frame(self);
+                }
+            }
+            CompositorCommand::PointerLeave { window_id } => {
+                if let Some(pointer) = self.seat.get_pointer() {
+                    // Ignore a stale leave if the pointer already entered another window.
+                    let owner = pointer
+                        .current_focus()
+                        .and_then(|s| self.window_for_surface(&s));
+                    if owner == Some(window_id) {
+                        let location = pointer.current_location();
+                        pointer.motion(
+                            self,
+                            None,
+                            &MotionEvent {
+                                location,
+                                serial,
+                                time: time_ms,
+                            },
+                        );
+                        pointer.frame(self);
+                    }
                 }
             }
             CompositorCommand::PointerButton {
@@ -2413,18 +2448,7 @@ impl AppState {
             self.emit_cursor_surface_bitmap(surface);
         }
 
-        let mut cur = surface.clone();
-        let window_id_opt = loop {
-            let key = cur.id();
-            if let Some(&wid) = self.surface_to_window.get(&key) {
-                break Some(wid);
-            }
-            match get_parent(&cur) {
-                Some(parent) => cur = parent,
-                None => break None,
-            }
-        };
-        let Some(window_id) = window_id_opt else {
+        let Some(window_id) = self.window_for_surface(surface) else {
             return;
         };
 

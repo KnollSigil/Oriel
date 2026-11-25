@@ -1913,6 +1913,9 @@ impl PointerHandler for ClientApp {
                     self.border_resize_active = false;
                     self.last_cursor = ActiveCursor::Named(CursorIcon::Default);
                     self.release_pressed_buttons(window_id);
+                    let _ = self
+                        .ctrl_tx
+                        .send(ControlMessage::PointerLeave { window_id });
                 }
             }
         }

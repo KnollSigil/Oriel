@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -455,6 +455,8 @@ pub enum ControlMessage {
     /// Client -> Server: XDG `org.freedesktop.appearance` `contrast`
     /// (`0` = no preference, `1` = higher contrast).
     Contrast { contrast: u32 },
+    /// Client -> Server: the local pointer left a remote window (mirrors `wl_pointer::leave`).
+    PointerLeave { window_id: WindowId },
 }
 
 /// Whether `rgb` is a valid XDG `accent-color`: three finite components in `[0, 1]`.

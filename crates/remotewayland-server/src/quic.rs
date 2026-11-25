@@ -884,6 +884,9 @@ async fn run_display_session(
                     Some(ControlMessage::PointerButton { window_id, button, pressed }) => {
                         let _ = cmd_tx.send(CompositorCommand::PointerButton { window_id, button, pressed });
                     }
+                    Some(ControlMessage::PointerLeave { window_id }) => {
+                        let _ = cmd_tx.send(CompositorCommand::PointerLeave { window_id });
+                    }
                     Some(ControlMessage::PointerAxis { window_id, dx, dy }) => {
                         let _ = cmd_tx.send(CompositorCommand::PointerAxis { window_id, dx, dy });
                     }
