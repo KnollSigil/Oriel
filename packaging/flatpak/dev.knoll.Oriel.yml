@@ -6,7 +6,7 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   # libclang for bindgen (pipewire-sys)
   - org.freedesktop.Sdk.Extension.llvm22
-command: remotewayland-client
+command: oriel-client
 
 finish-args:
   # Display / GPU
@@ -18,7 +18,7 @@ finish-args:
   # Audio: PipeWire (native) with PulseAudio fallback
   - --socket=pulseaudio
   - --filesystem=xdg-run/pipewire-0
-  # SSH access for `remotewayland-client connect`
+  # SSH access for `oriel-client connect`
   - --socket=ssh-auth
   - --filesystem=~/.ssh:ro
   # Color scheme / settings portal
@@ -29,7 +29,7 @@ finish-args:
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
   env:
-    CARGO_HOME: /run/build/remotewayland/cargo
+    CARGO_HOME: /run/build/oriel/cargo
     CARGO_NET_OFFLINE: 'true'
     LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
   arch:
@@ -40,7 +40,7 @@ build-options:
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: gcc
 
 modules:
-  - name: remotewayland
+  - name: oriel
     buildsystem: simple
     build-options:
       env:
@@ -54,9 +54,9 @@ modules:
         # Normalize vendored crate timestamps so Cargo does not re-run build.rs
         # and recompile C/C++ crates when flatpak-builder re-extracts sources.
         find "${CARGO_HOME}/vendor" -exec touch -h -d '2020-01-01T00:00:00Z' {} +
-        cargo --offline build --release -p remotewayland-client
-      - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/remotewayland-client"
-        /app/bin/remotewayland-client
+        cargo --offline build --release -p oriel-client
+      - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/oriel-client"
+        /app/bin/oriel-client
       - install -Dm644 packaging/flatpak/dev.knoll.Oriel.desktop
         /app/share/applications/dev.knoll.Oriel.desktop
       - install -Dm644 packaging/flatpak/dev.knoll.Oriel.metainfo.xml

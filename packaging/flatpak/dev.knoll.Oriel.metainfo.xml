@@ -7,14 +7,14 @@
   <project_license>MIT OR Apache-2.0</project_license>
   <description>
     <p>
-      Oriel is the RemoteWayland client: a rootless, low-latency streamer for
+      Oriel is a rootless, low-latency streamer for
       remote Linux GUI applications with video and bidirectional PipeWire audio
       over QUIC. Remote windows appear as native local windows.
     </p>
   </description>
   <launchable type="desktop-id">dev.knoll.Oriel.desktop</launchable>
   <provides>
-    <binary>remotewayland-client</binary>
+    <binary>oriel-client</binary>
   </provides>
   <content_rating type="oars-1.1" />
   <releases>

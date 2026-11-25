@@ -29,4 +29,4 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libclang-dev libwayland-dev libxkbcommon-dev libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev libspa-0.2-dev libopus-dev
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release -p remotewayland-client
+      - run: cargo build --release -p oriel-client

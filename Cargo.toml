@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/remotewayland-proto",
-    "crates/remotewayland-server",
-    "crates/remotewayland-client",
+    "crates/oriel-proto",
+    "crates/oriel-server",
+    "crates/oriel-client",
 ]
 
 [workspace.package]
@@ -45,4 +45,4 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wgpu = { version = "30.0", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl"] }
 zbus = "5"
-remotewayland-proto = { path = "crates/remotewayland-proto" }
+oriel-proto = { path = "crates/oriel-proto" }

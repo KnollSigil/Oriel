@@ -2027,6 +2027,76 @@ dependencies = [
 ]
 
 [[package]]
+name = "oriel-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gtk4",
+ "libadwaita",
+ "libc",
+ "lz4_flex",
+ "opus",
+ "oriel-proto",
+ "pipewire",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "smithay-client-toolkit",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
+name = "oriel-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "bytemuck",
+ "bytes",
+ "libc",
+ "lz4_flex",
+ "pollster",
+ "postcard",
+ "serde",
+ "tokio",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "oriel-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "clap",
+ "libc",
+ "lz4_flex",
+ "opus",
+ "oriel-proto",
+ "pipewire",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "smithay",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "pango"
 version = "0.22.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2453,76 +2523,6 @@ name = "regex-syntax"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
-
-[[package]]
-name = "remotewayland-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "gtk4",
- "libadwaita",
- "libc",
- "lz4_flex",
- "opus",
- "pipewire",
- "quinn",
- "rcgen",
- "remotewayland-proto",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "smithay-client-toolkit",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wayland-client",
- "wayland-protocols",
-]
-
-[[package]]
-name = "remotewayland-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "bytemuck",
- "bytes",
- "libc",
- "lz4_flex",
- "pollster",
- "postcard",
- "serde",
- "tokio",
- "tracing",
- "wgpu",
-]
-
-[[package]]
-name = "remotewayland-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calloop",
- "clap",
- "libc",
- "lz4_flex",
- "opus",
- "pipewire",
- "quinn",
- "rcgen",
- "remotewayland-proto",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "smithay",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zbus",
-]
 
 [[package]]
 name = "renderdoc-sys"

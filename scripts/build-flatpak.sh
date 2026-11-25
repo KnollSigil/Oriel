@@ -13,7 +13,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-flatpak.sh [OPTIONS]
 
-Build the Oriel (RemoteWayland client, GTK4/libadwaita) Flatpak.
+Build the Oriel client (GTK4/libadwaita) Flatpak.
 
 Options:
   --arch <x86_64|aarch64>  Target architecture (default: host). Non-host arches

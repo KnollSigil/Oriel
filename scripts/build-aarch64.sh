@@ -12,14 +12,14 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-aarch64.sh [OPTIONS]
 
-Cross-compile RemoteWayland for aarch64-unknown-linux-gnu with the Rust/GCC aarch64
+Cross-compile Oriel for aarch64-unknown-linux-gnu with the Rust/GCC aarch64
 cross toolchain inside a native (x86_64) Ubuntu 24.04 container. No qemu emulation.
 
 Options:
   --gtk4             Build client with GTK4/libadwaita launcher (default)
   --no-gui           Build client without GUI launcher (--no-default-features)
-  --client-only      Build only remotewayland-client
-  --server-only      Build only remotewayland-server
+  --client-only      Build only oriel-client
+  --server-only      Build only oriel-server
   --debug            Build debug profile instead of release
   --rebuild-image    Rebuild the cross-compilation builder container image
   -h, --help         Show this help message
@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IMAGE_NAME="localhost/remotewayland-aarch64-cross-builder:latest"
+IMAGE_NAME="localhost/oriel-aarch64-cross-builder:latest"
 CONTAINERFILE="${REPO_ROOT}/scripts/Containerfile.aarch64"
 TARGET_DIR="${REPO_ROOT}/target"
 
@@ -104,12 +104,12 @@ if [[ "${TARGET_SCOPE}" == "workspace" && "${GUI}" == "gtk4" ]]; then
     run_cargo build "${PROFILE_FLAG[@]}" --workspace --target aarch64-unknown-linux-gnu
 else
     if [[ "${TARGET_SCOPE}" != "server" ]]; then
-        echo "==> Building remotewayland-client (gui=${GUI}, ${PROFILE}) for aarch64-unknown-linux-gnu..."
-        run_cargo build "${PROFILE_FLAG[@]}" -p remotewayland-client "${CLIENT_FEAT_FLAGS[@]}" --target aarch64-unknown-linux-gnu
+        echo "==> Building oriel-client (gui=${GUI}, ${PROFILE}) for aarch64-unknown-linux-gnu..."
+        run_cargo build "${PROFILE_FLAG[@]}" -p oriel-client "${CLIENT_FEAT_FLAGS[@]}" --target aarch64-unknown-linux-gnu
     fi
     if [[ "${TARGET_SCOPE}" != "client" ]]; then
-        echo "==> Building remotewayland-server (${PROFILE}) for aarch64-unknown-linux-gnu..."
-        run_cargo build "${PROFILE_FLAG[@]}" -p remotewayland-server --target aarch64-unknown-linux-gnu
+        echo "==> Building oriel-server (${PROFILE}) for aarch64-unknown-linux-gnu..."
+        run_cargo build "${PROFILE_FLAG[@]}" -p oriel-server --target aarch64-unknown-linux-gnu
     fi
 fi
 
