@@ -24,6 +24,7 @@ use crate::hosts::{HostProfile, RenderScaleCap};
 use crate::pty::{available_local_terminals, terminal_basename};
 use crate::search::{self, MatchTier, SearchIndexEntry};
 use crate::session::{Changes, ConnStatus, HostEditError, SessionEvents, SessionManager};
+use crate::symbolic_icon::SymbolicIcon;
 
 /// Must match the Flatpak app ID: the sandbox only lets the app own D-Bus names under it,
 /// and compositors match the Wayland app ID to the installed `.desktop` file.
@@ -38,7 +39,7 @@ struct AppUi {
     grid_apps: Vec<RemoteAppEntry>,
     grid_search: Vec<SearchIndexEntry>,
     grid_tiers: Vec<Option<MatchTier>>,
-    icon_cache: HashMap<String, Option<gdk::Texture>>,
+    icon_cache: HashMap<String, Option<gdk::Paintable>>,
 }
 
 /// Refreshes the views named by a [`Changes`]. Bound once all views exist, so callbacks
@@ -944,9 +945,8 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                     .unwrap_or_default();
                 for entry in &apps {
                     if !st.icon_cache.contains_key(&entry.id) && !entry.icon_data.is_empty() {
-                        let tex =
-                            load_pixbuf(&entry.icon_data).map(|pb| gdk::Texture::for_pixbuf(&pb));
-                        st.icon_cache.insert(entry.id.clone(), tex);
+                        st.icon_cache
+                            .insert(entry.id.clone(), app_icon_paintable(entry));
                     }
                 }
                 st.grid_search = apps.iter().map(SearchIndexEntry::from_app).collect();
@@ -960,7 +960,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
                 vbox.set_size_request(96, 84);
                 let img = match state.borrow().icon_cache.get(&entry.id) {
-                    Some(Some(tex)) => gtk::Image::from_paintable(Some(tex)),
+                    Some(Some(icon)) => gtk::Image::from_paintable(Some(icon)),
                     _ => gtk::Image::from_icon_name("application-x-executable-symbolic"),
                 };
                 img.set_pixel_size(48);
@@ -2066,6 +2066,40 @@ fn saved_connection_row(ctx: &ManageCtx, profile: &HostProfile) -> adw::Expander
     });
 
     expander
+}
+
+/// Size symbolic icons are rasterised at: 2x the 48 px grid icon, since their SVGs are
+/// often drawn at 16-24 px and would blur if rendered at their own size and scaled up.
+const SYMBOLIC_ICON_PX: i32 = 96;
+
+/// Launcher grid icon for `entry`; symbolic icons are drawn in the foreground colour so
+/// they stay readable on both light and dark backgrounds.
+fn app_icon_paintable(entry: &RemoteAppEntry) -> Option<gdk::Paintable> {
+    if entry.icon_symbolic {
+        let pixbuf = load_pixbuf_sized(&entry.icon_data, SYMBOLIC_ICON_PX)?;
+        let mask = gdk::Texture::for_pixbuf(&pixbuf);
+        Some(SymbolicIcon::new(mask).upcast())
+    } else {
+        let pixbuf = load_pixbuf(&entry.icon_data)?;
+        Some(gdk::Texture::for_pixbuf(&pixbuf).upcast())
+    }
+}
+
+/// Decode `data`, scaling it to fit `max_px` square (keeping its aspect ratio); vector
+/// formats render at that size directly.
+fn load_pixbuf_sized(data: &[u8], max_px: i32) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    let loader = PixbufLoader::new();
+    loader.connect_size_prepared(move |loader, w, h| {
+        if w > 0 && h > 0 {
+            let scale = f64::from(max_px) / f64::from(w.max(h));
+            let sw = ((f64::from(w) * scale).round() as i32).max(1);
+            let sh = ((f64::from(h) * scale).round() as i32).max(1);
+            loader.set_size(sw, sh);
+        }
+    });
+    loader.write(data).ok()?;
+    loader.close().ok()?;
+    loader.pixbuf()
 }
 
 fn load_pixbuf(data: &[u8]) -> Option<gtk::gdk_pixbuf::Pixbuf> {

@@ -83,8 +83,9 @@ const ICON_THEMES: [&str; 4] = ["hicolor", "Adwaita", "breeze", "AdwaitaLegacy"]
 /// Launcher icon size the lookup aims for, in pixels.
 const TARGET_ICON_SIZE: u32 = 64;
 
-/// Index of the non-symbolic PNG/SVG icons in [`ICON_THEMES`] (all sizes and contexts) and
-/// in `pixmaps`, across the XDG data dirs, keyed by icon name.
+/// Index of the PNG/SVG icons in [`ICON_THEMES`] (all sizes and contexts) and in `pixmaps`,
+/// across the XDG data dirs, keyed by icon name. Symbolic (monochrome) icons are indexed only
+/// under their own `-symbolic` names, so they appear only when an entry asks for one.
 #[derive(Default)]
 pub(crate) struct IconIndex {
     /// Candidates per name, best first.
@@ -186,33 +187,36 @@ fn collect_icon_files(dir: &Path, depth: u32, wanted: &HashSet<String>, out: &mu
     }
 }
 
-/// Icon name of a `.png`/`.svg` file, or `None` for other files and symbolic icons.
+/// Icon name of a `.png`/`.svg` file, or `None` for other files.
 fn icon_stem(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_str()?;
     if ext != "png" && ext != "svg" {
         return None;
     }
-    let stem = path.file_stem()?.to_str()?;
-    if stem.ends_with("-symbolic") {
-        return None;
-    }
-    Some(stem.to_string())
+    Some(path.file_stem()?.to_str()?.to_string())
 }
 
 /// Name and size penalty (lower is better) of an icon at `rel` inside a theme directory,
 /// whose size comes from a `48x48`, `48x48@2`, `48`, `48@2x` or `scalable` component.
-/// Symbolic icons are skipped.
+/// A `symbolic` directory only holds `-symbolic` icons; anything else there is skipped.
 fn classify_icon(rel: &Path) -> Option<(String, u32)> {
     let name = icon_stem(rel)?;
     let mut size = None;
+    let mut in_symbolic_dir = false;
     for comp in rel.parent()?.components() {
         let comp = comp.as_os_str().to_str()?;
         if comp.contains("symbolic") {
-            return None;
-        }
-        if size.is_none() {
+            in_symbolic_dir = true;
+        } else if size.is_none() {
             size = parse_size_dir(comp);
         }
+    }
+    if in_symbolic_dir {
+        if !name.ends_with("-symbolic") {
+            return None;
+        }
+        // Symbolic dirs (`Adwaita/symbolic/apps`) carry no size: they hold SVGs.
+        size = size.or(Some(IconSize::Scalable));
     }
     let penalty = match size? {
         // Scalable renders crisply at any size: rank it just after an exact 64-128 px PNG.
@@ -330,11 +334,13 @@ fn parse_desktop_content(
         .map(|s| parse_semicolon_list(s))
         .unwrap_or_default();
 
-    let (icon_mime, icon_data) = fields
-        .get("Icon")
+    let icon = fields.get("Icon").map(|s| s.as_str());
+    let (icon_mime, icon_data) = icon
         .and_then(|icon| load_icon_bytes(icon, icon_index))
         .map(|(mime, data)| (Some(mime), data))
         .unwrap_or((None, Vec::new()));
+    // Symbolic icons are only ever loaded when `Icon=` names one (see `IconIndex`).
+    let icon_symbolic = !icon_data.is_empty() && icon.is_some_and(is_symbolic_icon_name);
 
     Some(RemoteAppEntry {
         id: id.to_string(),
@@ -346,6 +352,7 @@ fn parse_desktop_content(
         terminal,
         icon_mime,
         icon_data,
+        icon_symbolic,
     })
 }
 
@@ -379,6 +386,11 @@ fn icon_name(icon: &str) -> &str {
     icon.strip_suffix(".png")
         .or_else(|| icon.strip_suffix(".svg"))
         .unwrap_or(icon)
+}
+
+/// Whether an `Icon=` value (name or path) names a symbolic icon (`foo-symbolic[.svg]`).
+fn is_symbolic_icon_name(icon: &str) -> bool {
+    icon_name(icon).ends_with("-symbolic")
 }
 
 fn load_icon_bytes(icon: &str, icon_index: &IconIndex) -> Option<(String, Vec<u8>)> {
@@ -485,7 +497,7 @@ mod icon_tests {
     }
 
     #[test]
-    fn classify_icon_ranks_sizes_and_skips_symbolic() {
+    fn classify_icon_ranks_sizes_and_handles_symbolic() {
         let p = |s: &str| classify_icon(Path::new(s));
         let exact = p("64x64/apps/a.png").unwrap().1;
         let scalable = p("scalable/apps/a.svg").unwrap().1;
@@ -494,8 +506,25 @@ mod icon_tests {
         assert!(exact < scalable && scalable < large && large < small);
         // Context directories other than `apps`, and breeze's context/size layout.
         assert_eq!(p("devices/64/printer.svg"), Some(("printer".into(), 0)));
+        // Symbolic icons are classified under their own `-symbolic` name only.
         assert!(p("symbolic/apps/a.svg").is_none());
-        assert!(p("scalable/apps/a-symbolic.svg").is_none());
+        assert_eq!(
+            p("symbolic/devices/printer-symbolic.svg"),
+            Some(("printer-symbolic".into(), 32))
+        );
+        assert_eq!(
+            p("status/22/fcitx-googlepinyin-symbolic.svg").map(|(n, _)| n),
+            Some("fcitx-googlepinyin-symbolic".into())
+        );
         assert!(p("apps/a.png").is_none());
+    }
+
+    #[test]
+    fn is_symbolic_icon_name_checks_name_and_path_forms() {
+        assert!(is_symbolic_icon_name("printer-symbolic"));
+        assert!(is_symbolic_icon_name("printer-symbolic.svg"));
+        assert!(is_symbolic_icon_name("/opt/app/icons/app-symbolic.svg"));
+        assert!(!is_symbolic_icon_name("printer"));
+        assert!(!is_symbolic_icon_name("/opt/symbolic/app.svg"));
     }
 }

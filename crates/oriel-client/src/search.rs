@@ -186,6 +186,7 @@ mod tests {
             terminal: false,
             icon_mime: None,
             icon_data: Vec::new(),
+            icon_symbolic: false,
         };
         SearchIndexEntry::from_app(&app)
     }

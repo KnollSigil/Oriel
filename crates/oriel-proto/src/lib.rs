@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -247,6 +247,9 @@ pub struct RemoteAppEntry {
     pub terminal: bool,
     pub icon_mime: Option<String>,
     pub icon_data: Vec<u8>,
+    /// `icon_data` is a symbolic (monochrome) icon: clients recolour it to their
+    /// foreground colour instead of drawing its stock grey.
+    pub icon_symbolic: bool,
 }
 
 /// Lifecycle state of a launched remote application.
@@ -1034,6 +1037,7 @@ mod tests {
                     terminal: false,
                     icon_mime: None,
                     icon_data: Vec::new(),
+                    icon_symbolic: false,
                 },
                 RemoteAppEntry {
                     id: "xterm.desktop".into(),
@@ -1045,6 +1049,7 @@ mod tests {
                     terminal: true,
                     icon_mime: None,
                     icon_data: Vec::new(),
+                    icon_symbolic: false,
                 },
             ],
         };

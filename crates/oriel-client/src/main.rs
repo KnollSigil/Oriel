@@ -17,6 +17,8 @@ mod quic;
 mod search;
 #[cfg(any(feature = "gtk4", test))]
 mod session;
+#[cfg(feature = "gtk4")]
+mod symbolic_icon;
 mod window;
 
 use std::net::SocketAddr;
