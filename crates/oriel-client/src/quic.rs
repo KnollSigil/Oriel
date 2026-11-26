@@ -871,8 +871,8 @@ pub async fn run_client(
                 | ControlMessage::RemoteDragStart { .. }) => {
                     let _ = clipboard_tx.send(msg);
                 }
-                ControlMessage::DragFinished => {
-                    let _ = ui_tx.send(ClientUiEvent::DragFinished);
+                ControlMessage::DragFinished { offer_id } => {
+                    let _ = ui_tx.send(ClientUiEvent::DragFinished { offer_id });
                 }
                 ControlMessage::PrimarySelectionText { text } => {
                     let _ = ui_tx.send(ClientUiEvent::PrimarySelectionText { text });

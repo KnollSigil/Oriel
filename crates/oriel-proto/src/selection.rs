@@ -24,6 +24,10 @@ use crate::SUPPORTED_TEXT_MIMES;
 /// The FileTransfer portal's older type name, still read by some toolkits.
 pub const PORTAL_FILES_MIME: &str = "application/vnd.portal.files";
 
+/// Prefix of the marker type an Oriel client adds to its own clipboard sources to recognise
+/// their echo. Never forwarded.
+pub const SOURCE_MARKER_PREFIX: &str = "application/x-oriel-source-";
+
 /// Text up to this size travels with the offer; larger text is fetched like other types.
 pub const INLINE_TEXT_MAX: usize = 64 * 1024;
 
@@ -54,7 +58,8 @@ pub fn proxyable_mimes(mimes: &[String]) -> Vec<String> {
             || mime == PORTAL_FILES_MIME
             || mime.starts_with("application/x-kde-ark-dndextract")
             // GTK's marker for drags within one process.
-            || mime == "application/x-gtk-local-dnd";
+            || mime == "application/x-gtk-local-dnd"
+            || mime.starts_with(SOURCE_MARKER_PREFIX);
         if !local_only && !out.contains(mime) {
             out.push(mime.clone());
         }
@@ -231,8 +236,34 @@ pub async fn serve_selection_data(source: Option<OwnedFd>, send: &mut quinn::Sen
     }
 }
 
+/// An async writer for a selection destination: a pipe as such, any other fd (a socket, a
+/// file) through blocking writes on tokio's blocking pool.
+fn async_writer(fd: OwnedFd) -> Result<Box<dyn tokio::io::AsyncWrite + Unpin + Send>> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fstat on a valid fd into a zeroed stat buffer.
+    let is_fifo = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(fd.as_raw_fd(), &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO
+    };
+    if is_fifo {
+        Ok(Box::new(tokio::net::unix::pipe::Sender::from_owned_fd(fd)?))
+    } else {
+        // Written with blocking writes on the blocking pool, which a non-blocking socket
+        // would fail with EAGAIN.
+        // SAFETY: fcntl on a valid fd.
+        unsafe {
+            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+            if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+                libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+        Ok(Box::new(tokio::fs::File::from_std(std::fs::File::from(fd))))
+    }
+}
+
 /// Fetch type `mime` of the peer's selection `offer_id` into `dest` (the write end of a
-/// pipe a local app reads from). Stops early when the app closes its end.
+/// pipe a local app reads from, or any writable fd). Stops early when the app closes its
+/// end.
 pub async fn fetch_selection_data(
     conn: &quinn::Connection,
     offer_id: u64,
@@ -240,8 +271,7 @@ pub async fn fetch_selection_data(
     dest: OwnedFd,
 ) -> Result<()> {
     let started = std::time::Instant::now();
-    let mut dest = tokio::net::unix::pipe::Sender::from_owned_fd(dest)
-        .context("selection destination is not a pipe")?;
+    let mut dest = async_writer(dest)?;
     tracing::debug!(offer_id, %mime, "fetching selection data");
     let (mut send, mut recv) = conn.open_bi().await?;
     crate::write_bidi_stream_header(
@@ -263,6 +293,8 @@ pub async fn fetch_selection_data(
             .await
             .context("selection transfer stalled")??;
         let Some(n) = n else {
+            // A file destination buffers writes.
+            dest.flush().await?;
             tracing::debug!(
                 offer_id,
                 bytes = total,

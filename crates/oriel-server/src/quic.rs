@@ -305,6 +305,8 @@ struct Shared {
     xfer_owner: Arc<XferOwner>,
     /// Where files offered by the display client are presented; `None` without FUSE.
     xfer_mount: Option<Arc<XferMount>>,
+    /// The session's latest clipboard offer, for display clients that connect later.
+    clipboard_offer: Arc<std::sync::Mutex<Option<ControlMessage>>>,
 }
 
 /// Handle incoming authenticated client sessions on an endpoint from [`bind_endpoint`].
@@ -338,6 +340,7 @@ pub async fn run_server(
         events: bcast_tx,
         display: Arc::new(Mutex::new(DisplaySlot::default())),
         xfer_owner: Arc::new(XferOwner::new()),
+        clipboard_offer: Arc::default(),
         xfer_mount,
     });
     while let Some(incoming) = endpoint.accept().await {
@@ -499,17 +502,20 @@ fn spawn_bidi_stream_acceptor(
                 match read_bidi_stream_header(&mut recv_bi).await {
                     Ok(BidiStreamHeader::SelectionData { offer_id, mime }) => {
                         // The compositor hands the write end to the selection's owner, or
-                        // drops it (end of data) when the offer is no longer current.
-                        let source = std::io::pipe().ok().and_then(|(read, write)| {
-                            cmd_tx
-                                .send(CompositorCommand::ReadSelection {
-                                    offer_id,
-                                    mime,
-                                    fd: write.into(),
-                                })
-                                .ok()
-                                .map(|()| OwnedFd::from(read))
-                        });
+                        // reports that the offer is no longer current.
+                        let mut source = None;
+                        if let Ok((read, write)) = std::io::pipe() {
+                            let (found_tx, found_rx) = tokio::sync::oneshot::channel();
+                            let sent = cmd_tx.send(CompositorCommand::ReadSelection {
+                                offer_id,
+                                mime,
+                                fd: write.into(),
+                                found: found_tx,
+                            });
+                            if sent.is_ok() && matches!(found_rx.await, Ok(true)) {
+                                source = Some(OwnedFd::from(read));
+                            }
+                        }
                         oriel_proto::selection::serve_selection_data(source, &mut send_bi).await;
                     }
                     Ok(
@@ -818,10 +824,16 @@ async fn run_display_session(
     // slow work never stalls event forwarding and makes the event receiver lag.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ControlMessage>();
 
+    // A client connecting to a session whose clipboard is already set gets it right away.
+    let current_clipboard = shared.clipboard_offer.lock().unwrap().clone();
+    if let Some(msg) = current_clipboard {
+        let _ = out_tx.send(msg);
+    }
     let mut fwd = EventForwarder::new(
         conn.clone(),
         selected_codec,
         Arc::clone(&shared.xfer_owner),
+        Arc::clone(&shared.clipboard_offer),
         out_tx.clone(),
     );
 
@@ -1109,6 +1121,7 @@ fn selection_fetcher(conn: quinn::Connection) -> SelectionFetcher {
 /// itself), so it runs here and not in the session loop.
 fn spawn_clipboard_worker(
     xfer_owner: Arc<XferOwner>,
+    last_offer: Arc<std::sync::Mutex<Option<ControlMessage>>>,
     out_tx: mpsc::UnboundedSender<ControlMessage>,
 ) -> mpsc::UnboundedSender<CompositorEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<CompositorEvent>();
@@ -1193,6 +1206,9 @@ fn spawn_clipboard_worker(
                 }
                 _ => continue,
             };
+            if matches!(msg, ControlMessage::ClipboardOffer { .. }) {
+                *last_offer.lock().unwrap() = Some(msg.clone());
+            }
             if out_tx.send(msg).is_err() {
                 break;
             }
@@ -1222,11 +1238,12 @@ impl EventForwarder {
         conn: quinn::Connection,
         selected_codec: VideoCodec,
         xfer_owner: Arc<XferOwner>,
+        last_clipboard_offer: Arc<std::sync::Mutex<Option<ControlMessage>>>,
         out_tx: mpsc::UnboundedSender<ControlMessage>,
     ) -> Self {
         Self {
             conn,
-            clipboard_tx: spawn_clipboard_worker(xfer_owner, out_tx),
+            clipboard_tx: spawn_clipboard_worker(xfer_owner, last_clipboard_offer, out_tx),
             selected_codec,
             session_start: Instant::now(),
             video_pipelines: HashMap::new(),
@@ -1557,8 +1574,8 @@ impl EventForwarder {
             ev @ (CompositorEvent::ClipboardOffer { .. } | CompositorEvent::DragOffer { .. }) => {
                 let _ = self.clipboard_tx.send(ev);
             }
-            CompositorEvent::DragFinished => {
-                write_control_message(send, &ControlMessage::DragFinished).await?;
+            CompositorEvent::DragFinished { offer_id } => {
+                write_control_message(send, &ControlMessage::DragFinished { offer_id }).await?;
             }
             CompositorEvent::PrimarySelectionText { text } => {
                 write_control_message(send, &ControlMessage::PrimarySelectionText { text }).await?;

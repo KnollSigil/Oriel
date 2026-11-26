@@ -394,9 +394,14 @@ pub fn unmount_stale(mountpoint: &Path) {
         Err(err) => err.raw_os_error() == Some(libc::ENOTCONN),
         Ok(meta) => is_mountpoint(mountpoint, &meta),
     };
-    if !stale {
-        return;
+    if stale {
+        detach(mountpoint);
     }
+}
+
+/// Lazily detach whatever is mounted at `mountpoint` (`fusermount3 -u -z`), without
+/// touching it first: a stat could hang on a mount whose server is stuck.
+pub fn detach(mountpoint: &Path) {
     let bin = std::env::var_os("FUSERMOUNT_PATH").unwrap_or_else(|| "fusermount3".into());
     match std::process::Command::new(&bin)
         .arg("-u")

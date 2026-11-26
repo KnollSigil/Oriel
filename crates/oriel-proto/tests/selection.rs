@@ -110,3 +110,17 @@ async fn stops_when_the_app_stops_reading() {
         .unwrap();
     app.join().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetches_into_a_file_destination() {
+    let (owner, reader) = quic_pair().await;
+    let data = Arc::new(pattern(3 * 1024 * 1024 + 5));
+    serve(owner, Arc::clone(&data));
+    let path = std::env::temp_dir().join(format!("oriel-sel-dest-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    fetch_selection_data(&reader, 1, "image/png".into(), file.into())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), *data);
+    let _ = std::fs::remove_file(&path);
+}

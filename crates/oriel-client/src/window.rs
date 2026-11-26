@@ -188,8 +188,10 @@ pub enum ClientUiEvent {
         clip: ReceivedClipboard,
         fetch: crate::xfer::SelectionFetcher,
     },
-    /// The remote app a local drag was dropped on is done with it.
-    DragFinished,
+    /// The remote app the local drag with offer `offer_id` was dropped on is done with it.
+    DragFinished {
+        offer_id: u64,
+    },
     PrimarySelectionText {
         text: String,
     },
@@ -530,11 +532,17 @@ struct ClientApp {
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
     /// The server's clipboard our `copy_paste_source` offers.
     clipboard: Option<(ReceivedClipboard, crate::xfer::SelectionFetcher)>,
+    /// The compositor echoed `copy_paste_source` back as the selection, so it took it. A
+    /// compositor ignores a selection set while none of our windows has keyboard focus;
+    /// an unconfirmed one is set again on the next keyboard enter.
+    clipboard_confirmed: bool,
+    /// A type only our own clipboard sources offer, to recognise their echo exactly.
+    source_marker: String,
     /// A local drag over one of our windows.
     incoming_drag: Option<IncomingDrag>,
-    /// The relay of a local drag dropped on a remote window, waiting for the remote app to
-    /// finish reading it.
-    finishing_drag: Option<std::sync::mpsc::Sender<IncomingDragEvent>>,
+    /// Relays of local drags dropped on a remote window, by offer id, waiting for the
+    /// remote app to finish reading them.
+    finishing_drags: HashMap<u64, std::sync::mpsc::Sender<IncomingDragEvent>>,
     /// A remote app's drag of files, continued on the local desktop.
     outgoing_drag: Option<OutgoingDrag>,
     last_primary: String,
@@ -1140,10 +1148,13 @@ impl ClientApp {
                 if let (Some(mgr), Some(data_device)) =
                     (&self.data_device_manager_state, &self.data_device)
                 {
-                    let source = mgr.create_copy_paste_source(&self.qh, clip.mime_types());
+                    let mut mimes = clip.mime_types();
+                    mimes.push(self.source_marker.clone());
+                    let source = mgr.create_copy_paste_source(&self.qh, mimes);
                     source.set_selection(data_device, self.last_input_serial);
                     self.copy_paste_source = Some(source);
                     self.clipboard = Some((clip, fetch));
+                    self.clipboard_confirmed = false;
                 }
             }
             ClientUiEvent::RemoteDragStart {
@@ -1153,10 +1164,17 @@ impl ClientApp {
             } => {
                 self.start_outgoing_drag(window_id, clip, fetch);
             }
-            ClientUiEvent::DragFinished => {
-                if let Some(events) = self.finishing_drag.take() {
+            ClientUiEvent::DragFinished { offer_id } => {
+                // Forget relays that already gave up (their receiver is gone).
+                self.finishing_drags
+                    .retain(|_, tx| tx.send(IncomingDragEvent::Ping).is_ok());
+                if let Some(events) = self.finishing_drags.remove(&offer_id) {
                     let _ = events.send(IncomingDragEvent::Finished);
-                } else if let Some(drag) = self.incoming_drag.as_ref().filter(|d| d.dropped) {
+                } else if let Some(drag) = self
+                    .incoming_drag
+                    .as_ref()
+                    .filter(|d| d.offer_id == offer_id)
+                {
                     let _ = drag.events.send(IncomingDragEvent::Finished);
                 }
             }
@@ -1748,6 +1766,7 @@ impl KeyboardHandler for ClientApp {
         _: &[Keysym],
     ) {
         self.last_input_serial = serial;
+        self.reassert_clipboard(serial);
         let surf_id = surface.id().protocol_id();
         if let Some(&window_id) = self.surface_to_remote.get(&surf_id) {
             self.focused_window_id = window_id;
@@ -2045,6 +2064,8 @@ enum IncomingDragEvent {
     Drop,
     /// The remote app it was dropped on is done reading (see `ControlMessage::DragFinished`).
     Finished,
+    /// Liveness probe; ignored.
+    Ping,
 }
 
 /// How long a dropped local drag stays readable for the remote app it was dropped on,
@@ -2065,6 +2086,7 @@ struct OutgoingDrag {
 
 /// A local drag over one of our remote windows.
 struct IncomingDrag {
+    offer_id: u64,
     events: std::sync::mpsc::Sender<IncomingDragEvent>,
     dropped: bool,
 }
@@ -2130,6 +2152,8 @@ fn relay_incoming_drag(drag: DragEntered, events: std::sync::mpsc::Receiver<Inco
             files,
         });
     }
+    // The server can report the drag over before it is dropped (it refused the drag).
+    let mut finished_early = false;
     while let Ok(event) = events.recv() {
         match event {
             IncomingDragEvent::Motion { x, y } => {
@@ -2144,7 +2168,7 @@ fn relay_incoming_drag(drag: DragEntered, events: std::sync::mpsc::Receiver<Inco
                 return;
             }
             IncomingDragEvent::Drop => {
-                if announced {
+                if announced && !finished_early {
                     let _ = ctrl_tx.send(ControlMessage::DragDrop);
                     // The remote app reads the data after the drop; finishing the offer
                     // would let the source drop it.
@@ -2161,7 +2185,8 @@ fn relay_incoming_drag(drag: DragEntered, events: std::sync::mpsc::Receiver<Inco
                 let _ = conn.flush();
                 return;
             }
-            IncomingDragEvent::Finished => {}
+            IncomingDragEvent::Finished => finished_early = true,
+            IncomingDragEvent::Ping => {}
         }
     }
 }
@@ -2259,7 +2284,28 @@ impl ClientApp {
             let _ = self.ctrl_tx.send(ControlMessage::RemoteDragEnd);
         }
         self.pressed_buttons.remove(&BTN_LEFT);
-        drag.source.inner().destroy();
+        // Dropping the source destroys it.
+        drop(drag);
+    }
+
+    /// Set the server's clipboard again if the compositor never took it (see
+    /// `clipboard_confirmed`), now that a window has focus (`serial` from its enter).
+    fn reassert_clipboard(&mut self, serial: u32) {
+        if self.clipboard_confirmed {
+            return;
+        }
+        let (Some(mgr), Some(data_device), Some((clip, _))) = (
+            &self.data_device_manager_state,
+            &self.data_device,
+            &self.clipboard,
+        ) else {
+            return;
+        };
+        let mut mimes = clip.mime_types();
+        mimes.push(self.source_marker.clone());
+        let source = mgr.create_copy_paste_source(&self.qh, mimes);
+        source.set_selection(data_device, serial);
+        self.copy_paste_source = Some(source);
     }
 
     /// Tell the relay thread of the incoming drag, if any, that it ended with `event`. A
@@ -2267,7 +2313,10 @@ impl ClientApp {
     fn end_incoming_drag(&mut self, event: IncomingDragEvent) {
         if let Some(drag) = self.incoming_drag.take() {
             if drag.dropped {
-                self.finishing_drag = Some(drag.events);
+                // Forget relays that already gave up (their receiver is gone).
+                self.finishing_drags
+                    .retain(|_, tx| tx.send(IncomingDragEvent::Ping).is_ok());
+                self.finishing_drags.insert(drag.offer_id, drag.events);
             } else {
                 let _ = drag.events.send(event);
             }
@@ -2333,9 +2382,15 @@ impl DataDeviceHandler for ClientApp {
         offer.set_actions(DndAction::Copy, DndAction::Copy);
         let _ = self.conn.flush();
         let offer_id = oriel_proto::xfer::random_u64();
-        crate::xfer::register_live_source(offer_id, offer.inner().clone(), self.conn.clone());
+        crate::xfer::register_live_source(
+            OfferSlot::Drag,
+            offer_id,
+            offer.inner().clone(),
+            self.conn.clone(),
+        );
         let (events_tx, events_rx) = std::sync::mpsc::channel();
         self.incoming_drag = Some(IncomingDrag {
+            offer_id,
             events: events_tx,
             dropped: false,
         });
@@ -2382,10 +2437,6 @@ impl DataDeviceHandler for ClientApp {
     }
 
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, wl_data_device: &WlDataDevice) {
-        // Ignore selection echo when our own CopyPasteSource is active.
-        if self.copy_paste_source.is_some() {
-            return;
-        }
         let Some(data_device) = &self.data_device else {
             return;
         };
@@ -2395,6 +2446,24 @@ impl DataDeviceHandler for ClientApp {
         let Some(offer) = data_device.data().selection_offer() else {
             return;
         };
+        if offer.with_mime_types(|mimes| mimes.contains(&self.source_marker)) {
+            // The echo of our own source: the compositor took it.
+            self.clipboard_confirmed = true;
+            return;
+        }
+        if self.clipboard.is_some() && !self.clipboard_confirmed {
+            // The compositor never took the server's clipboard (set while unfocused) and
+            // holds another selection. Which is newer is unknown, so neither side
+            // overwrites the other: stop offering the server's here, and keep this one
+            // local. A copy made from now on is sent as usual.
+            self.copy_paste_source = None;
+            self.clipboard = None;
+            self.clipboard_confirmed = true;
+            return;
+        }
+        // Another app took the clipboard after ours.
+        self.copy_paste_source = None;
+        self.clipboard = None;
         let all_mimes = offer.with_mime_types(|mimes| mimes.to_vec());
         let text_mime = SUPPORTED_TEXT_MIMES
             .iter()
@@ -2406,7 +2475,12 @@ impl DataDeviceHandler for ClientApp {
         let _ = self.conn.flush();
         // Every other type is read only when a server pastes it.
         let offer_id = oriel_proto::xfer::random_u64();
-        crate::xfer::register_live_source(offer_id, offer.inner().clone(), self.conn.clone());
+        crate::xfer::register_live_source(
+            OfferSlot::Clipboard,
+            offer_id,
+            offer.inner().clone(),
+            self.conn.clone(),
+        );
         let ctrl_tx = self.ctrl_tx.clone();
         std::thread::spawn(move || {
             let files = match (file_pipe, file_mime) {
@@ -2600,7 +2674,11 @@ impl DataSourceHandler for ClientApp {
             .is_some_and(|s| s.inner() == source)
         {
             self.copy_paste_source = None;
-            self.clipboard = None;
+            // A source the compositor rejected (set while unfocused; some compositors
+            // cancel it) is set again on the next keyboard enter.
+            if self.clipboard_confirmed {
+                self.clipboard = None;
+            }
         } else {
             source.destroy();
         }
@@ -2889,8 +2967,14 @@ pub fn run_event_loop(
         latest_frames,
         ctrl_tx,
         clipboard: None,
+        clipboard_confirmed: false,
+        source_marker: format!(
+            "{}{:016x}",
+            oriel_proto::selection::SOURCE_MARKER_PREFIX,
+            oriel_proto::xfer::random_u64()
+        ),
         incoming_drag: None,
-        finishing_drag: None,
+        finishing_drags: HashMap::new(),
         outgoing_drag: None,
         last_primary: String::new(),
         exit: false,

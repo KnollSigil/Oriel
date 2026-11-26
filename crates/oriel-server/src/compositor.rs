@@ -239,8 +239,11 @@ pub enum CompositorEvent {
         mimes: Vec<String>,
         paths: Option<Vec<PathBuf>>,
     },
-    /// The app the client's drag was dropped on is done with it (or the drop failed).
-    DragFinished,
+    /// The client's drag with offer `offer_id` is over: the app it was dropped on is done
+    /// with it, or it ended without a drop.
+    DragFinished {
+        offer_id: u64,
+    },
     PrimarySelectionText {
         text: String,
     },
@@ -334,9 +337,11 @@ pub enum CompositorCommand {
         offer_id: u64,
         mime: String,
         fd: OwnedFd,
+        /// Whether the offer is still current (otherwise `fd` is dropped unanswered).
+        found: tokio::sync::oneshot::Sender<bool>,
     },
-    /// A client drag carrying files (presented at `paths` in the transfer mount) entered
-    /// remote window `window_id` at surface-local `x`/`y`.
+    /// A client drag entered remote window `window_id` at surface-local `x`/`y`; types not
+    /// held locally are fetched with `fetch`.
     DragStart {
         window_id: WindowId,
         x: f64,
@@ -987,6 +992,25 @@ impl AppState {
         serial: Serial,
         time_ms: u32,
     ) {
+        // Smithay's drag callbacks do not say which drag they are for, so a drop whose
+        // target is still reading keeps the drag slot for a while: refuse the new drag
+        // (telling its client right away) rather than serve the old drop the new data.
+        if let Some(old) = self.host_drag.as_ref().filter(|d| !d.active) {
+            let reading = old
+                .dropped_at
+                .is_some_and(|t| t.elapsed() < DROPPED_DRAG_GRACE);
+            if reading {
+                debug!("refusing a drag while the previous drop is still being read");
+                let _ = self.event_tx.send(CompositorEvent::DragFinished {
+                    offer_id: drag.clip.offer_id,
+                });
+                return;
+            }
+            let _ = self.event_tx.send(CompositorEvent::DragFinished {
+                offer_id: old.clip.offer_id,
+            });
+            self.host_drag = None;
+        }
         self.cancel_host_drag(serial, time_ms);
         let Some(pointer) = self.seat.get_pointer() else {
             return;
@@ -1046,6 +1070,21 @@ impl AppState {
                 },
             );
             pointer.frame(self);
+        }
+    }
+
+    /// The host drag is over: tell its client, which can end the local drag. Smithay's
+    /// `finished`/`cancelled` callbacks come only after a drop (smithay reports `dropped`
+    /// first, even for a cancel), so one arriving while the drag is still active belongs
+    /// to an older drag and is ignored.
+    fn end_host_drag(&mut self) {
+        if self.host_drag.as_ref().is_some_and(|d| d.active) {
+            return;
+        }
+        if let Some(drag) = self.host_drag.take() {
+            let _ = self.event_tx.send(CompositorEvent::DragFinished {
+                offer_id: drag.clip.offer_id,
+            });
         }
     }
 
@@ -1404,6 +1443,7 @@ impl AppState {
                     clip,
                     fetch,
                     active: true,
+                    dropped_at: None,
                 },
                 serial,
                 time_ms,
@@ -1633,16 +1673,25 @@ impl AppState {
             CompositorCommand::SetClipboard { clip, fetch } => {
                 self.set_host_clipboard(HostClipboard { clip, fetch });
             }
-            CompositorCommand::ReadSelection { offer_id, mime, fd } => {
+            CompositorCommand::ReadSelection {
+                offer_id,
+                mime,
+                fd,
+                found,
+            } => {
                 if self.owned_clipboard_offer == Some(offer_id) {
+                    let _ = found.send(true);
                     self.request_owned_clipboard(mime, fd);
                 } else if let Some((_, source)) = self
                     .outgoing_drag
                     .as_ref()
                     .filter(|(id, _)| *id == offer_id)
                 {
+                    let _ = found.send(true);
                     source.send(mime, std::os::fd::AsFd::as_fd(&fd));
                     let _ = self.display_handle.flush_clients();
+                } else {
+                    let _ = found.send(false);
                 }
             }
             CompositorCommand::SetPrimarySelectionText { text } => {
@@ -3539,6 +3588,9 @@ impl SeatHandler for AppState {
 /// Linux evdev code of the left mouse button, which host drags are held with.
 const BTN_LEFT: u32 = 0x110;
 
+/// How long a dropped client drag keeps the drag slot while its target reads the data.
+const DROPPED_DRAG_GRACE: Duration = Duration::from_secs(10);
+
 pub(crate) const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What the client is dragging over the session's apps.
@@ -3547,6 +3599,7 @@ struct HostDrag {
     fetch: SelectionFetcher,
     /// Not yet dropped or cancelled. After a drop the target may still read the data.
     active: bool,
+    dropped_at: Option<Instant>,
 }
 
 /// The client's clipboard, as the session's selection.
@@ -3602,11 +3655,7 @@ impl AppState {
         let Some(display) = self.x11_display.clone() else {
             return;
         };
-        std::thread::spawn(move || {
-            if let Some(bytes) = display.read_clipboard(&mime) {
-                write_selection_fd_timeout(fd, &bytes);
-            }
-        });
+        std::thread::spawn(move || display.read_clipboard_to(&mime, &fd, usize::MAX));
     }
 }
 
@@ -3739,13 +3788,27 @@ fn write_portal_key(paths: Vec<PathBuf>, fd: OwnedFd) {
 /// Write selection bytes to `fd` with a bounded `poll(2)` deadline so a stalled
 /// reader cannot pin a worker thread indefinitely.
 fn write_selection_fd_timeout(fd: OwnedFd, bytes: &[u8]) {
-    let raw = fd.as_raw_fd();
-    let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
+    write_fd_idle(fd.as_raw_fd(), bytes, SELECTION_IO_TIMEOUT);
+}
+
+/// Write all of `bytes` to `raw`, giving up when the reader takes no data for `idle` (so a
+/// stalled reader cannot pin a thread, while a slow one still gets everything). `false`
+/// when not everything was written.
+pub(crate) fn write_fd_idle(raw: std::os::fd::RawFd, bytes: &[u8], idle: Duration) -> bool {
+    // Non-blocking, so a write never waits past the poll for more room than there is.
+    // SAFETY: fcntl on a valid fd.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let mut deadline = Instant::now() + idle;
     let mut written = 0;
     while written < bytes.len() {
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
-            break;
+            return false;
         }
         let mut pfd = libc::pollfd {
             fd: raw,
@@ -3757,10 +3820,10 @@ fn write_selection_fd_timeout(fd: OwnedFd, bytes: &[u8]) {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            break;
+            return false;
         }
         if rc == 0 || (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
-            break;
+            return false;
         }
         let n = unsafe {
             libc::write(
@@ -3769,11 +3832,20 @@ fn write_selection_fd_timeout(fd: OwnedFd, bytes: &[u8]) {
                 bytes.len() - written,
             )
         };
-        if n <= 0 {
-            break;
+        if n < 0 {
+            let err = std::io::Error::last_os_error().kind();
+            if err == std::io::ErrorKind::WouldBlock || err == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if n == 0 {
+            return false;
         }
         written += n as usize;
+        deadline = Instant::now() + idle;
     }
+    true
 }
 
 impl SelectionHandler for AppState {
@@ -4685,11 +4757,14 @@ impl XwmHandler for AppState {
                     let Some(display) = display.clone() else {
                         return false;
                     };
-                    std::thread::spawn(move || {
-                        if let Some(bytes) = display.read_clipboard(&mime) {
-                            write_selection_fd_timeout(fd, &bytes);
-                        }
-                    });
+                    // Text is only sent along when small: stop reading just past the
+                    // limit instead of buffering huge text.
+                    let max = if pick_preferred_text_mime(std::slice::from_ref(&mime)).is_some() {
+                        oriel_proto::selection::INLINE_TEXT_MAX + 1
+                    } else {
+                        usize::MAX
+                    };
+                    std::thread::spawn(move || display.read_clipboard_to(&mime, &fd, max));
                     true
                 });
             }
@@ -4814,17 +4889,16 @@ impl ServerDndGrabHandler for AppState {
     fn dropped(&mut self, _seat: Seat<Self>) {
         if let Some(drag) = &mut self.host_drag {
             drag.active = false;
+            drag.dropped_at = Some(Instant::now());
         }
     }
 
     fn cancelled(&mut self, _seat: Seat<Self>) {
-        self.host_drag = None;
-        let _ = self.event_tx.send(CompositorEvent::DragFinished);
+        self.end_host_drag();
     }
 
     fn finished(&mut self, _seat: Seat<Self>) {
-        self.host_drag = None;
-        let _ = self.event_tx.send(CompositorEvent::DragFinished);
+        self.end_host_drag();
     }
 }
 

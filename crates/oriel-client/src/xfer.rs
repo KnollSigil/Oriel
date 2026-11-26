@@ -1,6 +1,6 @@
 //! Client side of streamed clipboard file transfer (see `oriel_proto::xfer`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -44,6 +44,9 @@ const MOUNT_RETRY: Duration = Duration::from_secs(30);
 
 static MOUNT: Mutex<MountSlot> = Mutex::new(MountSlot::Unmounted);
 
+/// Where the transfer mount is, readable while `MOUNT` is locked by a stuck unmount.
+static MOUNTPOINT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// The transfer mount where files offered by servers appear, mounted on first use.
 fn mount() -> Option<Arc<XferMount>> {
     let mut slot = MOUNT.lock().unwrap();
@@ -69,7 +72,10 @@ fn try_mount() -> Option<Arc<XferMount>> {
     cleanup_stale_mounts(&dir, MOUNT_PREFIX);
     let mountpoint = dir.join(format!("{MOUNT_PREFIX}{:016x}", rand_suffix()));
     match XferMount::mount(&mountpoint, rt.handle().clone()) {
-        Ok(m) => Some(Arc::new(m)),
+        Ok(m) => {
+            *MOUNTPOINT.lock().unwrap() = Some(mountpoint);
+            Some(Arc::new(m))
+        }
         Err(err) => {
             warn!(error = %format!("{err:#}"), "file transfer unavailable: cannot mount FUSE");
             let _ = std::fs::remove_dir(&mountpoint);
@@ -178,19 +184,39 @@ pub fn write_portal_key(paths: Vec<PathBuf>, fd: std::os::fd::OwnedFd) {
 /// Local selections (clipboard contents, drags) offered to servers, by offer id, so a
 /// server's paste can read any type from the app that owns it. wayland-client objects can
 /// send requests from any thread, so reads need no trip through a window loop.
-static LIVE_SOURCES: Mutex<VecDeque<(u64, WlDataOffer, wayland_client::Connection)>> =
-    Mutex::new(VecDeque::new());
+static LIVE_SOURCES: Mutex<Vec<LiveSource>> = Mutex::new(Vec::new());
 
-/// Offers kept readable: the current clipboard and drag per session, with room to spare.
-const KEPT_LIVE_SOURCES: usize = 16;
+struct LiveSource {
+    slot: OfferSlot,
+    offer_id: u64,
+    offer: WlDataOffer,
+    conn: wayland_client::Connection,
+}
 
-/// Make local selection `offer` readable by servers as `offer_id`.
-pub fn register_live_source(offer_id: u64, offer: WlDataOffer, conn: wayland_client::Connection) {
+/// Live sources kept per session (Wayland connection) and slot: the current one, and the
+/// one before it (a dropped drag may still be read while the next one starts).
+const KEPT_LIVE_SOURCES: usize = 2;
+
+/// Make local selection `offer` (the clipboard or a drag, per `slot`) readable by servers
+/// as `offer_id`.
+pub fn register_live_source(
+    slot: OfferSlot,
+    offer_id: u64,
+    offer: WlDataOffer,
+    conn: wayland_client::Connection,
+) {
     let mut sources = LIVE_SOURCES.lock().unwrap();
-    sources.push_back((offer_id, offer, conn));
-    while sources.len() > KEPT_LIVE_SOURCES {
-        sources.pop_front();
+    let same = |s: &LiveSource| s.slot == slot && s.conn == conn;
+    while sources.iter().filter(|s| same(s)).count() >= KEPT_LIVE_SOURCES {
+        let oldest = sources.iter().position(same).expect("counted above");
+        sources.remove(oldest);
     }
+    sources.push(LiveSource {
+        slot,
+        offer_id,
+        offer,
+        conn,
+    });
 }
 
 /// Ask the owner of live source `offer_id` for type `mime`: the read end of the pipe it
@@ -199,8 +225,8 @@ pub fn register_live_source(offer_id: u64, offer: WlDataOffer, conn: wayland_cli
 fn open_live_source(offer_id: u64, mime: String) -> Option<std::os::fd::OwnedFd> {
     let (offer, conn) = {
         let sources = LIVE_SOURCES.lock().unwrap();
-        let (_, offer, conn) = sources.iter().find(|(id, _, _)| *id == offer_id)?;
-        (offer.clone(), conn.clone())
+        let source = sources.iter().find(|s| s.offer_id == offer_id)?;
+        (source.offer.clone(), source.conn.clone())
     };
     let pipe =
         smithay_client_toolkit::data_device_manager::data_offer::receive(&offer, mime).ok()?;
@@ -218,6 +244,46 @@ extern "C" fn on_termination_signal(sig: libc::c_int) {
     unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
 }
 
+/// How long a clean unmount may take after a termination signal.
+const UNMOUNT_GRACE: Duration = Duration::from_secs(3);
+
+/// The next signal number reported on the signal pipe `fd`; `None` on error or after
+/// `timeout`.
+fn read_signal(fd: libc::c_int, timeout: Option<Duration>) -> Option<i32> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        if let Some(deadline) = deadline {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is valid for the call.
+            let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis() as i32) };
+            if rc == 0 {
+                return None;
+            }
+            if rc < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+        }
+        let mut byte = 0u8;
+        // SAFETY: reads one byte into `byte`.
+        let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if n == 1 {
+            return Some(i32::from(byte));
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+}
+
 /// On SIGTERM, SIGINT or SIGHUP, unmount the transfer mount and exit (128 + signal), so a
 /// killed client does not leave a dead mount behind. A handler, not a blocked signal mask:
 /// handlers reset on exec, so the programs this client starts keep default behaviour.
@@ -233,22 +299,20 @@ pub fn unmount_on_termination_signals() {
     let spawned = std::thread::Builder::new()
         .name("oriel-signals".into())
         .spawn(move || {
-            let mut byte = 0u8;
-            loop {
-                // SAFETY: reads one byte into `byte`.
-                let n = unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) };
-                if n == 1 {
-                    break;
-                }
-                if n < 0
-                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                {
-                    continue;
-                }
+            let Some(sig) = read_signal(read_fd, None) else {
                 return;
+            };
+            // Unmount cleanly, unless that hangs (a FUSE request stuck on a dead
+            // connection) or another signal insists: then detach lazily and exit anyway.
+            std::thread::spawn(move || {
+                unmount();
+                std::process::exit(128 + sig);
+            });
+            let _ = read_signal(read_fd, Some(UNMOUNT_GRACE));
+            if let Some(mountpoint) = MOUNTPOINT.lock().unwrap().clone() {
+                oriel_proto::xfer_fuse::detach(&mountpoint);
             }
-            unmount();
-            std::process::exit(128 + i32::from(byte));
+            std::process::exit(128 + sig);
         });
     if spawned.is_err() {
         warn!("cannot watch termination signals: thread spawn failed");

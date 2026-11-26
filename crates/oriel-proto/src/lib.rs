@@ -506,9 +506,10 @@ pub enum ControlMessage {
     DragLeave,
     /// Client -> Server: the drag was dropped where it last moved to.
     DragDrop,
-    /// Server -> Client: the app the drag from [`ControlMessage::DragEnter`] was dropped on
-    /// is done with its data (or the drop failed): the client can end the local drag.
-    DragFinished,
+    /// Server -> Client: the app the drag with offer `offer_id` (from
+    /// [`ControlMessage::DragEnter`]) was dropped on is done with its data, or the drag
+    /// ended without a drop: the client can end the local drag.
+    DragFinished { offer_id: u64 },
     /// Server -> Client: an app in remote window `window_id` started a drag that can leave
     /// the session (files, text, images). The client continues it on the local desktop;
     /// its data is offered like [`ControlMessage::ClipboardOffer`] (`mimes` fetched from

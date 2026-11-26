@@ -27,6 +27,9 @@ use crate::compositor::SELECTION_IO_TIMEOUT;
 
 const COOKIE_AUTH: &[u8] = b"MIT-MAGIC-COOKIE-1";
 
+/// How long a streamed write may wait for the reader (the client's paste over the network).
+const STREAM_WRITE_IDLE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Largest selection read with incremental (INCR) transfers, which X11 apps use for
 /// anything bigger than a request (images, mostly).
 const MAX_INCR_BYTES: usize = 256 * 1024 * 1024;
@@ -67,27 +70,46 @@ impl X11Display {
         }
     }
 
-    /// The `CLIPBOARD` selection converted to `mime`, or `None` when the owner refuses,
-    /// sends more than `MAX_INCR_BYTES`, or stalls for `SELECTION_IO_TIMEOUT`.
-    pub fn read_clipboard(&self, mime: &str) -> Option<Vec<u8>> {
+    /// Stream the `CLIPBOARD` selection converted to `mime` into `fd` as it arrives, at most
+    /// `max` bytes (the reader sees more data than it wants and stops). Writes wait for a
+    /// slow reader; a reader that stops reading ends the transfer.
+    pub fn read_clipboard_to(&self, mime: &str, fd: &std::os::fd::OwnedFd, max: usize) {
+        let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
+        self.read_clipboard_with(mime, max.min(MAX_INCR_BYTES), &mut |chunk| {
+            // As patient as the stream draining the pipe to the client.
+            crate::compositor::write_fd_idle(raw, chunk, STREAM_WRITE_IDLE)
+        });
+    }
+
+    /// Convert the selection to `mime`, passing the data to `sink` chunk by chunk (it
+    /// returns `false` to stop) up to `max` bytes. `true` when all of it was passed.
+    fn read_clipboard_with(
+        &self,
+        mime: &str,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> bool {
         let mut slot = self.reader.lock().unwrap();
         if slot.is_none() {
             match self.connect() {
                 Ok(reader) => *slot = Some(reader),
                 Err(err) => {
                     tracing::debug!(error = %err, "cannot connect to XWayland for the clipboard");
-                    return None;
+                    return false;
                 }
             }
         }
-        let reader = slot.as_ref()?;
-        match reader.read(mime) {
-            Ok(data) => data,
+        let Some(reader) = slot.as_ref() else {
+            return false;
+        };
+        match reader.read(mime, max, sink) {
+            Ok(complete) => complete,
             Err(err) => {
-                tracing::debug!(error = %err, mime, "X11 clipboard conversion failed");
-                // Reconnect next time.
+                // An abandoned incremental transfer leaves the owner writing chunks to our
+                // window: start over with a new connection and window next time.
+                tracing::debug!(error = %err, mime, "X11 clipboard conversion ended early");
                 *slot = None;
-                None
+                false
             }
         }
     }
@@ -159,7 +181,15 @@ fn target_name(mime: &str) -> &str {
 }
 
 impl Reader {
-    fn read(&self, mime: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Convert the selection to `mime` into `sink` (see `read_clipboard_with`). `Ok(false)`
+    /// when the owner refused or did not answer; an error once an incremental transfer
+    /// started and was abandoned (the window must not be reused).
+    fn read(
+        &self,
+        mime: &str,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> anyhow::Result<bool> {
         let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
         let conn = &self.conn;
         let target = conn
@@ -192,29 +222,30 @@ impl Reader {
                 continue;
             }
             if !wait_readable(conn.stream(), deadline) {
-                return Ok(None);
+                return Ok(false);
             }
         };
         if !answered {
-            return Ok(None);
+            return Ok(false);
         }
 
         let reply = self.take_property()?;
         if reply.type_ != self.incr {
             if reply.bytes_after != 0 || reply.format != 8 {
-                return Ok(None);
+                return Ok(false);
             }
-            return Ok(Some(reply.value));
+            let take = reply.value.len().min(max);
+            return Ok(sink(&reply.value[..take]) && take == reply.value.len());
         }
         // INCR (ICCCM 2.7.2): deleting the property (done by `take_property`) asks for the
         // first chunk; each chunk arrives as a new property value, which we take (deleting
         // it asks for the next) until an empty one ends the transfer.
-        let mut data = Vec::new();
+        let mut total = 0usize;
         let mut deadline = Instant::now() + SELECTION_IO_TIMEOUT;
         loop {
             let Some(event) = conn.poll_for_event()? else {
                 if !wait_readable(conn.stream(), deadline) {
-                    return Ok(None);
+                    anyhow::bail!("incremental transfer stalled");
                 }
                 continue;
             };
@@ -227,15 +258,19 @@ impl Reader {
             }
             let chunk = self.take_property()?;
             if chunk.format != 8 || chunk.bytes_after != 0 {
-                return Ok(None);
+                anyhow::bail!("unexpected incremental chunk");
             }
             if chunk.value.is_empty() {
-                return Ok(Some(data));
+                return Ok(true);
             }
-            if data.len() + chunk.value.len() > MAX_INCR_BYTES {
-                return Ok(None);
+            let take = chunk.value.len().min(max - total);
+            if !sink(&chunk.value[..take]) {
+                anyhow::bail!("reader stopped");
             }
-            data.extend_from_slice(&chunk.value);
+            total += take;
+            if take < chunk.value.len() {
+                anyhow::bail!("larger than {max} bytes");
+            }
             deadline = Instant::now() + SELECTION_IO_TIMEOUT;
         }
     }
