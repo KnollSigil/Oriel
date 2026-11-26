@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use oriel_proto::xfer::{FileEntry, XferOwner};
+use oriel_proto::xfer::{FileEntry, OfferSlot, XferOwner};
 use oriel_proto::xfer_fuse::{cleanup_stale_mounts, XferMount};
 use oriel_proto::{read_bidi_stream_header, BidiStreamHeader};
 use tracing::{debug, warn};
@@ -98,11 +98,12 @@ pub fn cleanup_stale_in_background() {
 /// unavailable). Blocks on the first call while mounting.
 pub fn receive_offer(
     conn: quinn::Connection,
+    slot: OfferSlot,
     offer_id: u64,
     roots: Vec<FileEntry>,
 ) -> Vec<PathBuf> {
     match mount() {
-        Some(m) => m.add_offer(conn, offer_id, roots),
+        Some(m) => m.add_offer(conn, slot, offer_id, roots),
         None => Vec::new(),
     }
 }

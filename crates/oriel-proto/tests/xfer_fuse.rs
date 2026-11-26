@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use oriel_proto::xfer::{self, XferOwner};
+use oriel_proto::xfer::{self, OfferSlot, XferOwner};
 use oriel_proto::xfer_fuse::XferMount;
 use oriel_proto::{read_bidi_stream_header, BidiStreamHeader};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -97,9 +97,12 @@ async fn files_stream_through_fuse() {
     };
 
     let (id, roots) = owner
-        .offer(&[src.join("big.bin"), src.join("tree")])
+        .offer(
+            OfferSlot::Clipboard,
+            &[src.join("big.bin"), src.join("tree")],
+        )
         .unwrap();
-    let paths = mount.add_offer(reader_conn.clone(), id, roots);
+    let paths = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id, roots);
     assert_eq!(paths.len(), 2);
 
     let (big_path, tree_path) = (paths[0].clone(), paths[1].clone());
@@ -142,8 +145,10 @@ async fn files_stream_through_fuse() {
     .unwrap();
 
     // A newer offer retires the old one, but it stays readable during the grace period.
-    let (id2, roots2) = owner.offer(&[src.join("tree/a.txt")]).unwrap();
-    let paths2 = mount.add_offer(reader_conn.clone(), id2, roots2);
+    let (id2, roots2) = owner
+        .offer(OfferSlot::Clipboard, &[src.join("tree/a.txt")])
+        .unwrap();
+    let paths2 = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id2, roots2);
     let old_tree = paths[1].clone();
     tokio::task::spawn_blocking(move || {
         assert_eq!(read_all(&paths2[0]), b"alpha");
@@ -155,8 +160,10 @@ async fn files_stream_through_fuse() {
     // When the owner goes away, reads fail instead of hanging (use a file whose pages
     // are not in the kernel's cache yet).
     std::fs::write(src.join("fresh.bin"), pattern(100_000, 3)).unwrap();
-    let (id3, roots3) = owner.offer(&[src.join("fresh.bin")]).unwrap();
-    let gone = mount.add_offer(reader_conn.clone(), id3, roots3)[0].clone();
+    let (id3, roots3) = owner
+        .offer(OfferSlot::Clipboard, &[src.join("fresh.bin")])
+        .unwrap();
+    let gone = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id3, roots3)[0].clone();
     reader_conn.close(0u32.into(), b"bye");
     let res = tokio::time::timeout(
         Duration::from_secs(10),

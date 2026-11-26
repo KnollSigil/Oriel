@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use oriel_proto::xfer::{self, XferOwner};
+use oriel_proto::xfer::{self, OfferSlot, XferOwner};
 use oriel_proto::xfer_fuse::XferMount;
 use oriel_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_protocol_preamble,
@@ -908,7 +908,7 @@ async fn run_display_session(
                     }
                     Some(ControlMessage::ClipboardFiles { offer_id, roots }) => {
                         if let Some(mount) = &shared.xfer_mount {
-                            let paths = mount.add_offer(conn.clone(), offer_id, roots);
+                            let paths = mount.add_offer(conn.clone(), OfferSlot::Clipboard, offer_id, roots);
                             if !paths.is_empty() {
                                 let _ = cmd_tx.send(CompositorCommand::SetClipboardFiles { paths });
                             }
@@ -918,6 +918,31 @@ async fn run_display_session(
                     }
                     Some(ControlMessage::PrimarySelectionText { text }) => {
                         let _ = cmd_tx.send(CompositorCommand::SetPrimarySelectionText { text });
+                    }
+                    Some(ControlMessage::DragEnter { window_id, x, y, offer_id, roots }) => {
+                        if let Some(mount) = &shared.xfer_mount {
+                            let paths = mount.add_offer(conn.clone(), OfferSlot::Drag, offer_id, roots);
+                            if !paths.is_empty() {
+                                let _ = cmd_tx.send(CompositorCommand::DragStart { window_id, x, y, paths });
+                            }
+                        } else {
+                            debug!("ignoring drag: no transfer mount");
+                        }
+                    }
+                    Some(ControlMessage::DragMotion { window_id, x, y }) => {
+                        let _ = cmd_tx.send(CompositorCommand::DragMotion { window_id, x, y });
+                    }
+                    Some(ControlMessage::DragLeave) => {
+                        let _ = cmd_tx.send(CompositorCommand::DragLeave);
+                    }
+                    Some(ControlMessage::DragDrop) => {
+                        let _ = cmd_tx.send(CompositorCommand::DragDrop);
+                    }
+                    Some(ControlMessage::RemoteDragLeave) => {
+                        let _ = cmd_tx.send(CompositorCommand::OutgoingDragLeave);
+                    }
+                    Some(ControlMessage::RemoteDragEnd) => {
+                        let _ = cmd_tx.send(CompositorCommand::OutgoingDragEnd);
                     }
                     Some(ControlMessage::PointerMotion { window_id, x, y }) => {
                         let _ = cmd_tx.send(CompositorCommand::PointerMotion { window_id, x, y });
@@ -1039,7 +1064,7 @@ const POPUP_IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
 
 /// Forwards compositor events to one display client and tracks what that client has been
 /// told, so a snapshot can retract windows and programs it missed the end of.
-/// Turn clipboard changes into control messages on `out_tx`, in order. Registering files
+/// Turn clipboard changes and file drags into control messages on `out_tx`, in order. Registering files
 /// stats every path, which can block (a stalled network mount, or the transfer mount
 /// itself), so it runs here and not in the session loop.
 fn spawn_clipboard_worker(
@@ -1053,14 +1078,32 @@ fn spawn_clipboard_worker(
                 CompositorEvent::ClipboardText { text } => ControlMessage::ClipboardText { text },
                 CompositorEvent::ClipboardFiles { paths } => {
                     let owner = Arc::clone(&xfer_owner);
-                    let offer = tokio::task::spawn_blocking(move || owner.offer(&paths))
-                        .await
-                        .ok()
-                        .flatten();
+                    let offer = tokio::task::spawn_blocking(move || {
+                        owner.offer(OfferSlot::Clipboard, &paths)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
                     let Some((offer_id, roots)) = offer else {
                         continue;
                     };
                     ControlMessage::ClipboardFiles { offer_id, roots }
+                }
+                CompositorEvent::DragFiles { window_id, paths } => {
+                    let owner = Arc::clone(&xfer_owner);
+                    let offer =
+                        tokio::task::spawn_blocking(move || owner.offer(OfferSlot::Drag, &paths))
+                            .await
+                            .ok()
+                            .flatten();
+                    let Some((offer_id, roots)) = offer else {
+                        continue;
+                    };
+                    ControlMessage::RemoteDragStart {
+                        window_id,
+                        offer_id,
+                        roots,
+                    }
                 }
                 _ => continue,
             };
@@ -1424,7 +1467,8 @@ impl EventForwarder {
                 .await?;
             }
             ev @ (CompositorEvent::ClipboardText { .. }
-            | CompositorEvent::ClipboardFiles { .. }) => {
+            | CompositorEvent::ClipboardFiles { .. }
+            | CompositorEvent::DragFiles { .. }) => {
                 let _ = self.clipboard_tx.send(ev);
             }
             CompositorEvent::PrimarySelectionText { text } => {

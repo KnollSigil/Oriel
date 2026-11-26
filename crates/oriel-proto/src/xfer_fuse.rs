@@ -19,7 +19,7 @@ use fuser::{
 };
 use tracing::{debug, warn};
 
-use crate::xfer::{read_frame, FileEntry, FileKind, FileListReply, FileReadReply};
+use crate::xfer::{read_frame, FileEntry, FileKind, FileListReply, FileReadReply, OfferSlot};
 use crate::{write_bidi_stream_header, BidiStreamHeader};
 
 /// How long a replaced offer stays readable when none of its files are open.
@@ -82,6 +82,7 @@ struct Node {
 struct OfferInfo {
     conn: quinn::Connection,
     offer_id: u64,
+    slot: OfferSlot,
     retired_at: Option<Instant>,
     open_files: usize,
 }
@@ -178,17 +179,18 @@ impl XferMount {
         &self.mountpoint
     }
 
-    /// Present a new offer from `conn` and return the local paths of its roots. Every
-    /// other offer is retired: it stays readable for [`OFFER_GRACE`] and while open.
+    /// Present a new offer from `conn` and return the local paths of its roots. The other
+    /// offers in `slot` are retired: they stay readable for [`OFFER_GRACE`] and while open.
     pub fn add_offer(
         &self,
         conn: quinn::Connection,
+        slot: OfferSlot,
         offer_id: u64,
         roots: Vec<FileEntry>,
     ) -> Vec<PathBuf> {
         let mut st = self.shared.state.lock().unwrap();
         let now = Instant::now();
-        for offer in st.offers.values_mut() {
+        for offer in st.offers.values_mut().filter(|o| o.slot == slot) {
             offer.retired_at.get_or_insert(now);
         }
         let seq = st.next_offer_seq;
@@ -233,6 +235,7 @@ impl XferMount {
             OfferInfo {
                 conn,
                 offer_id,
+                slot,
                 retired_at: None,
                 open_files: 0,
             },

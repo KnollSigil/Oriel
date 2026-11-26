@@ -31,6 +31,14 @@ const READ_CHUNK: usize = 256 * 1024;
 /// How many past offers an owner keeps servable after newer ones replace them.
 const KEPT_OFFERS: usize = 16;
 
+/// What an offer is for. Each slot keeps its own offers, so dragging files does not expire
+/// the files on the clipboard (and the other way round).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OfferSlot {
+    Clipboard,
+    Drag,
+}
+
 /// Kind of an offered filesystem entry. Symlinks and special files are never offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileKind {
@@ -117,6 +125,7 @@ pub struct XferOwner {
 
 struct Offer {
     id: u64,
+    slot: OfferSlot,
     /// Root name (as announced) and the canonical path it resolves to.
     roots: Vec<(String, PathBuf)>,
 }
@@ -129,7 +138,7 @@ impl XferOwner {
     /// Register `paths` as a new offer and return its id and announced roots. Paths that
     /// are not regular files or directories are skipped; returns `None` when nothing is
     /// left. Duplicate base names get a ` (n)` suffix.
-    pub fn offer(&self, paths: &[PathBuf]) -> Option<(u64, Vec<FileEntry>)> {
+    pub fn offer(&self, slot: OfferSlot, paths: &[PathBuf]) -> Option<(u64, Vec<FileEntry>)> {
         let mut roots = Vec::new();
         let mut entries: Vec<FileEntry> = Vec::new();
         for path in paths.iter().take(MAX_OFFER_ROOTS) {
@@ -158,9 +167,12 @@ impl XferOwner {
         }
         let id = random_u64();
         let mut offers = self.offers.lock().unwrap();
-        offers.push_back(Offer { id, roots });
-        while offers.len() > KEPT_OFFERS {
-            offers.pop_front();
+        offers.push_back(Offer { id, slot, roots });
+        // Drop the oldest offer of this slot beyond the limit.
+        if offers.iter().filter(|o| o.slot == slot).count() > KEPT_OFFERS {
+            if let Some(i) = offers.iter().position(|o| o.slot == slot) {
+                offers.remove(i);
+            }
         }
         Some((id, entries))
     }
@@ -556,7 +568,9 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("secret"), root.join("link")).unwrap();
 
         let owner = XferOwner::new();
-        let (id, roots) = owner.offer(&[root.clone(), root.clone()]).unwrap();
+        let (id, roots) = owner
+            .offer(OfferSlot::Clipboard, &[root.clone(), root.clone()])
+            .unwrap();
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].name, "root");
         assert_eq!(roots[1].name, "root (2)");
@@ -580,7 +594,7 @@ mod tests {
         let dir = scratch_dir("read");
         std::fs::write(dir.join("f"), b"0123456789").unwrap();
         let owner = XferOwner::new();
-        let (id, _) = owner.offer(&[dir.join("f")]).unwrap();
+        let (id, _) = owner.offer(OfferSlot::Clipboard, &[dir.join("f")]).unwrap();
         let mut out = Vec::new();
         serve_read(&owner, id, &["f".to_string()], 4, &mut out)
             .await

@@ -32,9 +32,13 @@ use smithay::desktop::{PopupKind, PopupManager, Space, Window};
 use smithay::input::keyboard::{
     FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
+use smithay::backend::input::ButtonState;
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, MotionEvent,
+    AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, GrabStartData as PointerGrabStartData,
+    MotionEvent,
 };
+use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction;
+use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -75,7 +79,8 @@ use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::{
     request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
-    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    start_dnd, with_source_metadata, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    SourceMetadata,
 };
 use smithay::wayland::selection::primary_selection::{
     request_primary_client_selection, set_primary_focus, set_primary_selection,
@@ -222,6 +227,12 @@ pub enum CompositorEvent {
     ClipboardFiles {
         paths: Vec<PathBuf>,
     },
+    /// An app in remote window `window_id` started dragging files (local paths from its
+    /// `text/uri-list`); the client continues the drag on its desktop.
+    DragFiles {
+        window_id: WindowId,
+        paths: Vec<PathBuf>,
+    },
     PrimarySelectionText {
         text: String,
     },
@@ -302,6 +313,25 @@ pub enum CompositorCommand {
     SetClipboardFiles {
         paths: Vec<PathBuf>,
     },
+    /// A client drag carrying files (presented at `paths` in the transfer mount) entered
+    /// remote window `window_id` at surface-local `x`/`y`.
+    DragStart {
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+        paths: Vec<PathBuf>,
+    },
+    DragMotion {
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+    },
+    DragLeave,
+    DragDrop,
+    /// The client's continuation of a session app's drag left the remote windows.
+    OutgoingDragLeave,
+    /// The client's continuation of a session app's drag ended outside the remote windows.
+    OutgoingDragEnd,
     SetPrimarySelectionText {
         text: String,
     },
@@ -618,6 +648,10 @@ struct AppState {
     output_manager_state: OutputManagerState,
     xwayland_shell_state: XWaylandShellState,
     xwm: Option<X11Wm>,
+    /// The client's drag in progress over the session's apps, see `start_host_drag`.
+    host_drag: Option<HostDrag>,
+    /// A session app's drag of files, continued on the client's desktop.
+    outgoing_drag: bool,
     /// The embedded XWayland, for reading X11 selections `xwm` cannot convert.
     x11_display: Option<crate::x11_selection::X11Display>,
     xwayland_client: Option<Client>,
@@ -867,6 +901,151 @@ impl AppState {
             hotspot_y,
             bgra: bgra_cloned,
         });
+    }
+
+    /// The surface under surface-local `x`/`y` of remote window `window_id` (with its
+    /// origin) and the pointer location in compositor space.
+    fn pointer_target(
+        &self,
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+    ) -> (
+        Option<(WlSurface, Point<f64, Logical>)>,
+        Point<f64, Logical>,
+    ) {
+        let focus_and_loc = if let Some(tw) = self.windows.get(&window_id) {
+            tw.window
+                .toplevel()
+                .and_then(|t| self.hit_test_tree(t.wl_surface(), (0, 0), x, y))
+        } else if let Some(tp) = self.popup_windows.get(&window_id) {
+            self.hit_test_tree(tp.surface.wl_surface(), (0, 0), x, y)
+        } else if let Some(xw) = self.x11_windows.get(&window_id) {
+            let ox = xw.geo.loc.x as f64;
+            let oy = xw.geo.loc.y as f64;
+            xw.surface.wl_surface().map(|s| {
+                (
+                    s,
+                    Point::<f64, Logical>::from((ox, oy)),
+                    Point::<f64, Logical>::from((ox + x, oy + y)),
+                )
+            })
+        } else if let Some(xp) = self.x11_popups.get(&window_id) {
+            let ox = xp.geo.loc.x as f64;
+            let oy = xp.geo.loc.y as f64;
+            xp.surface.wl_surface().map(|s| {
+                (
+                    s,
+                    Point::<f64, Logical>::from((ox, oy)),
+                    Point::<f64, Logical>::from((ox + x, oy + y)),
+                )
+            })
+        } else {
+            None
+        };
+
+        match focus_and_loc {
+            Some((surf, origin, loc)) => (Some((surf, origin)), loc),
+            None => (None, (x, y).into()),
+        }
+    }
+
+    /// Drag the client's files over the session's apps: a compositor-side drag that the
+    /// client moves and drops (`DragMotion`, `DragDrop`).
+    fn start_host_drag(
+        &mut self,
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+        paths: Vec<PathBuf>,
+        serial: Serial,
+        time_ms: u32,
+    ) {
+        self.cancel_host_drag(serial, time_ms);
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        if pointer.is_grabbed() {
+            // A drag or other grab inside the session is in progress.
+            return;
+        }
+        let (focus, location) = self.pointer_target(window_id, x, y);
+        self.host_drag = Some(HostDrag {
+            paths,
+            active: true,
+        });
+        let dh = self.display_handle.clone();
+        let seat = self.seat.clone();
+        start_dnd(
+            &dh,
+            &seat,
+            self,
+            serial,
+            Some(PointerGrabStartData {
+                focus: None,
+                button: BTN_LEFT,
+                location,
+            }),
+            None,
+            SourceMetadata {
+                mime_types: oriel_proto::xfer::file_selection_mimes(),
+                // Never a move: the source would delete the files once dropped.
+                dnd_action: DndAction::Copy,
+            },
+        );
+        // Enter the surface under the pointer.
+        pointer.motion(
+            self,
+            focus,
+            &MotionEvent {
+                location,
+                serial,
+                time: time_ms,
+            },
+        );
+        pointer.frame(self);
+        let _ = self.display_handle.flush_clients();
+    }
+
+    /// Move the pointer off every surface, keeping its location (during a drag grab
+    /// `PointerLeave` cannot tell which window the pointer is in).
+    fn pointer_to_nowhere(&mut self, serial: Serial, time_ms: u32) {
+        if let Some(pointer) = self.seat.get_pointer() {
+            let location = pointer.current_location();
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location,
+                    serial,
+                    time: time_ms,
+                },
+            );
+            pointer.frame(self);
+        }
+    }
+
+    /// End an active host drag without dropping (it left the window).
+    fn cancel_host_drag(&mut self, serial: Serial, time_ms: u32) {
+        if !self.host_drag.as_ref().is_some_and(|d| d.active) {
+            return;
+        }
+        if let Some(pointer) = self.seat.get_pointer() {
+            // Leave the target first, so ending the grab does not drop on it.
+            let location = pointer.current_location();
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location,
+                    serial,
+                    time: time_ms,
+                },
+            );
+            pointer.unset_grab(self, serial, time_ms);
+            pointer.frame(self);
+        }
+        self.host_drag = None;
     }
 
     fn cleanup_xwayland_state(&mut self) {
@@ -1174,40 +1353,7 @@ impl AppState {
             CompositorCommand::PointerMotion { window_id, x, y } => {
                 self.focused_window_id = window_id;
                 if let Some(pointer) = self.seat.get_pointer() {
-                    let focus_and_loc = if let Some(tw) = self.windows.get(&window_id) {
-                        tw.window
-                            .toplevel()
-                            .and_then(|t| self.hit_test_tree(t.wl_surface(), (0, 0), x, y))
-                    } else if let Some(tp) = self.popup_windows.get(&window_id) {
-                        self.hit_test_tree(tp.surface.wl_surface(), (0, 0), x, y)
-                    } else if let Some(xw) = self.x11_windows.get(&window_id) {
-                        let ox = xw.geo.loc.x as f64;
-                        let oy = xw.geo.loc.y as f64;
-                        xw.surface.wl_surface().map(|s| {
-                            (
-                                s,
-                                Point::<f64, Logical>::from((ox, oy)),
-                                Point::<f64, Logical>::from((ox + x, oy + y)),
-                            )
-                        })
-                    } else if let Some(xp) = self.x11_popups.get(&window_id) {
-                        let ox = xp.geo.loc.x as f64;
-                        let oy = xp.geo.loc.y as f64;
-                        xp.surface.wl_surface().map(|s| {
-                            (
-                                s,
-                                Point::<f64, Logical>::from((ox, oy)),
-                                Point::<f64, Logical>::from((ox + x, oy + y)),
-                            )
-                        })
-                    } else {
-                        None
-                    };
-
-                    let (focus, location) = match focus_and_loc {
-                        Some((surf, origin, loc)) => (Some((surf, origin)), loc),
-                        None => (None, (x, y).into()),
-                    };
+                    let (focus, location) = self.pointer_target(window_id, x, y);
                     pointer.motion(
                         self,
                         focus,
@@ -1218,6 +1364,71 @@ impl AppState {
                         },
                     );
                     pointer.frame(self);
+                }
+            }
+            CompositorCommand::DragStart {
+                window_id,
+                x,
+                y,
+                paths,
+            } => self.start_host_drag(window_id, x, y, paths, serial, time_ms),
+            CompositorCommand::DragMotion { window_id, x, y } => {
+                if self.host_drag.as_ref().is_some_and(|d| d.active) {
+                    if let Some(pointer) = self.seat.get_pointer() {
+                        let (focus, location) = self.pointer_target(window_id, x, y);
+                        pointer.motion(
+                            self,
+                            focus,
+                            &MotionEvent {
+                                location,
+                                serial,
+                                time: time_ms,
+                            },
+                        );
+                        pointer.frame(self);
+                    }
+                }
+            }
+            CompositorCommand::DragLeave => self.cancel_host_drag(serial, time_ms),
+            CompositorCommand::OutgoingDragLeave => {
+                if self.outgoing_drag {
+                    self.pointer_to_nowhere(serial, time_ms);
+                }
+            }
+            CompositorCommand::OutgoingDragEnd => {
+                if self.outgoing_drag {
+                    // Over no surface, releasing the button ends the drag without a drop.
+                    self.pointer_to_nowhere(serial, time_ms);
+                    self.pressed_buttons.remove(&BTN_LEFT);
+                    if let Some(pointer) = self.seat.get_pointer() {
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                serial,
+                                time: time_ms,
+                                button: BTN_LEFT,
+                                state: ButtonState::Released,
+                            },
+                        );
+                        pointer.frame(self);
+                    }
+                }
+            }
+            CompositorCommand::DragDrop => {
+                if self.host_drag.as_ref().is_some_and(|d| d.active) {
+                    if let Some(pointer) = self.seat.get_pointer() {
+                        // The drag grab drops once no button is held.
+                        pointer.button(
+                            self,
+                            &ButtonEvent {
+                                serial,
+                                time: time_ms,
+                                button: BTN_LEFT,
+                                state: ButtonState::Released,
+                            },
+                        );
+                        pointer.frame(self);
+                    }
                 }
             }
             CompositorCommand::PointerLeave { window_id } => {
@@ -3280,9 +3491,20 @@ impl SeatHandler for AppState {
     }
 }
 
+/// Linux evdev code of the left mouse button, which host drags are held with.
+const BTN_LEFT: u32 = 0x110;
+
 pub(crate) const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Clipboard contents owned by the client (the remote host of this session).
+/// Files the client is dragging over the session's apps.
+struct HostDrag {
+    /// Paths inside the transfer FUSE mount.
+    paths: Vec<PathBuf>,
+    /// Not yet dropped or cancelled. After a drop the target may still read `paths`.
+    active: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostClipboard {
     Text(String),
@@ -4463,9 +4685,75 @@ impl DataDeviceHandler for AppState {
     }
 }
 
-impl ClientDndGrabHandler for AppState {}
+impl ClientDndGrabHandler for AppState {
+    fn started(
+        &mut self,
+        source: Option<WlDataSource>,
+        _icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        // A drag carrying files can leave the session: read its file list so the client
+        // can continue it on its desktop. Other drags stay inside the session.
+        let Some(source) = source else {
+            return;
+        };
+        let has_files = with_source_metadata(&source, |meta| {
+            meta.mime_types
+                .iter()
+                .any(|m| m == oriel_proto::xfer::URI_LIST_MIME)
+        })
+        .unwrap_or(false);
+        if !has_files {
+            return;
+        }
+        let Ok((read_pipe, write_pipe)) = std::io::pipe() else {
+            return;
+        };
+        source.send(
+            oriel_proto::xfer::URI_LIST_MIME.to_string(),
+            std::os::fd::AsFd::as_fd(&write_pipe),
+        );
+        drop(write_pipe);
+        let _ = self.display_handle.flush_clients();
+        self.outgoing_drag = true;
+        let window_id = self.focused_window_id;
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(paths) = read_selection_fd_complete(read_pipe.into())
+                .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body))
+            {
+                let _ = event_tx.send(CompositorEvent::DragFiles { window_id, paths });
+            }
+        });
+    }
+
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.outgoing_drag = false;
+    }
+}
 impl ServerDndGrabHandler for AppState {
-    fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
+    fn send(&mut self, mime_type: String, fd: OwnedFd, _seat: Seat<Self>) {
+        let Some(drag) = &self.host_drag else {
+            return;
+        };
+        if let Some(bytes) = oriel_proto::xfer::file_selection_body(&mime_type, &drag.paths) {
+            std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
+        }
+    }
+
+    fn dropped(&mut self, _seat: Seat<Self>) {
+        if let Some(drag) = &mut self.host_drag {
+            drag.active = false;
+        }
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>) {
+        self.host_drag = None;
+    }
+
+    fn finished(&mut self, _seat: Seat<Self>) {
+        self.host_drag = None;
+    }
 }
 
 impl OutputHandler for AppState {}
@@ -4895,6 +5183,8 @@ fn run_compositor_loop(
         output_manager_state,
         xwayland_shell_state,
         xwm: None,
+        host_drag: None,
+        outgoing_drag: false,
         x11_display: None,
         xwayland_client,
         output,

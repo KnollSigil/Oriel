@@ -376,12 +376,37 @@ pub async fn run_client(
                     ControlMessage::ClipboardFiles { offer_id, roots } => {
                         let conn = conn.clone();
                         let paths = tokio::task::spawn_blocking(move || {
-                            crate::xfer::receive_offer(conn, offer_id, roots)
+                            crate::xfer::receive_offer(
+                                conn,
+                                oriel_proto::xfer::OfferSlot::Clipboard,
+                                offer_id,
+                                roots,
+                            )
                         })
                         .await
                         .unwrap_or_default();
                         if !paths.is_empty() {
                             let _ = ui_tx.send(ClientUiEvent::ClipboardFiles { paths });
+                        }
+                    }
+                    ControlMessage::RemoteDragStart {
+                        window_id,
+                        offer_id,
+                        roots,
+                    } => {
+                        let conn = conn.clone();
+                        let paths = tokio::task::spawn_blocking(move || {
+                            crate::xfer::receive_offer(
+                                conn,
+                                oriel_proto::xfer::OfferSlot::Drag,
+                                offer_id,
+                                roots,
+                            )
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if !paths.is_empty() {
+                            let _ = ui_tx.send(ClientUiEvent::RemoteDragStart { window_id, paths });
                         }
                     }
                     _ => {}
@@ -802,7 +827,8 @@ pub async fn run_client(
                     });
                 }
                 msg @ (ControlMessage::ClipboardText { .. }
-                | ControlMessage::ClipboardFiles { .. }) => {
+                | ControlMessage::ClipboardFiles { .. }
+                | ControlMessage::RemoteDragStart { .. }) => {
                     let _ = clipboard_tx.send(msg);
                 }
                 ControlMessage::PrimarySelectionText { text } => {

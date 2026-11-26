@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 use oriel_proto::xfer::{
-    file_selection_body, file_selection_mimes, parse_file_uri_list, PORTAL_FILE_TRANSFER_MIME,
-    URI_LIST_MIME,
+    file_selection_body, file_selection_mimes, parse_file_uri_list, OfferSlot,
+    PORTAL_FILE_TRANSFER_MIME, URI_LIST_MIME,
 };
 use oriel_proto::{ControlMessage, FrameRect, WindowId, MAX_CURSOR_DIM, SUPPORTED_TEXT_MIMES};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Sender as CalloopSender};
@@ -22,7 +22,7 @@ use smithay_client_toolkit::{
     data_device_manager::{
         data_device::{DataDevice, DataDeviceHandler},
         data_offer::{DataOfferHandler, DragOffer},
-        data_source::{CopyPasteSource, DataSourceHandler},
+        data_source::{CopyPasteSource, DataSourceHandler, DragSource},
         DataDeviceManagerState, WritePipe,
     },
     delegate_dispatch2, delegate_registry,
@@ -182,6 +182,12 @@ pub enum ClientUiEvent {
     },
     /// The server's clipboard holds files, presented locally at `paths`.
     ClipboardFiles {
+        paths: Vec<PathBuf>,
+    },
+    /// An app in remote window `window_id` started dragging the files presented locally at
+    /// `paths`: continue the drag on the local desktop.
+    RemoteDragStart {
+        window_id: WindowId,
         paths: Vec<PathBuf>,
     },
     PrimarySelectionText {
@@ -525,6 +531,10 @@ struct ClientApp {
     last_clipboard: String,
     /// Files our clipboard source offers instead of `last_clipboard` text.
     clipboard_files: Option<Vec<PathBuf>>,
+    /// A local drag carrying files over one of our windows.
+    incoming_drag: Option<IncomingDrag>,
+    /// A remote app's drag of files, continued on the local desktop.
+    outgoing_drag: Option<OutgoingDrag>,
     last_primary: String,
     exit: bool,
 }
@@ -1147,6 +1157,9 @@ impl ClientApp {
                         self.clipboard_files = Some(paths);
                     }
                 }
+            }
+            ClientUiEvent::RemoteDragStart { window_id, paths } => {
+                self.start_outgoing_drag(window_id, paths);
             }
             ClientUiEvent::PrimarySelectionText { text } => {
                 if !text.is_empty()
@@ -1939,6 +1952,11 @@ impl PointerHandler for ClientApp {
                 PointerEventKind::Leave { .. } => {
                     self.border_resize_active = false;
                     self.last_cursor = ActiveCursor::Named(CursorIcon::Default);
+                    if self.outgoing_drag.is_some() {
+                        // Starting our drag took the pointer; the button stays held in the
+                        // session's drag, which the data device events now move.
+                        continue;
+                    }
                     self.release_pressed_buttons(window_id);
                     let _ = self
                         .ctrl_tx
@@ -1976,17 +1994,137 @@ fn read_selection_fd_complete(fd: OwnedFd) -> Option<String> {
 }
 
 /// Read a file selection (`text/uri-list` or a FileTransfer portal key) and register its
-/// readable files for transfer. `None` when it holds no readable local files, in which case
-/// the caller falls back to text.
-fn file_selection_offer(mime: &str, fd: OwnedFd) -> Option<ControlMessage> {
-    let body = read_selection_fd_complete(fd)?;
-    let paths = if mime == PORTAL_FILE_TRANSFER_MIME {
-        crate::xfer::retrieve_portal_files(&body)?
-    } else {
-        crate::xfer::visible_host_paths(parse_file_uri_list(&body)?)?
+/// readable files for transfer in `slot`. `None` when it holds no readable local files.
+fn read_file_offer(
+    mime: &str,
+    fd: OwnedFd,
+    slot: OfferSlot,
+) -> Option<(u64, Vec<oriel_proto::xfer::FileEntry>)> {
+    let Some(body) = read_selection_fd_complete(fd) else {
+        debug!(mime, "file offer: no complete data from the source");
+        return None;
     };
-    let (offer_id, roots) = crate::xfer::OWNER.offer(&paths)?;
-    Some(ControlMessage::ClipboardFiles { offer_id, roots })
+    let paths = if mime == PORTAL_FILE_TRANSFER_MIME {
+        crate::xfer::retrieve_portal_files(&body)
+    } else {
+        parse_file_uri_list(&body).and_then(crate::xfer::visible_host_paths)
+    };
+    let Some(paths) = paths else {
+        debug!(mime, body = %body.escape_debug(), "file offer: no usable local paths");
+        return None;
+    };
+    let offer = crate::xfer::OWNER.offer(slot, &paths);
+    if offer.is_none() {
+        debug!(?paths, "file offer: none of the paths is readable");
+    }
+    offer
+}
+
+/// The format to read files from in an offer with `mimes`, if it carries files.
+fn file_offer_mime(mimes: &[String]) -> Option<&'static str> {
+    let has = |want: &str| mimes.iter().any(|m| m == want);
+    // Inside Flatpak only some host paths are readable (see `xfer::visible_host_paths`);
+    // the FileTransfer portal key resolves to document-portal paths that always are. Apps
+    // without the portal MIME (Cosmic Files) only offer `text/uri-list`.
+    if crate::pty::flatpak_app_id().is_some() && has(PORTAL_FILE_TRANSFER_MIME) {
+        Some(PORTAL_FILE_TRANSFER_MIME)
+    } else if has(URI_LIST_MIME) {
+        Some(URI_LIST_MIME)
+    } else {
+        None
+    }
+}
+
+/// What happens to a local drag over a remote window after it entered, relayed in order by
+/// the thread that reads its files (see `DataDeviceHandler::enter`).
+enum IncomingDragEvent {
+    Motion { x: f64, y: f64 },
+    Leave,
+    Drop,
+}
+
+/// A remote app's drag of files, continued on the local desktop. Over our own windows the
+/// local drag is relayed back as plain pointer input, so the session's drag follows it.
+struct OutgoingDrag {
+    source: DragSource,
+    /// Local paths of the files (in the transfer mount).
+    paths: Vec<PathBuf>,
+    /// The remote window the drag is over, if any.
+    over: Option<WindowId>,
+    /// Dropped on a remote window: the session's drag ended with that drop.
+    dropped_on_remote: bool,
+}
+
+/// A local drag carrying files over one of our remote windows.
+struct IncomingDrag {
+    events: std::sync::mpsc::Sender<IncomingDragEvent>,
+    dropped: bool,
+}
+
+/// A local drag carrying files that entered remote window `window_id` at `x`/`y`.
+struct DragEntered {
+    offer: DragOffer,
+    conn: Connection,
+    /// The format the files are read from, and the pipe it arrives on.
+    mime: &'static str,
+    pipe: OwnedFd,
+    window_id: WindowId,
+    x: f64,
+    y: f64,
+    ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
+}
+
+/// Read the files of a drag that entered a remote window, then announce the drag and
+/// relay `events` to the server until it leaves or drops. On a drop the offer is finished
+/// here, after its data was read.
+fn relay_incoming_drag(drag: DragEntered, events: std::sync::mpsc::Receiver<IncomingDragEvent>) {
+    let DragEntered {
+        offer,
+        conn,
+        mime,
+        pipe,
+        window_id,
+        x,
+        y,
+        ctrl_tx,
+    } = drag;
+    let files = read_file_offer(mime, pipe, OfferSlot::Drag);
+    match &files {
+        Some((_, roots)) => debug!(window_id, mime, roots = roots.len(), "local drag entered"),
+        None => debug!(window_id, mime, "local drag carries no readable files"),
+    }
+    if let Some((offer_id, roots)) = files.clone() {
+        let _ = ctrl_tx.send(ControlMessage::DragEnter {
+            window_id,
+            x,
+            y,
+            offer_id,
+            roots,
+        });
+    }
+    for event in events {
+        match event {
+            IncomingDragEvent::Motion { x, y } => {
+                if files.is_some() {
+                    let _ = ctrl_tx.send(ControlMessage::DragMotion { window_id, x, y });
+                }
+            }
+            IncomingDragEvent::Leave => {
+                if files.is_some() {
+                    let _ = ctrl_tx.send(ControlMessage::DragLeave);
+                }
+                return;
+            }
+            IncomingDragEvent::Drop => {
+                if files.is_some() {
+                    let _ = ctrl_tx.send(ControlMessage::DragDrop);
+                }
+                offer.finish();
+                let _ = conn.flush();
+                return;
+            }
+        }
+    }
 }
 
 /// Write selection bytes to `fd` with a bounded `poll(2)` deadline so a stalled
@@ -2029,21 +2167,169 @@ fn write_selection_fd_timeout(fd: OwnedFd, bytes: &[u8]) {
     }
 }
 
+impl ClientApp {
+    /// Continue a remote app's drag of files on the local desktop. Needs the button that
+    /// started it still held: the local drag reuses that press's implicit grab.
+    fn start_outgoing_drag(&mut self, window_id: WindowId, paths: Vec<PathBuf>) {
+        if !self.pressed_buttons.contains(&BTN_LEFT) {
+            // Dropped (inside the session) before the file list arrived.
+            return;
+        }
+        let origin = match (self.windows.get(&window_id), self.popups.get(&window_id)) {
+            (Some(win), _) => win.window.wl_surface().clone(),
+            (None, Some(popup)) => popup.popup.wl_surface().clone(),
+            (None, None) => return,
+        };
+        self.end_outgoing_drag();
+        let (Some(mgr), Some(data_device)) = (&self.data_device_manager_state, &self.data_device)
+        else {
+            return;
+        };
+        // Copy only: a move would ask the session app to delete its files.
+        let source =
+            mgr.create_drag_and_drop_source(&self.qh, file_selection_mimes(), DndAction::Copy);
+        source.start_drag(data_device, &origin, None, self.last_button_serial);
+        let _ = self.conn.flush();
+        debug!(
+            window_id,
+            files = paths.len(),
+            "continuing a remote drag locally"
+        );
+        self.outgoing_drag = Some(OutgoingDrag {
+            source,
+            paths,
+            over: Some(window_id),
+            dropped_on_remote: false,
+        });
+    }
+
+    /// The local drag continuing a remote one is over: unless it was dropped on a remote
+    /// window (the session's drag already ended there), end the session's drag without a
+    /// drop. The held button is released by then.
+    fn end_outgoing_drag(&mut self) {
+        let Some(drag) = self.outgoing_drag.take() else {
+            return;
+        };
+        if !drag.dropped_on_remote {
+            let _ = self.ctrl_tx.send(ControlMessage::RemoteDragEnd);
+        }
+        self.pressed_buttons.remove(&BTN_LEFT);
+        drag.source.inner().destroy();
+    }
+
+    /// Tell the relay thread of the incoming drag, if any, that it ended with `event`.
+    fn end_incoming_drag(&mut self, event: IncomingDragEvent) {
+        if let Some(drag) = self.incoming_drag.take() {
+            if !drag.dropped {
+                let _ = drag.events.send(event);
+            }
+        }
+    }
+}
+
 impl DataDeviceHandler for ClientApp {
     fn enter(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlDataDevice,
-        _: f64,
-        _: f64,
-        _: &wl_surface::WlSurface,
+        wl_data_device: &WlDataDevice,
+        x: f64,
+        y: f64,
+        surface: &wl_surface::WlSurface,
     ) {
+        // A drag that left another window without a leave event (not expected).
+        self.end_incoming_drag(IncomingDragEvent::Leave);
+        let Some(data_device) = &self.data_device else {
+            return;
+        };
+        if data_device.inner() != wl_data_device {
+            return;
+        }
+        let Some(offer) = data_device.data().drag_offer() else {
+            return;
+        };
+        let Some(&window_id) = self.surface_to_remote.get(&surface.id().protocol_id()) else {
+            offer.accept_mime_type(offer.serial, None);
+            return;
+        };
+        if let Some(drag) = &mut self.outgoing_drag {
+            // Our own drag of a remote app's files is back over a remote window: hand the
+            // pointer back to the session's drag.
+            drag.over = Some(window_id);
+            offer.accept_mime_type(offer.serial, Some(URI_LIST_MIME.to_string()));
+            offer.set_actions(DndAction::Copy, DndAction::Copy);
+            let _ = self
+                .ctrl_tx
+                .send(ControlMessage::PointerMotion { window_id, x, y });
+            return;
+        }
+        // Only drags carrying files are relayed; anything else is refused here.
+        let Some(mime) = offer.with_mime_types(file_offer_mime) else {
+            debug!(
+                window_id,
+                mimes = ?offer.with_mime_types(|m| m.to_vec()),
+                "refusing a local drag without files"
+            );
+            offer.accept_mime_type(offer.serial, None);
+            offer.set_actions(DndAction::empty(), DndAction::empty());
+            return;
+        };
+        let Ok(pipe) = offer.receive(mime.to_string()) else {
+            return;
+        };
+        // Accepted before the remote app is known to want it: the round trip to ask would
+        // lag every motion. Always a copy: a move would make the source delete the files.
+        offer.accept_mime_type(offer.serial, Some(mime.to_string()));
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+        let _ = self.conn.flush();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        self.incoming_drag = Some(IncomingDrag {
+            events: events_tx,
+            dropped: false,
+        });
+        let conn = self.conn.clone();
+        let ctrl_tx = self.ctrl_tx.clone();
+        let drag = DragEntered {
+            offer,
+            conn,
+            mime,
+            pipe: OwnedFd::from(pipe),
+            window_id,
+            x,
+            y,
+            ctrl_tx,
+        };
+        std::thread::spawn(move || relay_incoming_drag(drag, events_rx));
     }
 
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        if let Some(drag) = &mut self.outgoing_drag {
+            if drag.over.take().is_some() && !drag.dropped_on_remote {
+                let _ = self.ctrl_tx.send(ControlMessage::RemoteDragLeave);
+            }
+            return;
+        }
+        // A drop is followed by a leave; the drop already ended the drag.
+        if self.incoming_drag.as_ref().is_some_and(|d| d.dropped) {
+            self.incoming_drag = None;
+            return;
+        }
+        self.end_incoming_drag(IncomingDragEvent::Leave);
+    }
 
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, x: f64, y: f64) {
+        if let Some(drag) = &self.outgoing_drag {
+            if let Some(window_id) = drag.over {
+                let _ = self
+                    .ctrl_tx
+                    .send(ControlMessage::PointerMotion { window_id, x, y });
+            }
+            return;
+        }
+        if let Some(drag) = &self.incoming_drag {
+            let _ = drag.events.send(IncomingDragEvent::Motion { x, y });
+        }
+    }
 
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, wl_data_device: &WlDataDevice) {
         // Ignore selection echo when our own CopyPasteSource is active.
@@ -2059,25 +2345,12 @@ impl DataDeviceHandler for ClientApp {
         let Some(offer) = data_device.data().selection_offer() else {
             return;
         };
-        let in_flatpak = crate::pty::flatpak_app_id().is_some();
         let (text_mime, file_mime) = offer.with_mime_types(|mimes| {
-            let has = |want: &str| mimes.iter().any(|m| m == want);
             let text = SUPPORTED_TEXT_MIMES
                 .iter()
-                .find(|&&want| has(want))
+                .find(|&&want| mimes.iter().any(|m| m == want))
                 .map(|&s| s.to_string());
-            // Inside Flatpak only some host paths are readable (see
-            // `xfer::visible_host_paths`); the FileTransfer portal key resolves to
-            // document-portal paths that always are. Apps without the portal MIME
-            // (Cosmic Files) only offer `text/uri-list`.
-            let file = if in_flatpak && has(PORTAL_FILE_TRANSFER_MIME) {
-                Some(PORTAL_FILE_TRANSFER_MIME)
-            } else if has(URI_LIST_MIME) {
-                Some(URI_LIST_MIME)
-            } else {
-                None
-            };
-            (text, file)
+            (text, file_offer_mime(mimes))
         });
         let file_pipe = file_mime.and_then(|m| offer.receive(m.to_string()).ok());
         let text_pipe = text_mime.and_then(|m| offer.receive(m).ok());
@@ -2088,8 +2361,10 @@ impl DataDeviceHandler for ClientApp {
         let ctrl_tx = self.ctrl_tx.clone();
         std::thread::spawn(move || {
             if let (Some(pipe), Some(mime)) = (file_pipe, file_mime) {
-                if let Some(msg) = file_selection_offer(mime, OwnedFd::from(pipe)) {
-                    let _ = ctrl_tx.send(msg);
+                if let Some((offer_id, roots)) =
+                    read_file_offer(mime, OwnedFd::from(pipe), OfferSlot::Clipboard)
+                {
+                    let _ = ctrl_tx.send(ControlMessage::ClipboardFiles { offer_id, roots });
                     return;
                 }
             }
@@ -2101,7 +2376,34 @@ impl DataDeviceHandler for ClientApp {
         });
     }
 
-    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        if let Some(drag) = &mut self.outgoing_drag {
+            // Dropped on a remote window: release the button there, and the session's drag
+            // drops on whatever is under it.
+            if let Some(window_id) = drag.over {
+                drag.dropped_on_remote = true;
+                let _ = self.ctrl_tx.send(ControlMessage::PointerButton {
+                    window_id,
+                    button: BTN_LEFT,
+                    pressed: false,
+                });
+                if let Some(offer) = self
+                    .data_device
+                    .as_ref()
+                    .and_then(|d| d.data().drag_offer())
+                {
+                    offer.finish();
+                }
+            }
+            return;
+        }
+        if let Some(drag) = &mut self.incoming_drag {
+            if !drag.dropped {
+                drag.dropped = true;
+                let _ = drag.events.send(IncomingDragEvent::Drop);
+            }
+        }
+    }
 }
 
 impl DataOfferHandler for ClientApp {
@@ -2142,6 +2444,18 @@ impl DataSourceHandler for ClientApp {
         mime: String,
         write_pipe: WritePipe,
     ) {
+        if let Some(drag) = self
+            .outgoing_drag
+            .as_ref()
+            .filter(|d| d.source.inner() == source)
+        {
+            if let Some(body) = file_selection_body(&mime, &drag.paths) {
+                std::thread::spawn(move || {
+                    write_selection_fd_timeout(OwnedFd::from(write_pipe), &body);
+                });
+            }
+            return;
+        }
         if !self
             .copy_paste_source
             .as_ref()
@@ -2165,6 +2479,14 @@ impl DataSourceHandler for ClientApp {
 
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
         if self
+            .outgoing_drag
+            .as_ref()
+            .is_some_and(|d| d.source.inner() == source)
+        {
+            self.end_outgoing_drag();
+            return;
+        }
+        if self
             .copy_paste_source
             .as_ref()
             .is_some_and(|s| s.inner() == source)
@@ -2177,7 +2499,15 @@ impl DataSourceHandler for ClientApp {
     }
 
     fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
-    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        if self
+            .outgoing_drag
+            .as_ref()
+            .is_some_and(|d| d.source.inner() == source)
+        {
+            self.end_outgoing_drag();
+        }
+    }
     fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
 }
 
@@ -2452,6 +2782,8 @@ pub fn run_event_loop(
         ctrl_tx,
         last_clipboard: String::new(),
         clipboard_files: None,
+        incoming_drag: None,
+        outgoing_drag: None,
         last_primary: String::new(),
         exit: false,
     };

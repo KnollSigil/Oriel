@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -471,6 +471,38 @@ pub enum ControlMessage {
         offer_id: u64,
         roots: Vec<xfer::FileEntry>,
     },
+    /// Client -> Server: a local drag carrying files entered remote window `window_id` at
+    /// surface-local `x`/`y`. The server drags the files over the window's apps (read like
+    /// [`ControlMessage::ClipboardFiles`]) until [`ControlMessage::DragLeave`] or
+    /// [`ControlMessage::DragDrop`].
+    DragEnter {
+        window_id: WindowId,
+        x: f64,
+        y: f64,
+        offer_id: u64,
+        roots: Vec<xfer::FileEntry>,
+    },
+    /// Client -> Server: the drag from [`ControlMessage::DragEnter`] moved.
+    DragMotion { window_id: WindowId, x: f64, y: f64 },
+    /// Client -> Server: the drag left the window it entered (cancelled there).
+    DragLeave,
+    /// Client -> Server: the drag was dropped where it last moved to.
+    DragDrop,
+    /// Server -> Client: an app in remote window `window_id` started dragging files. The
+    /// client continues the drag on the local desktop (read like
+    /// [`ControlMessage::ClipboardFiles`]). Over remote windows it keeps sending ordinary
+    /// pointer motion and the button release, which the server's drag follows.
+    RemoteDragStart {
+        window_id: WindowId,
+        offer_id: u64,
+        roots: Vec<xfer::FileEntry>,
+    },
+    /// Client -> Server: the drag from [`ControlMessage::RemoteDragStart`] left the remote
+    /// windows, so it is over no session app.
+    RemoteDragLeave,
+    /// Client -> Server: the drag from [`ControlMessage::RemoteDragStart`] ended outside the
+    /// remote windows (dropped on a local app or cancelled); end it in the session too.
+    RemoteDragEnd,
     /// Bidirectional: UTF-8 primary selection (middle-click paste) text synchronization.
     PrimarySelectionText { text: String },
     /// Server -> Client: enable/disable host microphone capture based on remote app demand.
