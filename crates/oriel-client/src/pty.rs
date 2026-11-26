@@ -776,6 +776,21 @@ fn write_private_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Konsole's default tab title (`%d : %n`) describes the *local* foreground process, which
+/// for a remote PTY is `oriel-client` (or `flatpak`/`bwrap` in the Flatpak build). Show the
+/// title the remote shell sets via OSC 0/2 instead.
+const KONSOLE_TITLE_FORMAT: &str = "%w";
+
+/// `-p` overrides for Konsole launches that do not use the Oriel profile overlay.
+fn konsole_title_property_args() -> [String; 4] {
+    [
+        "-p".to_string(),
+        format!("LocalTabTitleFormat={KONSOLE_TITLE_FORMAT}"),
+        "-p".to_string(),
+        format!("RemoteTabTitleFormat={KONSOLE_TITLE_FORMAT}"),
+    ]
+}
+
 fn prepare_konsole_remote_profile(
     cmd_prefix: &[String],
     socket_path: &Path,
@@ -840,8 +855,10 @@ fn prepare_konsole_remote_profile_with_env(
         .unwrap_or_else(|| "FALLBACK/".to_string());
 
     let cmd = format_konsole_command_with_prefix(cmd_prefix, socket_path)?;
-    let profile_contents =
-        format!("[General]\nCommand={cmd}\nName=Oriel\nParent={parent_profile}\n");
+    let profile_contents = format!(
+        "[General]\nCommand={cmd}\nName=Oriel\nParent={parent_profile}\n\
+         LocalTabTitleFormat={KONSOLE_TITLE_FORMAT}\nRemoteTabTitleFormat={KONSOLE_TITLE_FORMAT}\n"
+    );
     write_private_file_atomic(
         &profiles_dir.join("Oriel.profile"),
         profile_contents.as_bytes(),
@@ -1149,12 +1166,14 @@ fn spawn_local_terminal_with_args(
                                 error = %err,
                                 "failed to prepare Konsole remote profile overlay; falling back to -e"
                             );
+                            term_args.extend(konsole_title_property_args());
                             term_args.push("-e".to_string());
                             term_args.extend(attach_prefix.iter().cloned());
                             term_args.extend(attach_args.iter().cloned());
                         }
                     }
                 } else {
+                    term_args.extend(konsole_title_property_args());
                     term_args.push("-e".to_string());
                     term_args.extend(attach_prefix.iter().cloned());
                     term_args.extend(attach_args.iter().cloned());
@@ -1349,6 +1368,8 @@ mod tests {
         let profile_path = overlay.data_home.join("konsole").join("Oriel.profile");
         let profile = fs::read_to_string(&profile_path).unwrap();
         assert!(profile.contains("Name=Oriel"));
+        assert!(profile.contains("\nLocalTabTitleFormat=%w\n"));
+        assert!(profile.contains("\nRemoteTabTitleFormat=%w\n"));
         assert!(profile.contains("Parent=UserTheme.profile"));
         assert!(profile.contains(&format!(
             "Command=/usr/local/bin/oriel-client pty-attach --socket {}",
