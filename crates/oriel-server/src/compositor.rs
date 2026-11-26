@@ -32,6 +32,7 @@ use smithay::desktop::{PopupKind, PopupManager, Space, Window};
 use smithay::input::keyboard::{
     FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
+use oriel_proto::selection::{ReceivedClipboard, Serve};
 use smithay::backend::input::ButtonState;
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, GrabStartData as PointerGrabStartData,
@@ -220,19 +221,26 @@ pub enum CompositorEvent {
         hotspot_y: i32,
         bgra: Vec<u8>,
     },
-    ClipboardText {
-        text: String,
+    /// A session app's clipboard selection changed (see `oriel_proto::selection`): the
+    /// types it offers, its text when small, and its files (local paths from its
+    /// `text/uri-list`).
+    ClipboardOffer {
+        offer_id: u64,
+        mimes: Vec<String>,
+        text: Option<String>,
+        paths: Option<Vec<PathBuf>>,
     },
-    /// A session app put files on the clipboard (local paths from its `text/uri-list`).
-    ClipboardFiles {
-        paths: Vec<PathBuf>,
-    },
-    /// An app in remote window `window_id` started dragging files (local paths from its
-    /// `text/uri-list`); the client continues the drag on its desktop.
-    DragFiles {
+    /// An app in remote window `window_id` started a drag that can leave the session (see
+    /// `oriel_proto::selection::has_interchange_mime`); the client continues it on its
+    /// desktop. `paths` are the files from its `text/uri-list`.
+    DragOffer {
         window_id: WindowId,
-        paths: Vec<PathBuf>,
+        offer_id: u64,
+        mimes: Vec<String>,
+        paths: Option<Vec<PathBuf>>,
     },
+    /// The app the client's drag was dropped on is done with it (or the drop failed).
+    DragFinished,
     PrimarySelectionText {
         text: String,
     },
@@ -246,6 +254,16 @@ pub enum CompositorEvent {
     SnapshotTaken {
         sync_id: u64,
     },
+}
+
+/// Fetches type `mime` of the client's selection `offer_id` into the pipe `fd`.
+#[derive(Clone)]
+pub struct SelectionFetcher(pub Arc<dyn Fn(u64, String, OwnedFd) + Send + Sync>);
+
+impl std::fmt::Debug for SelectionFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SelectionFetcher")
+    }
 }
 
 /// Commands sent from the QUIC server loop to the headless compositor.
@@ -305,13 +323,17 @@ pub enum CompositorCommand {
     KeyboardLeave {
         window_id: WindowId,
     },
-    SetClipboardText {
-        text: String,
+    /// The client's clipboard changed; types not held locally are fetched with `fetch`.
+    SetClipboard {
+        clip: ReceivedClipboard,
+        fetch: SelectionFetcher,
     },
-    /// The client's clipboard holds files, presented locally at `paths` (inside the
-    /// transfer FUSE mount).
-    SetClipboardFiles {
-        paths: Vec<PathBuf>,
+    /// The client pastes type `mime` of the session selection `offer_id`: have its owner
+    /// write it to `fd` (dropped unanswered when the offer is no longer current).
+    ReadSelection {
+        offer_id: u64,
+        mime: String,
+        fd: OwnedFd,
     },
     /// A client drag carrying files (presented at `paths` in the transfer mount) entered
     /// remote window `window_id` at surface-local `x`/`y`.
@@ -319,7 +341,8 @@ pub enum CompositorCommand {
         window_id: WindowId,
         x: f64,
         y: f64,
-        paths: Vec<PathBuf>,
+        clip: ReceivedClipboard,
+        fetch: SelectionFetcher,
     },
     DragMotion {
         window_id: WindowId,
@@ -650,8 +673,9 @@ struct AppState {
     xwm: Option<X11Wm>,
     /// The client's drag in progress over the session's apps, see `start_host_drag`.
     host_drag: Option<HostDrag>,
-    /// A session app's drag of files, continued on the client's desktop.
-    outgoing_drag: bool,
+    /// A session app's drag continued on the client's desktop: our id for its data and the
+    /// app's source, which the client reads from (see `CompositorCommand::ReadSelection`).
+    outgoing_drag: Option<(u64, WlDataSource)>,
     /// The embedded XWayland, for reading X11 selections `xwm` cannot convert.
     x11_display: Option<crate::x11_selection::X11Display>,
     xwayland_client: Option<Client>,
@@ -678,6 +702,8 @@ struct AppState {
     last_cursor_bitmap: Option<(u32, u32, u32, u32, i32, i32, Vec<u8>)>,
     clipboard_owner: SelectionOwner,
     clipboard_data: Option<HostClipboard>,
+    /// Our id for the session app's current clipboard selection, as offered to the client.
+    owned_clipboard_offer: Option<u64>,
     pending_clipboard: Option<ClipboardRequest>,
     primary_owner: SelectionOwner,
     primary_text: Option<String>,
@@ -957,7 +983,7 @@ impl AppState {
         window_id: WindowId,
         x: f64,
         y: f64,
-        paths: Vec<PathBuf>,
+        drag: HostDrag,
         serial: Serial,
         time_ms: u32,
     ) {
@@ -970,10 +996,8 @@ impl AppState {
             return;
         }
         let (focus, location) = self.pointer_target(window_id, x, y);
-        self.host_drag = Some(HostDrag {
-            paths,
-            active: true,
-        });
+        let mime_types = drag.clip.mime_types();
+        self.host_drag = Some(drag);
         let dh = self.display_handle.clone();
         let seat = self.seat.clone();
         start_dnd(
@@ -988,8 +1012,8 @@ impl AppState {
             }),
             None,
             SourceMetadata {
-                mime_types: oriel_proto::xfer::file_selection_mimes(),
-                // Never a move: the source would delete the files once dropped.
+                mime_types,
+                // Never a move: the source would delete what was dragged once dropped.
                 dnd_action: DndAction::Copy,
             },
         );
@@ -1370,8 +1394,20 @@ impl AppState {
                 window_id,
                 x,
                 y,
-                paths,
-            } => self.start_host_drag(window_id, x, y, paths, serial, time_ms),
+                clip,
+                fetch,
+            } => self.start_host_drag(
+                window_id,
+                x,
+                y,
+                HostDrag {
+                    clip,
+                    fetch,
+                    active: true,
+                },
+                serial,
+                time_ms,
+            ),
             CompositorCommand::DragMotion { window_id, x, y } => {
                 if self.host_drag.as_ref().is_some_and(|d| d.active) {
                     if let Some(pointer) = self.seat.get_pointer() {
@@ -1391,12 +1427,12 @@ impl AppState {
             }
             CompositorCommand::DragLeave => self.cancel_host_drag(serial, time_ms),
             CompositorCommand::OutgoingDragLeave => {
-                if self.outgoing_drag {
+                if self.outgoing_drag.is_some() {
                     self.pointer_to_nowhere(serial, time_ms);
                 }
             }
             CompositorCommand::OutgoingDragEnd => {
-                if self.outgoing_drag {
+                if self.outgoing_drag.is_some() {
                     // Over no surface, releasing the button ends the drag without a drop.
                     self.pointer_to_nowhere(serial, time_ms);
                     self.pressed_buttons.remove(&BTN_LEFT);
@@ -1594,11 +1630,20 @@ impl AppState {
                     }
                 }
             }
-            CompositorCommand::SetClipboardText { text } => {
-                self.set_host_clipboard(HostClipboard::Text(text));
+            CompositorCommand::SetClipboard { clip, fetch } => {
+                self.set_host_clipboard(HostClipboard { clip, fetch });
             }
-            CompositorCommand::SetClipboardFiles { paths } => {
-                self.set_host_clipboard(HostClipboard::Files(paths));
+            CompositorCommand::ReadSelection { offer_id, mime, fd } => {
+                if self.owned_clipboard_offer == Some(offer_id) {
+                    self.request_owned_clipboard(mime, fd);
+                } else if let Some((_, source)) = self
+                    .outgoing_drag
+                    .as_ref()
+                    .filter(|(id, _)| *id == offer_id)
+                {
+                    source.send(mime, std::os::fd::AsFd::as_fd(&fd));
+                    let _ = self.display_handle.flush_clients();
+                }
             }
             CompositorCommand::SetPrimarySelectionText { text } => {
                 if self.primary_owner == SelectionOwner::RemoteHost
@@ -3496,60 +3541,80 @@ const BTN_LEFT: u32 = 0x110;
 
 pub(crate) const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Clipboard contents owned by the client (the remote host of this session).
-/// Files the client is dragging over the session's apps.
+/// What the client is dragging over the session's apps.
 struct HostDrag {
-    /// Paths inside the transfer FUSE mount.
-    paths: Vec<PathBuf>,
-    /// Not yet dropped or cancelled. After a drop the target may still read `paths`.
+    clip: ReceivedClipboard,
+    fetch: SelectionFetcher,
+    /// Not yet dropped or cancelled. After a drop the target may still read the data.
     active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HostClipboard {
-    Text(String),
-    /// Paths inside the transfer FUSE mount.
-    Files(Vec<PathBuf>),
-}
-
-impl HostClipboard {
-    fn mime_types(&self) -> Vec<String> {
-        match self {
-            HostClipboard::Text(_) => text_selection_mimes(),
-            HostClipboard::Files(_) => oriel_proto::xfer::file_selection_mimes(),
-        }
-    }
-
-    /// The selection body for `mime`; text is served for any requested type.
-    fn body(&self, mime: &str) -> Option<Vec<u8>> {
-        match self {
-            HostClipboard::Text(text) => Some(text.clone().into_bytes()),
-            HostClipboard::Files(paths) => oriel_proto::xfer::file_selection_body(mime, paths),
-        }
-    }
+/// The client's clipboard, as the session's selection.
+struct HostClipboard {
+    clip: ReceivedClipboard,
+    fetch: SelectionFetcher,
 }
 
 impl AppState {
     /// Make the client's clipboard contents the session's clipboard selection.
     fn set_host_clipboard(&mut self, data: HostClipboard) {
-        if self.clipboard_owner == SelectionOwner::RemoteHost
-            && self.clipboard_data.as_ref() == Some(&data)
-        {
-            return;
-        }
-        let mimes = data.mime_types();
+        let mimes = data.clip.mime_types();
         self.clipboard_owner = SelectionOwner::RemoteHost;
         self.clipboard_data = Some(data);
+        self.owned_clipboard_offer = None;
         set_data_device_selection(&self.display_handle, &self.seat, mimes.clone(), ());
         if let Some(xwm) = self.xwm.as_mut() {
             let _ = xwm.new_selection(SelectionTarget::Clipboard, Some(mimes));
         }
     }
+
+    /// Answer a session app's paste of type `mime` from the client's clipboard: locally
+    /// held data right away, anything else fetched from the client.
+    fn serve_host_clipboard(&self, mime: &str, fd: OwnedFd) {
+        let Some(data) = &self.clipboard_data else {
+            return;
+        };
+        match data.clip.serve(mime) {
+            Serve::Bytes(bytes) => {
+                std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
+            }
+            Serve::Fetch(owner_mime) => (data.fetch.0)(data.clip.offer_id, owner_mime, fd),
+            Serve::Nothing => {}
+        }
+    }
+
+    /// Have the session app owning the clipboard write type `mime` to `fd`.
+    fn request_owned_clipboard(&mut self, mime: String, fd: OwnedFd) {
+        match self.clipboard_owner {
+            SelectionOwner::WaylandClient => {
+                let _ = request_data_device_client_selection(&self.seat, mime, fd);
+                let _ = self.display_handle.flush_clients();
+            }
+            SelectionOwner::X11Client => self.request_x11_clipboard(mime, fd),
+            SelectionOwner::RemoteHost | SelectionOwner::None => {}
+        }
+    }
+
+    /// Have the X11 clipboard owner write type `mime` to `fd`, over our own X connection
+    /// (see `x11_selection` for why not `X11Wm::send_selection`).
+    fn request_x11_clipboard(&self, mime: String, fd: OwnedFd) {
+        let Some(display) = self.x11_display.clone() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            if let Some(bytes) = display.read_clipboard(&mime) {
+                write_selection_fd_timeout(fd, &bytes);
+            }
+        });
+    }
 }
 
-/// Formats to read from an app's new clipboard selection: its file list when it offers
-/// one, and text as the fallback for selections without local files.
+/// What to read from an app's new clipboard selection before offering it to the client:
+/// its file list when it offers one, and its text (sent along when small). Every other
+/// type is read only when the client pastes it.
 struct ClipboardRequest {
+    offer_id: u64,
+    mimes: Vec<String>,
     uri_list: bool,
     text_mime: Option<String>,
 }
@@ -3557,56 +3622,54 @@ struct ClipboardRequest {
 impl ClipboardRequest {
     fn for_mimes(mime_types: &[String]) -> Option<Self> {
         let req = Self {
+            offer_id: oriel_proto::xfer::random_u64(),
+            mimes: oriel_proto::selection::proxyable_mimes(mime_types),
             uri_list: mime_types
                 .iter()
                 .any(|m| m == oriel_proto::xfer::URI_LIST_MIME),
             text_mime: pick_preferred_text_mime(mime_types),
         };
-        (req.uri_list || req.text_mime.is_some()).then_some(req)
+        (req.uri_list || req.text_mime.is_some() || !req.mimes.is_empty()).then_some(req)
     }
 
-    /// Ask the owner for each format through `request` (which hands it the write end of a
-    /// pipe), then read them on a worker thread and emit the clipboard event. With `x11`,
-    /// the owner is an X11 client and the file list is read over our own X connection,
-    /// because `X11Wm::send_selection` cannot convert it.
+    /// Ask the owner for the file list and text through `request` (which hands it the
+    /// write end of a pipe), then read them on a worker thread and emit the clipboard
+    /// offer.
     fn spawn_reader(
         self,
         event_tx: mpsc::UnboundedSender<CompositorEvent>,
         mut request: impl FnMut(String, OwnedFd) -> bool,
-        x11: Option<crate::x11_selection::X11Display>,
     ) {
         let mut open = |mime: String| -> Option<OwnedFd> {
             let (read_pipe, write_pipe) = std::io::pipe().ok()?;
             request(mime, write_pipe.into()).then(|| read_pipe.into())
         };
-        enum UriSource {
-            Pipe(OwnedFd),
-            X11(crate::x11_selection::X11Display),
-        }
-        let uri = match (self.uri_list, x11) {
-            (false, _) => None,
-            (true, Some(display)) => Some(UriSource::X11(display)),
-            (true, None) => open(oriel_proto::xfer::URI_LIST_MIME.to_string()).map(UriSource::Pipe),
+        let uri_fd = if self.uri_list {
+            open(oriel_proto::xfer::URI_LIST_MIME.to_string())
+        } else {
+            None
         };
-        let text_fd = self.text_mime.and_then(&mut open);
-        if uri.is_none() && text_fd.is_none() {
-            return;
-        }
+        let text_fd = self.text_mime.clone().and_then(&mut open);
+        let Self {
+            offer_id, mimes, ..
+        } = self;
         std::thread::spawn(move || {
-            let body = uri.and_then(|source| match source {
-                UriSource::Pipe(fd) => read_selection_fd_complete(fd),
-                UriSource::X11(display) => display
-                    .read_clipboard(oriel_proto::xfer::URI_LIST_MIME)
-                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+            let body = uri_fd.and_then(read_selection_fd_complete);
+            let paths = body.and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body));
+            let text = text_fd.and_then(|fd| {
+                let (buf, complete) = oriel_proto::read_selection_fd_max(
+                    fd,
+                    SELECTION_IO_TIMEOUT,
+                    oriel_proto::selection::INLINE_TEXT_MAX,
+                );
+                complete.then(|| String::from_utf8(buf).ok()).flatten()
             });
-            if let Some(paths) = body.and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body))
-            {
-                let _ = event_tx.send(CompositorEvent::ClipboardFiles { paths });
-                return;
-            }
-            if let Some(text) = text_fd.and_then(read_selection_fd_bounded) {
-                let _ = event_tx.send(CompositorEvent::ClipboardText { text });
-            }
+            let _ = event_tx.send(CompositorEvent::ClipboardOffer {
+                offer_id,
+                mimes,
+                text,
+                paths,
+            });
         });
     }
 }
@@ -3695,6 +3758,7 @@ impl SelectionHandler for AppState {
         let is_clipboard = ty == SelectionTarget::Clipboard;
         if is_clipboard {
             self.clipboard_data = None;
+            self.owned_clipboard_offer = None;
             self.clipboard_owner = if source.is_some() {
                 SelectionOwner::WaylandClient
             } else {
@@ -3719,6 +3783,7 @@ impl SelectionHandler for AppState {
             // Defer requesting client selection until right after dispatch finishes.
             if is_clipboard {
                 self.pending_clipboard = ClipboardRequest::for_mimes(&mime_types);
+                self.owned_clipboard_offer = self.pending_clipboard.as_ref().map(|r| r.offer_id);
             } else if let Some(mime) = pick_preferred_text_mime(&mime_types) {
                 self.pending_primary_mime = Some(mime);
             }
@@ -3735,43 +3800,23 @@ impl SelectionHandler for AppState {
         _seat: Seat<Self>,
         _user_data: &Self::SelectionUserData,
     ) {
-        let (owner, cached) = match ty {
-            SelectionTarget::Clipboard => (
-                self.clipboard_owner,
-                self.clipboard_data
-                    .as_ref()
-                    .and_then(|d| d.body(&mime_type)),
-            ),
-            SelectionTarget::Primary => (
-                self.primary_owner,
-                self.primary_text.clone().map(String::into_bytes),
-            ),
+        let owner = match ty {
+            SelectionTarget::Clipboard => self.clipboard_owner,
+            SelectionTarget::Primary => self.primary_owner,
         };
         match owner {
-            SelectionOwner::RemoteHost => {
-                if let Some(bytes) = cached {
-                    std::thread::spawn(move || {
-                        write_selection_fd_timeout(fd, &bytes);
-                    });
+            SelectionOwner::RemoteHost => match ty {
+                SelectionTarget::Clipboard => self.serve_host_clipboard(&mime_type, fd),
+                SelectionTarget::Primary => {
+                    if let Some(bytes) = self.primary_text.clone().map(String::into_bytes) {
+                        std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
+                    }
                 }
+            },
+            SelectionOwner::X11Client if ty == SelectionTarget::Clipboard => {
+                self.request_x11_clipboard(mime_type, fd);
             }
             SelectionOwner::X11Client => {
-                // `X11Wm::send_selection` only converts the two text formats (see
-                // `x11_selection`); read other clipboard formats over our own connection.
-                let smithay_converts = matches!(
-                    mime_type.as_str(),
-                    "text/plain;charset=utf-8" | "text/plain"
-                );
-                if ty == SelectionTarget::Clipboard && !smithay_converts {
-                    if let Some(display) = self.x11_display.clone() {
-                        std::thread::spawn(move || {
-                            if let Some(bytes) = display.read_clipboard(&mime_type) {
-                                write_selection_fd_timeout(fd, &bytes);
-                            }
-                        });
-                    }
-                    return;
-                }
                 if let Some(xwm) = self.xwm.as_mut() {
                     if let Err(err) =
                         xwm.send_selection(ty, mime_type, fd, self.loop_handle.clone())
@@ -3789,11 +3834,9 @@ impl AppState {
     fn poll_pending_selections(&mut self) {
         if let Some(req) = self.pending_clipboard.take() {
             let seat = self.seat.clone();
-            req.spawn_reader(
-                self.event_tx.clone(),
-                |mime, fd| request_data_device_client_selection(&seat, mime, fd).is_ok(),
-                None,
-            );
+            req.spawn_reader(self.event_tx.clone(), |mime, fd| {
+                request_data_device_client_selection(&seat, mime, fd).is_ok()
+            });
             let _ = self.display_handle.flush_clients();
         }
         if let Some(mime) = self.pending_primary_mime.take() {
@@ -4562,26 +4605,19 @@ impl XwmHandler for AppState {
         mime_type: String,
         fd: OwnedFd,
     ) {
-        let (owner, cached) = match selection {
-            SelectionTarget::Clipboard => (
-                self.clipboard_owner,
-                self.clipboard_data
-                    .as_ref()
-                    .and_then(|d| d.body(&mime_type)),
-            ),
-            SelectionTarget::Primary => (
-                self.primary_owner,
-                self.primary_text.clone().map(String::into_bytes),
-            ),
+        let owner = match selection {
+            SelectionTarget::Clipboard => self.clipboard_owner,
+            SelectionTarget::Primary => self.primary_owner,
         };
         match owner {
-            SelectionOwner::RemoteHost => {
-                if let Some(bytes) = cached {
-                    std::thread::spawn(move || {
-                        write_selection_fd_timeout(fd, &bytes);
-                    });
+            SelectionOwner::RemoteHost => match selection {
+                SelectionTarget::Clipboard => self.serve_host_clipboard(&mime_type, fd),
+                SelectionTarget::Primary => {
+                    if let Some(bytes) = self.primary_text.clone().map(String::into_bytes) {
+                        std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
+                    }
                 }
-            }
+            },
             SelectionOwner::WaylandClient => match selection {
                 SelectionTarget::Clipboard => {
                     let _ = request_data_device_client_selection(&self.seat, mime_type, fd);
@@ -4601,6 +4637,7 @@ impl XwmHandler for AppState {
             SelectionTarget::Clipboard => {
                 self.clipboard_owner = SelectionOwner::X11Client;
                 self.clipboard_data = None;
+                self.owned_clipboard_offer = None;
                 set_data_device_selection(&self.display_handle, &self.seat, mime_types.clone(), ());
             }
             SelectionTarget::Primary => {
@@ -4611,23 +4648,20 @@ impl XwmHandler for AppState {
         }
 
         if selection == SelectionTarget::Clipboard {
-            if let (Some(req), Some(xwm)) =
-                (ClipboardRequest::for_mimes(&mime_types), self.xwm.as_mut())
-            {
-                let loop_handle = self.loop_handle.clone();
-                req.spawn_reader(
-                    self.event_tx.clone(),
-                    |mime, fd| {
-                        xwm.send_selection(
-                            SelectionTarget::Clipboard,
-                            mime,
-                            fd,
-                            loop_handle.clone(),
-                        )
-                        .is_ok()
-                    },
-                    self.x11_display.clone(),
-                );
+            if let Some(req) = ClipboardRequest::for_mimes(&mime_types) {
+                self.owned_clipboard_offer = Some(req.offer_id);
+                let display = self.x11_display.clone();
+                req.spawn_reader(self.event_tx.clone(), |mime, fd| {
+                    let Some(display) = display.clone() else {
+                        return false;
+                    };
+                    std::thread::spawn(move || {
+                        if let Some(bytes) = display.read_clipboard(&mime) {
+                            write_selection_fd_timeout(fd, &bytes);
+                        }
+                    });
+                    true
+                });
             }
         } else if let Some(mime) = pick_preferred_text_mime(&mime_types) {
             if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
@@ -4641,15 +4675,8 @@ impl XwmHandler for AppState {
                         let read_fd: OwnedFd = read_pipe.into();
                         std::thread::spawn(move || {
                             if let Some(text) = read_selection_fd_bounded(read_fd) {
-                                let ev = match selection {
-                                    SelectionTarget::Clipboard => {
-                                        CompositorEvent::ClipboardText { text }
-                                    }
-                                    SelectionTarget::Primary => {
-                                        CompositorEvent::PrimarySelectionText { text }
-                                    }
-                                };
-                                let _ = event_tx.send(ev);
+                                let _ =
+                                    event_tx.send(CompositorEvent::PrimarySelectionText { text });
                             }
                         });
                     }
@@ -4692,43 +4719,51 @@ impl ClientDndGrabHandler for AppState {
         _icon: Option<WlSurface>,
         _seat: Seat<Self>,
     ) {
-        // A drag carrying files can leave the session: read its file list so the client
-        // can continue it on its desktop. Other drags stay inside the session.
+        // A drag carrying data other apps understand can leave the session: the client
+        // continues it on its desktop. Drags of app-internal types stay in the session.
         let Some(source) = source else {
             return;
         };
-        let has_files = with_source_metadata(&source, |meta| {
-            meta.mime_types
-                .iter()
-                .any(|m| m == oriel_proto::xfer::URI_LIST_MIME)
-        })
-        .unwrap_or(false);
-        if !has_files {
+        let mime_types =
+            with_source_metadata(&source, |meta| meta.mime_types.clone()).unwrap_or_default();
+        if !oriel_proto::selection::has_interchange_mime(&mime_types) {
             return;
         }
-        let Ok((read_pipe, write_pipe)) = std::io::pipe() else {
-            return;
+        let uri_pipe = if mime_types
+            .iter()
+            .any(|m| m == oriel_proto::xfer::URI_LIST_MIME)
+        {
+            std::io::pipe().ok().map(|(read_pipe, write_pipe)| {
+                source.send(
+                    oriel_proto::xfer::URI_LIST_MIME.to_string(),
+                    std::os::fd::AsFd::as_fd(&write_pipe),
+                );
+                read_pipe
+            })
+        } else {
+            None
         };
-        source.send(
-            oriel_proto::xfer::URI_LIST_MIME.to_string(),
-            std::os::fd::AsFd::as_fd(&write_pipe),
-        );
-        drop(write_pipe);
         let _ = self.display_handle.flush_clients();
-        self.outgoing_drag = true;
+        let offer_id = oriel_proto::xfer::random_u64();
+        self.outgoing_drag = Some((offer_id, source));
         let window_id = self.focused_window_id;
+        let mimes = oriel_proto::selection::proxyable_mimes(&mime_types);
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            if let Some(paths) = read_selection_fd_complete(read_pipe.into())
-                .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body))
-            {
-                let _ = event_tx.send(CompositorEvent::DragFiles { window_id, paths });
-            }
+            let paths = uri_pipe
+                .and_then(|pipe| read_selection_fd_complete(pipe.into()))
+                .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body));
+            let _ = event_tx.send(CompositorEvent::DragOffer {
+                window_id,
+                offer_id,
+                mimes,
+                paths,
+            });
         });
     }
 
     fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
-        self.outgoing_drag = false;
+        self.outgoing_drag = None;
     }
 }
 impl ServerDndGrabHandler for AppState {
@@ -4736,8 +4771,12 @@ impl ServerDndGrabHandler for AppState {
         let Some(drag) = &self.host_drag else {
             return;
         };
-        if let Some(bytes) = oriel_proto::xfer::file_selection_body(&mime_type, &drag.paths) {
-            std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
+        match drag.clip.serve(&mime_type) {
+            Serve::Bytes(bytes) => {
+                std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
+            }
+            Serve::Fetch(mime) => (drag.fetch.0)(drag.clip.offer_id, mime, fd),
+            Serve::Nothing => {}
         }
     }
 
@@ -4749,10 +4788,12 @@ impl ServerDndGrabHandler for AppState {
 
     fn cancelled(&mut self, _seat: Seat<Self>) {
         self.host_drag = None;
+        let _ = self.event_tx.send(CompositorEvent::DragFinished);
     }
 
     fn finished(&mut self, _seat: Seat<Self>) {
         self.host_drag = None;
+        let _ = self.event_tx.send(CompositorEvent::DragFinished);
     }
 }
 
@@ -5184,7 +5225,7 @@ fn run_compositor_loop(
         xwayland_shell_state,
         xwm: None,
         host_drag: None,
-        outgoing_drag: false,
+        outgoing_drag: None,
         x11_display: None,
         xwayland_client,
         output,
@@ -5207,6 +5248,7 @@ fn run_compositor_loop(
         last_cursor_bitmap: None,
         clipboard_owner: SelectionOwner::None,
         clipboard_data: None,
+        owned_clipboard_offer: None,
         pending_clipboard: None,
         primary_owner: SelectionOwner::None,
         primary_text: None,

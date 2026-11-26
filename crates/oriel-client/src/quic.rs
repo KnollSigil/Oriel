@@ -370,44 +370,85 @@ pub async fn run_client(
         tokio::spawn(async move {
             while let Some(msg) = clipboard_rx.recv().await {
                 match msg {
-                    ControlMessage::ClipboardText { text } => {
-                        let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
-                    }
-                    ControlMessage::ClipboardFiles { offer_id, roots } => {
-                        let conn = conn.clone();
-                        let paths = tokio::task::spawn_blocking(move || {
-                            crate::xfer::receive_offer(
-                                conn,
-                                oriel_proto::xfer::OfferSlot::Clipboard,
-                                offer_id,
-                                roots,
-                            )
-                        })
-                        .await
-                        .unwrap_or_default();
-                        if !paths.is_empty() {
-                            let _ = ui_tx.send(ClientUiEvent::ClipboardFiles { paths });
+                    ControlMessage::ClipboardOffer {
+                        offer_id,
+                        mimes,
+                        text,
+                        files,
+                    } => {
+                        let files = match files {
+                            Some(f) => {
+                                let conn = conn.clone();
+                                let paths = tokio::task::spawn_blocking(move || {
+                                    crate::xfer::receive_offer(
+                                        conn,
+                                        oriel_proto::xfer::OfferSlot::Clipboard,
+                                        f.offer_id,
+                                        f.roots,
+                                    )
+                                })
+                                .await
+                                .unwrap_or_default();
+                                (!paths.is_empty()).then_some(paths)
+                            }
+                            None => None,
+                        };
+                        if files.is_none() && text.is_none() && mimes.is_empty() {
+                            continue;
                         }
+                        let clip = oriel_proto::selection::ReceivedClipboard {
+                            offer_id,
+                            mimes,
+                            text,
+                            files,
+                        };
+                        let fetch = crate::xfer::SelectionFetcher {
+                            conn: conn.clone(),
+                            rt: tokio::runtime::Handle::current(),
+                        };
+                        let _ = ui_tx.send(ClientUiEvent::ClipboardOffer { clip, fetch });
                     }
                     ControlMessage::RemoteDragStart {
                         window_id,
                         offer_id,
-                        roots,
+                        mimes,
+                        files,
                     } => {
-                        let conn = conn.clone();
-                        let paths = tokio::task::spawn_blocking(move || {
-                            crate::xfer::receive_offer(
-                                conn,
-                                oriel_proto::xfer::OfferSlot::Drag,
-                                offer_id,
-                                roots,
-                            )
-                        })
-                        .await
-                        .unwrap_or_default();
-                        if !paths.is_empty() {
-                            let _ = ui_tx.send(ClientUiEvent::RemoteDragStart { window_id, paths });
+                        let files = match files {
+                            Some(f) => {
+                                let conn = conn.clone();
+                                let paths = tokio::task::spawn_blocking(move || {
+                                    crate::xfer::receive_offer(
+                                        conn,
+                                        oriel_proto::xfer::OfferSlot::Drag,
+                                        f.offer_id,
+                                        f.roots,
+                                    )
+                                })
+                                .await
+                                .unwrap_or_default();
+                                (!paths.is_empty()).then_some(paths)
+                            }
+                            None => None,
+                        };
+                        if files.is_none() && mimes.is_empty() {
+                            continue;
                         }
+                        let clip = oriel_proto::selection::ReceivedClipboard {
+                            offer_id,
+                            mimes,
+                            text: None,
+                            files,
+                        };
+                        let fetch = crate::xfer::SelectionFetcher {
+                            conn: conn.clone(),
+                            rt: tokio::runtime::Handle::current(),
+                        };
+                        let _ = ui_tx.send(ClientUiEvent::RemoteDragStart {
+                            window_id,
+                            clip,
+                            fetch,
+                        });
                     }
                     _ => {}
                 }
@@ -826,10 +867,12 @@ pub async fn run_client(
                         bgra,
                     });
                 }
-                msg @ (ControlMessage::ClipboardText { .. }
-                | ControlMessage::ClipboardFiles { .. }
+                msg @ (ControlMessage::ClipboardOffer { .. }
                 | ControlMessage::RemoteDragStart { .. }) => {
                     let _ = clipboard_tx.send(msg);
+                }
+                ControlMessage::DragFinished => {
+                    let _ = ui_tx.send(ClientUiEvent::DragFinished);
                 }
                 ControlMessage::PrimarySelectionText { text } => {
                     let _ = ui_tx.send(ClientUiEvent::PrimarySelectionText { text });

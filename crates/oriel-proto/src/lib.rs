@@ -1,5 +1,6 @@
 //! Shared wire protocol and stream framing for Oriel.
 
+pub mod selection;
 pub mod smart_tile;
 pub mod xfer;
 pub mod xfer_fuse;
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -154,6 +155,15 @@ pub fn read_selection_fd(
     fd: std::os::fd::OwnedFd,
     timeout: std::time::Duration,
 ) -> (Vec<u8>, bool) {
+    read_selection_fd_max(fd, timeout, MAX_SELECTION_BYTES)
+}
+
+/// [`read_selection_fd`] with a limit of `max` bytes.
+pub fn read_selection_fd_max(
+    fd: std::os::fd::OwnedFd,
+    timeout: std::time::Duration,
+    max: usize,
+) -> (Vec<u8>, bool) {
     use std::os::fd::AsRawFd;
     let raw = fd.as_raw_fd();
     let deadline = std::time::Instant::now() + timeout;
@@ -181,7 +191,7 @@ pub fn read_selection_fd(
             return (buf, false);
         }
         // One byte past the limit tells "exactly at the limit" from "over it".
-        let max_read = chunk.len().min(MAX_SELECTION_BYTES + 1 - buf.len());
+        let max_read = chunk.len().min(max + 1 - buf.len());
         // SAFETY: `chunk` has room for `max_read` bytes.
         let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast::<libc::c_void>(), max_read) };
         if n == 0 {
@@ -194,8 +204,8 @@ pub fn read_selection_fd(
             return (buf, false);
         }
         buf.extend_from_slice(&chunk[..n as usize]);
-        if buf.len() > MAX_SELECTION_BYTES {
-            buf.truncate(MAX_SELECTION_BYTES);
+        if buf.len() > max {
+            buf.truncate(max);
             return (buf, false);
         }
     }
@@ -264,7 +274,7 @@ pub enum BidiStreamHeader {
         rows: u16,
         command: Option<String>,
     },
-    /// List a directory inside a file offer (see [`ControlMessage::ClipboardFiles`]). The
+    /// List a directory inside a file offer (see [`ControlMessage::ClipboardOffer`]). The
     /// owner replies with one [`xfer::FileListReply`] frame.
     FileList {
         offer_id: u64,
@@ -280,6 +290,10 @@ pub enum BidiStreamHeader {
         path: Vec<String>,
         offset: u64,
     },
+    /// Read type `mime` of selection `offer_id` (see [`ControlMessage::ClipboardOffer`]).
+    /// The owner replies with one [`selection::SelectionDataReply`] frame followed by the
+    /// raw data up to EOF; the reader stops the stream to cancel.
+    SelectionData { offer_id: u64, mime: String },
 }
 
 /// Framed messages exchanged over a bidirectional PTY QUIC stream.
@@ -462,25 +476,29 @@ pub enum ControlMessage {
         pressed: bool,
     },
 
-    /// Bidirectional: UTF-8 clipboard text synchronization.
-    ClipboardText { text: String },
-    /// Bidirectional: the clipboard now holds files owned by the sender. The receiver
-    /// presents them as paths and reads their contents on demand with
-    /// [`BidiStreamHeader::FileList`] / [`BidiStreamHeader::FileRead`].
-    ClipboardFiles {
+    /// Bidirectional: the sender's clipboard changed (see [`selection`]). `mimes` are the
+    /// types the receiver fetches on paste with [`BidiStreamHeader::SelectionData`];
+    /// `text` is the text when small; `files` are files presented as paths, read on demand
+    /// with [`BidiStreamHeader::FileList`] / [`BidiStreamHeader::FileRead`].
+    ClipboardOffer {
         offer_id: u64,
-        roots: Vec<xfer::FileEntry>,
+        mimes: Vec<String>,
+        text: Option<String>,
+        files: Option<xfer::FileOffer>,
     },
-    /// Client -> Server: a local drag carrying files entered remote window `window_id` at
-    /// surface-local `x`/`y`. The server drags the files over the window's apps (read like
-    /// [`ControlMessage::ClipboardFiles`]) until [`ControlMessage::DragLeave`] or
-    /// [`ControlMessage::DragDrop`].
+    /// Client -> Server: a local drag entered remote window `window_id` at surface-local
+    /// `x`/`y`. The server drags it over the window's apps until
+    /// [`ControlMessage::DragLeave`] or [`ControlMessage::DragDrop`]. Its data is offered
+    /// like [`ControlMessage::ClipboardOffer`]: `mimes` fetched from offer `offer_id` with
+    /// [`BidiStreamHeader::SelectionData`] (until [`ControlMessage::DragFinished`]),
+    /// `files` presented as paths.
     DragEnter {
         window_id: WindowId,
         x: f64,
         y: f64,
         offer_id: u64,
-        roots: Vec<xfer::FileEntry>,
+        mimes: Vec<String>,
+        files: Option<xfer::FileOffer>,
     },
     /// Client -> Server: the drag from [`ControlMessage::DragEnter`] moved.
     DragMotion { window_id: WindowId, x: f64, y: f64 },
@@ -488,14 +506,19 @@ pub enum ControlMessage {
     DragLeave,
     /// Client -> Server: the drag was dropped where it last moved to.
     DragDrop,
-    /// Server -> Client: an app in remote window `window_id` started dragging files. The
-    /// client continues the drag on the local desktop (read like
-    /// [`ControlMessage::ClipboardFiles`]). Over remote windows it keeps sending ordinary
-    /// pointer motion and the button release, which the server's drag follows.
+    /// Server -> Client: the app the drag from [`ControlMessage::DragEnter`] was dropped on
+    /// is done with its data (or the drop failed): the client can end the local drag.
+    DragFinished,
+    /// Server -> Client: an app in remote window `window_id` started a drag that can leave
+    /// the session (files, text, images). The client continues it on the local desktop;
+    /// its data is offered like [`ControlMessage::ClipboardOffer`] (`mimes` fetched from
+    /// offer `offer_id`). Over remote windows the client keeps sending ordinary pointer
+    /// motion and the button release, which the server's drag follows.
     RemoteDragStart {
         window_id: WindowId,
         offer_id: u64,
-        roots: Vec<xfer::FileEntry>,
+        mimes: Vec<String>,
+        files: Option<xfer::FileOffer>,
     },
     /// Client -> Server: the drag from [`ControlMessage::RemoteDragStart`] left the remote
     /// windows, so it is over no session app.

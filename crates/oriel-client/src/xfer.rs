@@ -1,6 +1,6 @@
 //! Client side of streamed clipboard file transfer (see `oriel_proto::xfer`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use oriel_proto::xfer::{FileEntry, OfferSlot, XferOwner};
 use oriel_proto::xfer_fuse::{cleanup_stale_mounts, XferMount};
 use oriel_proto::{read_bidi_stream_header, BidiStreamHeader};
 use tracing::{debug, warn};
+use wayland_client::protocol::wl_data_offer::WlDataOffer;
 
 /// Local files offered to servers. Shared by every session in this process; offer ids are
 /// random, so a server can only read what it was offered.
@@ -117,6 +118,66 @@ pub fn unmount() {
     }
 }
 
+/// Fetches types of a server's selection on demand (see `oriel_proto::selection`).
+#[derive(Clone)]
+pub struct SelectionFetcher {
+    pub conn: quinn::Connection,
+    pub rt: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for SelectionFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SelectionFetcher")
+    }
+}
+
+impl SelectionFetcher {
+    /// Fetch type `mime` of the server's selection `offer_id` into the pipe `fd`.
+    pub fn fetch(&self, offer_id: u64, mime: String, fd: std::os::fd::OwnedFd) {
+        let conn = self.conn.clone();
+        self.rt.spawn(async move {
+            if let Err(err) =
+                oriel_proto::selection::fetch_selection_data(&conn, offer_id, mime, fd).await
+            {
+                debug!(error = %format!("{err:#}"), "clipboard fetch from server failed");
+            }
+        });
+    }
+}
+
+/// Local selections (clipboard contents, drags) offered to servers, by offer id, so a
+/// server's paste can read any type from the app that owns it. wayland-client objects can
+/// send requests from any thread, so reads need no trip through a window loop.
+static LIVE_SOURCES: Mutex<VecDeque<(u64, WlDataOffer, wayland_client::Connection)>> =
+    Mutex::new(VecDeque::new());
+
+/// Offers kept readable: the current clipboard and drag per session, with room to spare.
+const KEPT_LIVE_SOURCES: usize = 16;
+
+/// Make local selection `offer` readable by servers as `offer_id`.
+pub fn register_live_source(offer_id: u64, offer: WlDataOffer, conn: wayland_client::Connection) {
+    let mut sources = LIVE_SOURCES.lock().unwrap();
+    sources.push_back((offer_id, offer, conn));
+    while sources.len() > KEPT_LIVE_SOURCES {
+        sources.pop_front();
+    }
+}
+
+/// Ask the owner of live source `offer_id` for type `mime`: the read end of the pipe it
+/// writes to. `None` for an unknown offer. A replaced offer has been destroyed, so the
+/// request is ignored and the pipe ends empty.
+fn open_live_source(offer_id: u64, mime: String) -> Option<std::os::fd::OwnedFd> {
+    let (offer, conn) = {
+        let sources = LIVE_SOURCES.lock().unwrap();
+        let (_, offer, conn) = sources.iter().find(|(id, _, _)| *id == offer_id)?;
+        (offer.clone(), conn.clone())
+    };
+    let pipe =
+        smithay_client_toolkit::data_device_manager::data_offer::receive(&offer, mime).ok()?;
+    let _ = conn.flush();
+    Some(pipe.into())
+}
+
 /// Write end of the pipe the termination signal handler reports signals on.
 static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -182,6 +243,10 @@ pub fn spawn_stream_acceptor(conn: quinn::Connection) -> tokio::task::JoinHandle
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             streams.spawn(async move {
                 match read_bidi_stream_header(&mut recv).await {
+                    Ok(BidiStreamHeader::SelectionData { offer_id, mime }) => {
+                        let source = open_live_source(offer_id, mime);
+                        oriel_proto::selection::serve_selection_data(source, &mut send).await;
+                    }
                     Ok(
                         header @ (BidiStreamHeader::FileList { .. }
                         | BidiStreamHeader::FileRead { .. }),

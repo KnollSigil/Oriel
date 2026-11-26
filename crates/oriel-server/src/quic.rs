@@ -2,12 +2,14 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use oriel_proto::xfer::{self, OfferSlot, XferOwner};
+use oriel_proto::selection::ReceivedClipboard;
+use oriel_proto::xfer::{self, FileOffer, OfferSlot, XferOwner};
 use oriel_proto::xfer_fuse::XferMount;
 use oriel_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_protocol_preamble,
@@ -23,7 +25,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tracing::{debug, info, warn};
 
 use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
-use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
+use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle, SelectionFetcher};
 use crate::damage::FrameDamage;
 use crate::media::WindowVideoEncoder;
 
@@ -434,6 +436,7 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         conn.clone(),
         Arc::clone(&shared.pty_mgr),
         Arc::clone(&shared.xfer_owner),
+        shared.cmd_tx.clone(),
     );
     let res = match role {
         ClientRole::PtyOnly => {
@@ -485,13 +488,30 @@ fn spawn_bidi_stream_acceptor(
     conn: quinn::Connection,
     pty_mgr: Arc<crate::pty::PtyManager>,
     xfer_owner: Arc<XferOwner>,
+    cmd_tx: calloop::channel::Sender<CompositorCommand>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Ok((mut send_bi, mut recv_bi)) = conn.accept_bi().await {
             let pty = Arc::clone(&pty_mgr);
             let xfer_owner = Arc::clone(&xfer_owner);
+            let cmd_tx = cmd_tx.clone();
             tokio::spawn(async move {
                 match read_bidi_stream_header(&mut recv_bi).await {
+                    Ok(BidiStreamHeader::SelectionData { offer_id, mime }) => {
+                        // The compositor hands the write end to the selection's owner, or
+                        // drops it (end of data) when the offer is no longer current.
+                        let source = std::io::pipe().ok().and_then(|(read, write)| {
+                            cmd_tx
+                                .send(CompositorCommand::ReadSelection {
+                                    offer_id,
+                                    mime,
+                                    fd: write.into(),
+                                })
+                                .ok()
+                                .map(|()| OwnedFd::from(read))
+                        });
+                        oriel_proto::selection::serve_selection_data(source, &mut send_bi).await;
+                    }
                     Ok(
                         header @ (BidiStreamHeader::FileList { .. }
                         | BidiStreamHeader::FileRead { .. }),
@@ -903,30 +923,37 @@ async fn run_display_session(
                     Some(ControlMessage::WindowClosed { window_id }) => {
                         let _ = cmd_tx.send(CompositorCommand::CloseWindow { window_id });
                     }
-                    Some(ControlMessage::ClipboardText { text }) => {
-                        let _ = cmd_tx.send(CompositorCommand::SetClipboardText { text });
-                    }
-                    Some(ControlMessage::ClipboardFiles { offer_id, roots }) => {
-                        if let Some(mount) = &shared.xfer_mount {
-                            let paths = mount.add_offer(conn.clone(), OfferSlot::Clipboard, offer_id, roots);
-                            if !paths.is_empty() {
-                                let _ = cmd_tx.send(CompositorCommand::SetClipboardFiles { paths });
+                    Some(ControlMessage::ClipboardOffer { offer_id, mimes, text, files }) => {
+                        let files = files.and_then(|f| match &shared.xfer_mount {
+                            Some(mount) => {
+                                let paths = mount.add_offer(conn.clone(), OfferSlot::Clipboard, f.offer_id, f.roots);
+                                (!paths.is_empty()).then_some(paths)
                             }
-                        } else {
-                            debug!("ignoring clipboard files: no transfer mount");
+                            None => {
+                                debug!("ignoring clipboard files: no transfer mount");
+                                None
+                            }
+                        });
+                        debug!(?mimes, text = text.as_ref().map(String::len), files = files.as_ref().map(Vec::len), "client clipboard changed");
+                        if files.is_some() || text.is_some() || !mimes.is_empty() {
+                            let clip = ReceivedClipboard { offer_id, mimes, text, files };
+                            let fetch = selection_fetcher(conn.clone());
+                            let _ = cmd_tx.send(CompositorCommand::SetClipboard { clip, fetch });
                         }
                     }
                     Some(ControlMessage::PrimarySelectionText { text }) => {
                         let _ = cmd_tx.send(CompositorCommand::SetPrimarySelectionText { text });
                     }
-                    Some(ControlMessage::DragEnter { window_id, x, y, offer_id, roots }) => {
-                        if let Some(mount) = &shared.xfer_mount {
-                            let paths = mount.add_offer(conn.clone(), OfferSlot::Drag, offer_id, roots);
-                            if !paths.is_empty() {
-                                let _ = cmd_tx.send(CompositorCommand::DragStart { window_id, x, y, paths });
-                            }
-                        } else {
-                            debug!("ignoring drag: no transfer mount");
+                    Some(ControlMessage::DragEnter { window_id, x, y, offer_id, mimes, files }) => {
+                        let files = files.and_then(|f| {
+                            let mount = shared.xfer_mount.as_ref()?;
+                            let paths = mount.add_offer(conn.clone(), OfferSlot::Drag, f.offer_id, f.roots);
+                            (!paths.is_empty()).then_some(paths)
+                        });
+                        if files.is_some() || !mimes.is_empty() {
+                            let clip = ReceivedClipboard { offer_id, mimes, text: None, files };
+                            let fetch = selection_fetcher(conn.clone());
+                            let _ = cmd_tx.send(CompositorCommand::DragStart { window_id, x, y, clip, fetch });
                         }
                     }
                     Some(ControlMessage::DragMotion { window_id, x, y }) => {
@@ -1062,8 +1089,21 @@ struct PopupEncoderState {
 
 const POPUP_IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
 
-/// Forwards compositor events to one display client and tracks what that client has been
-/// told, so a snapshot can retract windows and programs it missed the end of.
+/// Fetch types of the client's selections over `conn` (see `oriel_proto::selection`).
+fn selection_fetcher(conn: quinn::Connection) -> SelectionFetcher {
+    let handle = tokio::runtime::Handle::current();
+    SelectionFetcher(Arc::new(move |offer_id, mime, fd| {
+        let conn = conn.clone();
+        handle.spawn(async move {
+            if let Err(err) =
+                oriel_proto::selection::fetch_selection_data(&conn, offer_id, mime, fd).await
+            {
+                debug!(error = %format!("{err:#}"), "clipboard fetch from client failed");
+            }
+        });
+    }))
+}
+
 /// Turn clipboard changes and file drags into control messages on `out_tx`, in order. Registering files
 /// stats every path, which can block (a stalled network mount, or the transfer mount
 /// itself), so it runs here and not in the session loop.
@@ -1075,34 +1115,80 @@ fn spawn_clipboard_worker(
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let msg = match ev {
-                CompositorEvent::ClipboardText { text } => ControlMessage::ClipboardText { text },
-                CompositorEvent::ClipboardFiles { paths } => {
-                    let owner = Arc::clone(&xfer_owner);
-                    let offer = tokio::task::spawn_blocking(move || {
-                        owner.offer(OfferSlot::Clipboard, &paths)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    let Some((offer_id, roots)) = offer else {
-                        continue;
-                    };
-                    ControlMessage::ClipboardFiles { offer_id, roots }
-                }
-                CompositorEvent::DragFiles { window_id, paths } => {
-                    let owner = Arc::clone(&xfer_owner);
-                    let offer =
-                        tokio::task::spawn_blocking(move || owner.offer(OfferSlot::Drag, &paths))
+                CompositorEvent::ClipboardOffer {
+                    offer_id,
+                    mimes,
+                    text,
+                    paths,
+                } => {
+                    let had_files = paths.is_some();
+                    let files = match paths {
+                        Some(paths) => {
+                            let owner = Arc::clone(&xfer_owner);
+                            tokio::task::spawn_blocking(move || {
+                                owner.offer(OfferSlot::Clipboard, &paths)
+                            })
                             .await
                             .ok()
-                            .flatten();
-                    let Some((offer_id, roots)) = offer else {
-                        continue;
+                            .flatten()
+                            .map(|(offer_id, roots)| FileOffer { offer_id, roots })
+                        }
+                        None => None,
                     };
+                    // Files are offered as files only; their text form (paths on this
+                    // machine) and file-list types mean nothing to the client.
+                    let (mimes, text) = if files.is_some() {
+                        (Vec::new(), None)
+                    } else if had_files {
+                        let mimes = mimes
+                            .into_iter()
+                            .filter(|m| {
+                                !oriel_proto::xfer::FILE_SELECTION_MIMES.contains(&m.as_str())
+                            })
+                            .collect();
+                        (mimes, text)
+                    } else {
+                        (mimes, text)
+                    };
+                    if files.is_none() && text.is_none() && mimes.is_empty() {
+                        continue;
+                    }
+                    ControlMessage::ClipboardOffer {
+                        offer_id,
+                        mimes,
+                        text,
+                        files,
+                    }
+                }
+                CompositorEvent::DragOffer {
+                    window_id,
+                    offer_id,
+                    mimes,
+                    paths,
+                } => {
+                    let files = match paths {
+                        Some(paths) => {
+                            let owner = Arc::clone(&xfer_owner);
+                            tokio::task::spawn_blocking(move || {
+                                owner.offer(OfferSlot::Drag, &paths)
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|(offer_id, roots)| FileOffer { offer_id, roots })
+                        }
+                        None => None,
+                    };
+                    // As for the clipboard: files are offered as files only.
+                    let mimes = if files.is_some() { Vec::new() } else { mimes };
+                    if files.is_none() && mimes.is_empty() {
+                        continue;
+                    }
                     ControlMessage::RemoteDragStart {
                         window_id,
                         offer_id,
-                        roots,
+                        mimes,
+                        files,
                     }
                 }
                 _ => continue,
@@ -1115,6 +1201,8 @@ fn spawn_clipboard_worker(
     tx
 }
 
+/// Forwards compositor events to one display client and tracks what that client has been
+/// told, so a snapshot can retract windows and programs it missed the end of.
 struct EventForwarder {
     conn: quinn::Connection,
     selected_codec: VideoCodec,
@@ -1466,10 +1554,11 @@ impl EventForwarder {
                 )
                 .await?;
             }
-            ev @ (CompositorEvent::ClipboardText { .. }
-            | CompositorEvent::ClipboardFiles { .. }
-            | CompositorEvent::DragFiles { .. }) => {
+            ev @ (CompositorEvent::ClipboardOffer { .. } | CompositorEvent::DragOffer { .. }) => {
                 let _ = self.clipboard_tx.send(ev);
+            }
+            CompositorEvent::DragFinished => {
+                write_control_message(send, &ControlMessage::DragFinished).await?;
             }
             CompositorEvent::PrimarySelectionText { text } => {
                 write_control_message(send, &ControlMessage::PrimarySelectionText { text }).await?;

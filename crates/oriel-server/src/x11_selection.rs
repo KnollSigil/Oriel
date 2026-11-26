@@ -1,9 +1,10 @@
 //! Read one format of the X11 `CLIPBOARD` selection over a connection of our own to the
 //! embedded XWayland.
 //!
-//! Smithay 0.7's `X11Wm::send_selection` can only convert `UTF8_STRING` and `TEXT`: for any
-//! other MIME type it looks the atom up in a `TARGETS` property it never stores, and fails.
-//! File copies (`text/uri-list`) and other formats from X11 apps go through here instead.
+//! Smithay 0.7's `X11Wm::send_selection` can only convert `UTF8_STRING` and `TEXT` (for
+//! any other MIME type it looks the atom up in a `TARGETS` property it never stores), and
+//! for large data sent incrementally (INCR) it passes the INCR size header on as data. All
+//! clipboard reads from X11 apps go through here instead.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -13,7 +14,8 @@ use std::time::Instant;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt, CreateWindowAux, Window, WindowClass,
+    Atom, AtomEnum, ConnectionExt, CreateWindowAux, EventMask, GetPropertyReply, Property, Window,
+    WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
@@ -24,6 +26,10 @@ use oriel_proto::MAX_SELECTION_BYTES;
 use crate::compositor::SELECTION_IO_TIMEOUT;
 
 const COOKIE_AUTH: &[u8] = b"MIT-MAGIC-COOKIE-1";
+
+/// Largest selection read with incremental (INCR) transfers, which X11 apps use for
+/// anything bigger than a request (images, mostly).
+const MAX_INCR_BYTES: usize = 256 * 1024 * 1024;
 
 /// How to reach the embedded XWayland. Clones share one connection.
 #[derive(Clone, Debug)]
@@ -62,8 +68,7 @@ impl X11Display {
     }
 
     /// The `CLIPBOARD` selection converted to `mime`, or `None` when the owner refuses,
-    /// answers incrementally (INCR, only used for large data), sends more than
-    /// `MAX_SELECTION_BYTES`, or does not answer within `SELECTION_IO_TIMEOUT`.
+    /// sends more than `MAX_INCR_BYTES`, or stalls for `SELECTION_IO_TIMEOUT`.
     pub fn read_clipboard(&self, mime: &str) -> Option<Vec<u8>> {
         let mut slot = self.reader.lock().unwrap();
         if slot.is_none() {
@@ -127,7 +132,10 @@ impl X11Display {
             WindowClass::INPUT_ONLY,
             0,
             // Never mapped; override-redirect keeps it out of window management anyway.
-            &CreateWindowAux::new().override_redirect(1),
+            // Property changes drive incremental (INCR) transfers.
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .event_mask(EventMask::PROPERTY_CHANGE),
         )?;
         conn.flush()?;
         Ok(Reader {
@@ -140,11 +148,24 @@ impl X11Display {
     }
 }
 
+/// The X11 target for MIME type `mime`: the plain-text types map to the X11 text atoms
+/// (as smithay's window manager announces them), everything else is its own atom name.
+fn target_name(mime: &str) -> &str {
+    match mime {
+        "text/plain;charset=utf-8" => "UTF8_STRING",
+        "text/plain" => "TEXT",
+        other => other,
+    }
+}
+
 impl Reader {
     fn read(&self, mime: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
         let conn = &self.conn;
-        let target = conn.intern_atom(false, mime.as_bytes())?.reply()?.atom;
+        let target = conn
+            .intern_atom(false, target_name(mime).as_bytes())?
+            .reply()?
+            .atom;
         // Answers to earlier requests that timed out are stale.
         while conn.poll_for_event()?.is_some() {}
         // Clear a stale value so only the owner's answer is read.
@@ -178,8 +199,52 @@ impl Reader {
             return Ok(None);
         }
 
+        let reply = self.take_property()?;
+        if reply.type_ != self.incr {
+            if reply.bytes_after != 0 || reply.format != 8 {
+                return Ok(None);
+            }
+            return Ok(Some(reply.value));
+        }
+        // INCR (ICCCM 2.7.2): deleting the property (done by `take_property`) asks for the
+        // first chunk; each chunk arrives as a new property value, which we take (deleting
+        // it asks for the next) until an empty one ends the transfer.
+        let mut data = Vec::new();
+        let mut deadline = Instant::now() + SELECTION_IO_TIMEOUT;
+        loop {
+            let Some(event) = conn.poll_for_event()? else {
+                if !wait_readable(conn.stream(), deadline) {
+                    return Ok(None);
+                }
+                continue;
+            };
+            let Event::PropertyNotify(n) = event else {
+                continue;
+            };
+            if n.window != self.window || n.atom != self.property || n.state != Property::NEW_VALUE
+            {
+                continue;
+            }
+            let chunk = self.take_property()?;
+            if chunk.format != 8 || chunk.bytes_after != 0 {
+                return Ok(None);
+            }
+            if chunk.value.is_empty() {
+                return Ok(Some(data));
+            }
+            if data.len() + chunk.value.len() > MAX_INCR_BYTES {
+                return Ok(None);
+            }
+            data.extend_from_slice(&chunk.value);
+            deadline = Instant::now() + SELECTION_IO_TIMEOUT;
+        }
+    }
+
+    /// Read and delete our property.
+    fn take_property(&self) -> anyhow::Result<GetPropertyReply> {
         let max_words = (MAX_SELECTION_BYTES / 4) as u32;
-        let reply = conn
+        Ok(self
+            .conn
             .get_property(
                 true,
                 self.window,
@@ -188,11 +253,7 @@ impl Reader {
                 0,
                 max_words,
             )?
-            .reply()?;
-        if reply.type_ == self.incr || reply.bytes_after != 0 || reply.format != 8 {
-            return Ok(None);
-        }
-        Ok(Some(reply.value))
+            .reply()?)
     }
 }
 

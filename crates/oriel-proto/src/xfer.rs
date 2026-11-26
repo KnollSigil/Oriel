@@ -1,7 +1,7 @@
 //! Streamed file transfer for clipboard file offers.
 //!
 //! The side that owns the files registers them in an [`XferOwner`] and announces them with
-//! [`ControlMessage::ClipboardFiles`](crate::ControlMessage::ClipboardFiles). The receiving
+//! [`ControlMessage::ClipboardOffer`](crate::ControlMessage::ClipboardOffer). The receiving
 //! side presents them through FUSE ([`crate::xfer_fuse`]) and fetches directory listings and
 //! file contents on demand over bidirectional QUIC streams opened with
 //! [`BidiStreamHeader::FileList`](crate::BidiStreamHeader::FileList) and
@@ -37,6 +37,13 @@ const KEPT_OFFERS: usize = 16;
 pub enum OfferSlot {
     Clipboard,
     Drag,
+}
+
+/// Files offered to the peer: an [`XferOwner`] offer and its roots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOffer {
+    pub offer_id: u64,
+    pub roots: Vec<FileEntry>,
 }
 
 /// Kind of an offered filesystem entry. Symlinks and special files are never offered.
@@ -219,7 +226,8 @@ fn unique_name(base: &str, taken: &[FileEntry]) -> String {
         .unwrap()
 }
 
-fn random_u64() -> u64 {
+/// A random id (for offers).
+pub fn random_u64() -> u64 {
     let mut buf = [0u8; 8];
     if std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))

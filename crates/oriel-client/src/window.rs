@@ -7,11 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 
+use oriel_proto::selection::{ReceivedClipboard, Serve};
 use oriel_proto::xfer::{
-    file_selection_body, file_selection_mimes, parse_file_uri_list, OfferSlot,
-    PORTAL_FILE_TRANSFER_MIME, URI_LIST_MIME,
+    parse_file_uri_list, FileOffer, OfferSlot, PORTAL_FILE_TRANSFER_MIME, URI_LIST_MIME,
 };
 use oriel_proto::{ControlMessage, FrameRect, WindowId, MAX_CURSOR_DIM, SUPPORTED_TEXT_MIMES};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Sender as CalloopSender};
@@ -177,19 +176,20 @@ pub enum ClientUiEvent {
         hotspot_y: i32,
         bgra: Vec<u8>,
     },
-    ClipboardText {
-        text: String,
+    /// The server's clipboard changed (files already presented locally).
+    ClipboardOffer {
+        clip: ReceivedClipboard,
+        fetch: crate::xfer::SelectionFetcher,
     },
-    /// The server's clipboard holds files, presented locally at `paths`.
-    ClipboardFiles {
-        paths: Vec<PathBuf>,
-    },
-    /// An app in remote window `window_id` started dragging the files presented locally at
-    /// `paths`: continue the drag on the local desktop.
+    /// An app in remote window `window_id` started a drag (files already presented
+    /// locally): continue it on the local desktop.
     RemoteDragStart {
         window_id: WindowId,
-        paths: Vec<PathBuf>,
+        clip: ReceivedClipboard,
+        fetch: crate::xfer::SelectionFetcher,
     },
+    /// The remote app a local drag was dropped on is done with it.
+    DragFinished,
     PrimarySelectionText {
         text: String,
     },
@@ -528,11 +528,13 @@ struct ClientApp {
     latest_frames: LatestFrameMap,
 
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
-    last_clipboard: String,
-    /// Files our clipboard source offers instead of `last_clipboard` text.
-    clipboard_files: Option<Vec<PathBuf>>,
-    /// A local drag carrying files over one of our windows.
+    /// The server's clipboard our `copy_paste_source` offers.
+    clipboard: Option<(ReceivedClipboard, crate::xfer::SelectionFetcher)>,
+    /// A local drag over one of our windows.
     incoming_drag: Option<IncomingDrag>,
+    /// The relay of a local drag dropped on a remote window, waiting for the remote app to
+    /// finish reading it.
+    finishing_drag: Option<std::sync::mpsc::Sender<IncomingDragEvent>>,
     /// A remote app's drag of files, continued on the local desktop.
     outgoing_drag: Option<OutgoingDrag>,
     last_primary: String,
@@ -1126,40 +1128,37 @@ impl ClientApp {
                     }
                 }
             }
-            ClientUiEvent::ClipboardText { text } => {
-                if !text.is_empty()
-                    && (self.copy_paste_source.is_none()
-                        || self.clipboard_files.is_some()
-                        || text != self.last_clipboard)
+            ClientUiEvent::ClipboardOffer { clip, fetch } => {
+                debug!(
+                    mimes = ?clip.mimes,
+                    text = clip.text.as_ref().map(String::len),
+                    files = clip.files.as_ref().map(Vec::len),
+                    "server clipboard changed"
+                );
+                // `send_request` answers from `self.clipboard`, so it changes only along
+                // with the source.
+                if let (Some(mgr), Some(data_device)) =
+                    (&self.data_device_manager_state, &self.data_device)
                 {
-                    // `send_request` answers from these fields, so they change only along
-                    // with the source.
-                    if let (Some(mgr), Some(data_device)) =
-                        (&self.data_device_manager_state, &self.data_device)
-                    {
-                        let source =
-                            mgr.create_copy_paste_source(&self.qh, SUPPORTED_TEXT_MIMES.to_vec());
-                        source.set_selection(data_device, self.last_input_serial);
-                        self.copy_paste_source = Some(source);
-                        self.last_clipboard = text;
-                        self.clipboard_files = None;
-                    }
+                    let source = mgr.create_copy_paste_source(&self.qh, clip.mime_types());
+                    source.set_selection(data_device, self.last_input_serial);
+                    self.copy_paste_source = Some(source);
+                    self.clipboard = Some((clip, fetch));
                 }
             }
-            ClientUiEvent::ClipboardFiles { paths } => {
-                if !paths.is_empty() && self.clipboard_files.as_ref() != Some(&paths) {
-                    if let (Some(mgr), Some(data_device)) =
-                        (&self.data_device_manager_state, &self.data_device)
-                    {
-                        let source = mgr.create_copy_paste_source(&self.qh, file_selection_mimes());
-                        source.set_selection(data_device, self.last_input_serial);
-                        self.copy_paste_source = Some(source);
-                        self.clipboard_files = Some(paths);
-                    }
-                }
+            ClientUiEvent::RemoteDragStart {
+                window_id,
+                clip,
+                fetch,
+            } => {
+                self.start_outgoing_drag(window_id, clip, fetch);
             }
-            ClientUiEvent::RemoteDragStart { window_id, paths } => {
-                self.start_outgoing_drag(window_id, paths);
+            ClientUiEvent::DragFinished => {
+                if let Some(events) = self.finishing_drag.take() {
+                    let _ = events.send(IncomingDragEvent::Finished);
+                } else if let Some(drag) = self.incoming_drag.as_ref().filter(|d| d.dropped) {
+                    let _ = drag.events.send(IncomingDragEvent::Finished);
+                }
             }
             ClientUiEvent::PrimarySelectionText { text } => {
                 if !text.is_empty()
@@ -2038,36 +2037,48 @@ fn file_offer_mime(mimes: &[String]) -> Option<&'static str> {
 /// What happens to a local drag over a remote window after it entered, relayed in order by
 /// the thread that reads its files (see `DataDeviceHandler::enter`).
 enum IncomingDragEvent {
-    Motion { x: f64, y: f64 },
+    Motion {
+        x: f64,
+        y: f64,
+    },
     Leave,
     Drop,
+    /// The remote app it was dropped on is done reading (see `ControlMessage::DragFinished`).
+    Finished,
 }
 
-/// A remote app's drag of files, continued on the local desktop. Over our own windows the
-/// local drag is relayed back as plain pointer input, so the session's drag follows it.
+/// How long a dropped local drag stays readable for the remote app it was dropped on,
+/// when the server never says it finished.
+const DROP_FINISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A remote app's drag continued on the local desktop. Over our own windows the local drag
+/// is relayed back as plain pointer input, so the session's drag follows it.
 struct OutgoingDrag {
     source: DragSource,
-    /// Local paths of the files (in the transfer mount).
-    paths: Vec<PathBuf>,
+    clip: ReceivedClipboard,
+    fetch: crate::xfer::SelectionFetcher,
     /// The remote window the drag is over, if any.
     over: Option<WindowId>,
     /// Dropped on a remote window: the session's drag ended with that drop.
     dropped_on_remote: bool,
 }
 
-/// A local drag carrying files over one of our remote windows.
+/// A local drag over one of our remote windows.
 struct IncomingDrag {
     events: std::sync::mpsc::Sender<IncomingDragEvent>,
     dropped: bool,
 }
 
-/// A local drag carrying files that entered remote window `window_id` at `x`/`y`.
+/// A local drag that entered remote window `window_id` at `x`/`y`.
 struct DragEntered {
     offer: DragOffer,
     conn: Connection,
-    /// The format the files are read from, and the pipe it arrives on.
-    mime: &'static str,
-    pipe: OwnedFd,
+    /// Our id for the drag's data, readable by the server while the drag lasts.
+    offer_id: u64,
+    /// The drag's types the server can fetch (when it carries no files).
+    mimes: Vec<String>,
+    /// The format files are read from, and the pipe it arrives on.
+    files: Option<(&'static str, OwnedFd)>,
     window_id: WindowId,
     x: f64,
     y: f64,
@@ -2075,54 +2086,82 @@ struct DragEntered {
 }
 
 /// Read the files of a drag that entered a remote window, then announce the drag and
-/// relay `events` to the server until it leaves or drops. On a drop the offer is finished
-/// here, after its data was read.
+/// relay `events` to the server until it leaves or drops. After a drop the offer stays
+/// readable until the remote app finished with it, then it is finished here.
 fn relay_incoming_drag(drag: DragEntered, events: std::sync::mpsc::Receiver<IncomingDragEvent>) {
     let DragEntered {
         offer,
         conn,
-        mime,
-        pipe,
+        offer_id,
+        mut mimes,
+        files,
         window_id,
         x,
         y,
         ctrl_tx,
     } = drag;
-    let files = read_file_offer(mime, pipe, OfferSlot::Drag);
-    match &files {
-        Some((_, roots)) => debug!(window_id, mime, roots = roots.len(), "local drag entered"),
-        None => debug!(window_id, mime, "local drag carries no readable files"),
-    }
-    if let Some((offer_id, roots)) = files.clone() {
+    let files = match files {
+        Some((mime, pipe)) => {
+            let files = read_file_offer(mime, pipe, OfferSlot::Drag);
+            if files.is_some() {
+                mimes.clear();
+            } else {
+                // A file list that is unreadable here.
+                mimes.retain(|m| !oriel_proto::xfer::FILE_SELECTION_MIMES.contains(&m.as_str()));
+            }
+            files.map(|(offer_id, roots)| FileOffer { offer_id, roots })
+        }
+        None => None,
+    };
+    let announced = files.is_some() || !mimes.is_empty();
+    debug!(
+        window_id,
+        ?mimes,
+        files = files.as_ref().map(|f| f.roots.len()),
+        "local drag entered"
+    );
+    if announced {
         let _ = ctrl_tx.send(ControlMessage::DragEnter {
             window_id,
             x,
             y,
             offer_id,
-            roots,
+            mimes,
+            files,
         });
     }
-    for event in events {
+    while let Ok(event) = events.recv() {
         match event {
             IncomingDragEvent::Motion { x, y } => {
-                if files.is_some() {
+                if announced {
                     let _ = ctrl_tx.send(ControlMessage::DragMotion { window_id, x, y });
                 }
             }
             IncomingDragEvent::Leave => {
-                if files.is_some() {
+                if announced {
                     let _ = ctrl_tx.send(ControlMessage::DragLeave);
                 }
                 return;
             }
             IncomingDragEvent::Drop => {
-                if files.is_some() {
+                if announced {
                     let _ = ctrl_tx.send(ControlMessage::DragDrop);
+                    // The remote app reads the data after the drop; finishing the offer
+                    // would let the source drop it.
+                    let deadline = Instant::now() + DROP_FINISH_TIMEOUT;
+                    loop {
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        match events.recv_timeout(rem) {
+                            Ok(IncomingDragEvent::Finished) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
                 }
                 offer.finish();
                 let _ = conn.flush();
                 return;
             }
+            IncomingDragEvent::Finished => {}
         }
     }
 }
@@ -2170,7 +2209,12 @@ fn write_selection_fd_timeout(fd: OwnedFd, bytes: &[u8]) {
 impl ClientApp {
     /// Continue a remote app's drag of files on the local desktop. Needs the button that
     /// started it still held: the local drag reuses that press's implicit grab.
-    fn start_outgoing_drag(&mut self, window_id: WindowId, paths: Vec<PathBuf>) {
+    fn start_outgoing_drag(
+        &mut self,
+        window_id: WindowId,
+        clip: ReceivedClipboard,
+        fetch: crate::xfer::SelectionFetcher,
+    ) {
         if !self.pressed_buttons.contains(&BTN_LEFT) {
             // Dropped (inside the session) before the file list arrived.
             return;
@@ -2185,19 +2229,20 @@ impl ClientApp {
         else {
             return;
         };
-        // Copy only: a move would ask the session app to delete its files.
-        let source =
-            mgr.create_drag_and_drop_source(&self.qh, file_selection_mimes(), DndAction::Copy);
+        // Copy only: a move would ask the session app to delete what it dragged.
+        let source = mgr.create_drag_and_drop_source(&self.qh, clip.mime_types(), DndAction::Copy);
         source.start_drag(data_device, &origin, None, self.last_button_serial);
         let _ = self.conn.flush();
         debug!(
             window_id,
-            files = paths.len(),
+            mimes = ?clip.mimes,
+            files = clip.files.as_ref().map(Vec::len),
             "continuing a remote drag locally"
         );
         self.outgoing_drag = Some(OutgoingDrag {
             source,
-            paths,
+            clip,
+            fetch,
             over: Some(window_id),
             dropped_on_remote: false,
         });
@@ -2217,10 +2262,13 @@ impl ClientApp {
         drag.source.inner().destroy();
     }
 
-    /// Tell the relay thread of the incoming drag, if any, that it ended with `event`.
+    /// Tell the relay thread of the incoming drag, if any, that it ended with `event`. A
+    /// dropped drag instead waits for `ControlMessage::DragFinished` in `finishing_drag`.
     fn end_incoming_drag(&mut self, event: IncomingDragEvent) {
         if let Some(drag) = self.incoming_drag.take() {
-            if !drag.dropped {
+            if drag.dropped {
+                self.finishing_drag = Some(drag.events);
+            } else {
                 let _ = drag.events.send(event);
             }
         }
@@ -2256,32 +2304,36 @@ impl DataDeviceHandler for ClientApp {
             // Our own drag of a remote app's files is back over a remote window: hand the
             // pointer back to the session's drag.
             drag.over = Some(window_id);
-            offer.accept_mime_type(offer.serial, Some(URI_LIST_MIME.to_string()));
+            offer.accept_mime_type(offer.serial, drag.clip.mime_types().into_iter().next());
             offer.set_actions(DndAction::Copy, DndAction::Copy);
             let _ = self
                 .ctrl_tx
                 .send(ControlMessage::PointerMotion { window_id, x, y });
             return;
         }
-        // Only drags carrying files are relayed; anything else is refused here.
-        let Some(mime) = offer.with_mime_types(file_offer_mime) else {
-            debug!(
-                window_id,
-                mimes = ?offer.with_mime_types(|m| m.to_vec()),
-                "refusing a local drag without files"
-            );
+        let all_mimes = offer.with_mime_types(|m| m.to_vec());
+        let file_mime = file_offer_mime(&all_mimes);
+        let mimes = oriel_proto::selection::proxyable_mimes(&all_mimes);
+        let Some(accept) = file_mime
+            .map(str::to_string)
+            .or_else(|| mimes.first().cloned())
+        else {
+            debug!(window_id, mimes = ?all_mimes, "refusing a local drag with nothing to relay");
             offer.accept_mime_type(offer.serial, None);
             offer.set_actions(DndAction::empty(), DndAction::empty());
             return;
         };
-        let Ok(pipe) = offer.receive(mime.to_string()) else {
-            return;
-        };
+        let files = file_mime.and_then(|mime| {
+            let pipe = offer.receive(mime.to_string()).ok()?;
+            Some((mime, OwnedFd::from(pipe)))
+        });
         // Accepted before the remote app is known to want it: the round trip to ask would
-        // lag every motion. Always a copy: a move would make the source delete the files.
-        offer.accept_mime_type(offer.serial, Some(mime.to_string()));
+        // lag every motion. Always a copy: a move would make the source delete the data.
+        offer.accept_mime_type(offer.serial, Some(accept));
         offer.set_actions(DndAction::Copy, DndAction::Copy);
         let _ = self.conn.flush();
+        let offer_id = oriel_proto::xfer::random_u64();
+        crate::xfer::register_live_source(offer_id, offer.inner().clone(), self.conn.clone());
         let (events_tx, events_rx) = std::sync::mpsc::channel();
         self.incoming_drag = Some(IncomingDrag {
             events: events_tx,
@@ -2292,8 +2344,9 @@ impl DataDeviceHandler for ClientApp {
         let drag = DragEntered {
             offer,
             conn,
-            mime,
-            pipe: OwnedFd::from(pipe),
+            offer_id,
+            mimes,
+            files,
             window_id,
             x,
             y,
@@ -2309,11 +2362,8 @@ impl DataDeviceHandler for ClientApp {
             }
             return;
         }
-        // A drop is followed by a leave; the drop already ended the drag.
-        if self.incoming_drag.as_ref().is_some_and(|d| d.dropped) {
-            self.incoming_drag = None;
-            return;
-        }
+        // After a drop (always followed by a leave) this keeps the drag readable until the
+        // remote app finished with it.
         self.end_incoming_drag(IncomingDragEvent::Leave);
     }
 
@@ -2345,34 +2395,77 @@ impl DataDeviceHandler for ClientApp {
         let Some(offer) = data_device.data().selection_offer() else {
             return;
         };
-        let (text_mime, file_mime) = offer.with_mime_types(|mimes| {
-            let text = SUPPORTED_TEXT_MIMES
-                .iter()
-                .find(|&&want| mimes.iter().any(|m| m == want))
-                .map(|&s| s.to_string());
-            (text, file_offer_mime(mimes))
-        });
+        let all_mimes = offer.with_mime_types(|mimes| mimes.to_vec());
+        let text_mime = SUPPORTED_TEXT_MIMES
+            .iter()
+            .find(|&&want| all_mimes.iter().any(|m| m == want))
+            .map(|&s| s.to_string());
+        let file_mime = file_offer_mime(&all_mimes);
         let file_pipe = file_mime.and_then(|m| offer.receive(m.to_string()).ok());
         let text_pipe = text_mime.and_then(|m| offer.receive(m).ok());
-        if file_pipe.is_none() && text_pipe.is_none() {
-            return;
-        }
         let _ = self.conn.flush();
+        // Every other type is read only when a server pastes it.
+        let offer_id = oriel_proto::xfer::random_u64();
+        crate::xfer::register_live_source(offer_id, offer.inner().clone(), self.conn.clone());
         let ctrl_tx = self.ctrl_tx.clone();
         std::thread::spawn(move || {
-            if let (Some(pipe), Some(mime)) = (file_pipe, file_mime) {
-                if let Some((offer_id, roots)) =
+            let files = match (file_pipe, file_mime) {
+                (Some(pipe), Some(mime)) => {
                     read_file_offer(mime, OwnedFd::from(pipe), OfferSlot::Clipboard)
-                {
-                    let _ = ctrl_tx.send(ControlMessage::ClipboardFiles { offer_id, roots });
-                    return;
                 }
-            }
-            if let Some(pipe) = text_pipe {
-                if let Some(text) = read_selection_fd_bounded(OwnedFd::from(pipe)) {
-                    let _ = ctrl_tx.send(ControlMessage::ClipboardText { text });
+                _ => None,
+            };
+            let msg = match files {
+                // Files are offered as files only: their text form (paths here) and
+                // file-list types mean nothing to the server.
+                Some((file_offer_id, roots)) => ControlMessage::ClipboardOffer {
+                    offer_id,
+                    mimes: Vec::new(),
+                    text: None,
+                    files: Some(FileOffer {
+                        offer_id: file_offer_id,
+                        roots,
+                    }),
+                },
+                None => {
+                    let text = text_pipe.and_then(|pipe| {
+                        let (buf, complete) = oriel_proto::read_selection_fd_max(
+                            OwnedFd::from(pipe),
+                            SELECTION_IO_TIMEOUT,
+                            oriel_proto::selection::INLINE_TEXT_MAX,
+                        );
+                        complete.then(|| String::from_utf8(buf).ok()).flatten()
+                    });
+                    let mut mimes = oriel_proto::selection::proxyable_mimes(&all_mimes);
+                    if file_mime.is_some() {
+                        // A file list that is unreadable here.
+                        mimes.retain(|m| {
+                            !oriel_proto::xfer::FILE_SELECTION_MIMES.contains(&m.as_str())
+                        });
+                    }
+                    if text.is_none() && mimes.is_empty() {
+                        return;
+                    }
+                    ControlMessage::ClipboardOffer {
+                        offer_id,
+                        mimes,
+                        text,
+                        files: None,
+                    }
                 }
+            };
+            if let ControlMessage::ClipboardOffer {
+                mimes, text, files, ..
+            } = &msg
+            {
+                debug!(
+                    ?mimes,
+                    text = text.as_ref().map(String::len),
+                    files = files.as_ref().map(|f| f.roots.len()),
+                    "offering the local clipboard to the server"
+                );
             }
+            let _ = ctrl_tx.send(msg);
         });
     }
 
@@ -2449,10 +2542,17 @@ impl DataSourceHandler for ClientApp {
             .as_ref()
             .filter(|d| d.source.inner() == source)
         {
-            if let Some(body) = file_selection_body(&mime, &drag.paths) {
-                std::thread::spawn(move || {
-                    write_selection_fd_timeout(OwnedFd::from(write_pipe), &body);
-                });
+            match drag.clip.serve(&mime) {
+                Serve::Bytes(body) => {
+                    std::thread::spawn(move || {
+                        write_selection_fd_timeout(OwnedFd::from(write_pipe), &body);
+                    });
+                }
+                Serve::Fetch(owner_mime) => {
+                    drag.fetch
+                        .fetch(drag.clip.offer_id, owner_mime, OwnedFd::from(write_pipe));
+                }
+                Serve::Nothing => {}
             }
             return;
         }
@@ -2463,17 +2563,19 @@ impl DataSourceHandler for ClientApp {
         {
             return;
         }
-        let body = match &self.clipboard_files {
-            Some(paths) => file_selection_body(&mime, paths),
-            None if SUPPORTED_TEXT_MIMES.contains(&mime.as_str()) => {
-                Some(self.last_clipboard.clone().into_bytes())
-            }
-            None => None,
+        let Some((clip, fetch)) = &self.clipboard else {
+            return;
         };
-        if let Some(body) = body {
-            std::thread::spawn(move || {
-                write_selection_fd_timeout(OwnedFd::from(write_pipe), &body);
-            });
+        match clip.serve(&mime) {
+            Serve::Bytes(body) => {
+                std::thread::spawn(move || {
+                    write_selection_fd_timeout(OwnedFd::from(write_pipe), &body);
+                });
+            }
+            Serve::Fetch(owner_mime) => {
+                fetch.fetch(clip.offer_id, owner_mime, OwnedFd::from(write_pipe));
+            }
+            Serve::Nothing => {}
         }
     }
 
@@ -2492,7 +2594,7 @@ impl DataSourceHandler for ClientApp {
             .is_some_and(|s| s.inner() == source)
         {
             self.copy_paste_source = None;
-            self.clipboard_files = None;
+            self.clipboard = None;
         } else {
             source.destroy();
         }
@@ -2780,9 +2882,9 @@ pub fn run_event_loop(
         surface_to_remote: HashMap::new(),
         latest_frames,
         ctrl_tx,
-        last_clipboard: String::new(),
-        clipboard_files: None,
+        clipboard: None,
         incoming_drag: None,
+        finishing_drag: None,
         outgoing_drag: None,
         last_primary: String::new(),
         exit: false,
