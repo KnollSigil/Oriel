@@ -1,13 +1,15 @@
 //! Shared wire protocol and stream framing for Oriel.
 
 pub mod smart_tile;
+pub mod xfer;
+pub mod xfer_fuse;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -145,6 +147,60 @@ pub const MAX_VIDEO_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum UTF-8 selection payload size (4 MiB) read from clipboard or primary selection pipes.
 pub const MAX_SELECTION_BYTES: usize = 4 * 1024 * 1024;
 
+/// Read a selection pipe until end of file, at most [`MAX_SELECTION_BYTES`], giving up at
+/// `timeout` so a misbehaving owner cannot pin a thread. Returns the bytes read and whether
+/// they are complete (end of file reached within the limits).
+pub fn read_selection_fd(
+    fd: std::os::fd::OwnedFd,
+    timeout: std::time::Duration,
+) -> (Vec<u8>, bool) {
+    use std::os::fd::AsRawFd;
+    let raw = fd.as_raw_fd();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            return (buf, false);
+        }
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call.
+        let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return (buf, false);
+        }
+        if rc == 0 {
+            return (buf, false);
+        }
+        // One byte past the limit tells "exactly at the limit" from "over it".
+        let max_read = chunk.len().min(MAX_SELECTION_BYTES + 1 - buf.len());
+        // SAFETY: `chunk` has room for `max_read` bytes.
+        let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast::<libc::c_void>(), max_read) };
+        if n == 0 {
+            return (buf, true);
+        }
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return (buf, false);
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        if buf.len() > MAX_SELECTION_BYTES {
+            buf.truncate(MAX_SELECTION_BYTES);
+            return (buf, false);
+        }
+    }
+}
+
 /// Maximum allowed cursor bitmap width/height in pixels.
 pub const MAX_CURSOR_DIM: u32 = 512;
 
@@ -207,6 +263,22 @@ pub enum BidiStreamHeader {
         cols: u16,
         rows: u16,
         command: Option<String>,
+    },
+    /// List a directory inside a file offer (see [`ControlMessage::ClipboardFiles`]). The
+    /// owner replies with one [`xfer::FileListReply`] frame.
+    FileList {
+        offer_id: u64,
+        /// Root name followed by the components below it.
+        path: Vec<String>,
+    },
+    /// Read a file inside a file offer from `offset`. The owner replies with one
+    /// [`xfer::FileReadReply`] frame followed by the raw bytes up to EOF; the reader stops
+    /// the stream to cancel.
+    FileRead {
+        offer_id: u64,
+        /// Root name followed by the components below it.
+        path: Vec<String>,
+        offset: u64,
     },
 }
 
@@ -392,6 +464,13 @@ pub enum ControlMessage {
 
     /// Bidirectional: UTF-8 clipboard text synchronization.
     ClipboardText { text: String },
+    /// Bidirectional: the clipboard now holds files owned by the sender. The receiver
+    /// presents them as paths and reads their contents on demand with
+    /// [`BidiStreamHeader::FileList`] / [`BidiStreamHeader::FileRead`].
+    ClipboardFiles {
+        offer_id: u64,
+        roots: Vec<xfer::FileEntry>,
+    },
     /// Bidirectional: UTF-8 primary selection (middle-click paste) text synchronization.
     PrimarySelectionText { text: String },
     /// Server -> Client: enable/disable host microphone capture based on remote app demand.
@@ -764,6 +843,28 @@ pub async fn read_audio_packet<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_selection_fd_reports_completeness() {
+        use std::io::Write;
+        use std::time::Duration;
+
+        let (r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"file:///a\n").unwrap();
+        drop(w);
+        assert_eq!(
+            read_selection_fd(r.into(), Duration::from_secs(1)),
+            (b"file:///a\n".to_vec(), true)
+        );
+
+        // The writer stalls: what arrived is returned, marked incomplete.
+        let (r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"file:///Docu").unwrap();
+        let (buf, complete) = read_selection_fd(r.into(), Duration::from_millis(50));
+        assert_eq!(buf, b"file:///Docu");
+        assert!(!complete);
+        drop(w);
+    }
 
     #[test]
     fn port_ranges_parse_and_display() {

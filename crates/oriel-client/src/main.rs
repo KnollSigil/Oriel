@@ -20,6 +20,7 @@ mod session;
 #[cfg(feature = "gtk4")]
 mod symbolic_icon;
 mod window;
+mod xfer;
 
 use std::net::SocketAddr;
 
@@ -147,7 +148,10 @@ fn main() -> Result<()> {
     let env_uri = take_env_secret(URI_ENV);
     let env_token = take_env_secret(TOKEN_ENV);
 
-    match cli.subcommand {
+    if !matches!(cli.subcommand, Some(ClientSubcommand::PtyAttach { .. })) {
+        xfer::cleanup_stale_in_background();
+    }
+    let result = match cli.subcommand {
         Some(ClientSubcommand::PtyAttach {
             socket,
             uri,
@@ -268,7 +272,10 @@ fn main() -> Result<()> {
                 launcher::run_launcher(cli_max_scale)
             }
         }
-    }
+    };
+    // Files offered by servers vanish from the local clipboard with this process.
+    xfer::unmount();
+    result
 }
 
 fn run_gui_session(

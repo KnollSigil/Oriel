@@ -23,8 +23,14 @@ finish-args:
   - --filesystem=~/.ssh:ro
   # Color scheme / settings portal
   - --talk-name=org.freedesktop.portal.Desktop
-  # Spawn local host terminal emulators for remote PTY sessions
+  # Spawn local host terminal emulators for remote PTY sessions, and run the host's
+  # fusermount3 so files pasted from remote apps appear in a FUSE mount host apps can see
   - --talk-name=org.freedesktop.Flatpak
+  # Read files copied in host apps that offer only file:// URIs, not a FileTransfer
+  # portal key (Cosmic Files). Read-only; /usr, /etc and /tmp stay the sandbox's own.
+  - --filesystem=host:ro
+  # /dev/fuse, which the FUSE library opens before it hands mounting to fusermount3
+  - --device=all
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
@@ -57,6 +63,7 @@ modules:
         cargo --offline build --release -p oriel-client
       - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/oriel-client"
         /app/bin/oriel-client
+      - install -Dm755 packaging/flatpak/fusermount3-wrapper.sh /app/bin/fusermount3
       - install -Dm644 packaging/flatpak/dev.knoll.Oriel.desktop
         /app/share/applications/dev.knoll.Oriel.desktop
       - install -Dm644 packaging/flatpak/dev.knoll.Oriel.metainfo.xml

@@ -16,6 +16,7 @@ mod quic;
 mod session;
 mod settings_portal;
 mod shell_env;
+mod x11_selection;
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -255,6 +256,22 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
         warn!(error = %err, "isolated PipeWire audio session unavailable at startup");
     }
 
+    // Files the client puts on the clipboard appear here, streamed on demand.
+    let xfer_mount = match oriel_proto::xfer_fuse::XferMount::mount(
+        &session_guard.runtime_dir().join(session::XFER_MOUNT_DIR),
+        tokio::runtime::Handle::current(),
+    ) {
+        Ok(mount) => {
+            let mount = Arc::new(mount);
+            session_guard.set_xfer_mount(Arc::clone(&mount));
+            Some(mount)
+        }
+        Err(err) => {
+            warn!(error = %format!("{err:#}"), "file transfer unavailable: cannot mount FUSE");
+            None
+        }
+    };
+
     let (comp_handle, event_rx) =
         compositor::start_compositor(cli.command, !cli.no_xwayland, cli.gpu.mode())?;
     info!(
@@ -292,7 +309,7 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
     let mut sighup = signal(SignalKind::hangup())?;
 
     let server_res = tokio::select! {
-        res = quic::run_server(endpoint, server_creds, comp_handle, event_rx) => res,
+        res = quic::run_server(endpoint, server_creds, comp_handle, event_rx, xfer_mount.clone()) => res,
         _ = sigterm.recv() => {
             info!("received SIGTERM; shutting down isolated session");
             Ok(())
@@ -310,6 +327,7 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
     if owns_control_sock.load(Ordering::SeqCst) {
         let _ = std::fs::remove_file(&control_sock);
     }
+    // Unmounts the transfer filesystem after the session's apps are gone.
     drop(session_guard);
 
     server_res

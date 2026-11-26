@@ -21,7 +21,7 @@ use calloop::channel::{self, Channel, Sender as CalloopSender};
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use oriel_proto::{
-    LaunchState, FrameRect, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES,
+    LaunchState, FrameRect, WindowId, MAX_CURSOR_DIM,
     SUPPORTED_TEXT_MIMES,
 };
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -218,6 +218,10 @@ pub enum CompositorEvent {
     ClipboardText {
         text: String,
     },
+    /// A session app put files on the clipboard (local paths from its `text/uri-list`).
+    ClipboardFiles {
+        paths: Vec<PathBuf>,
+    },
     PrimarySelectionText {
         text: String,
     },
@@ -292,6 +296,11 @@ pub enum CompositorCommand {
     },
     SetClipboardText {
         text: String,
+    },
+    /// The client's clipboard holds files, presented locally at `paths` (inside the
+    /// transfer FUSE mount).
+    SetClipboardFiles {
+        paths: Vec<PathBuf>,
     },
     SetPrimarySelectionText {
         text: String,
@@ -609,6 +618,8 @@ struct AppState {
     output_manager_state: OutputManagerState,
     xwayland_shell_state: XWaylandShellState,
     xwm: Option<X11Wm>,
+    /// The embedded XWayland, for reading X11 selections `xwm` cannot convert.
+    x11_display: Option<crate::x11_selection::X11Display>,
     xwayland_client: Option<Client>,
     output: Output,
     output_size: (i32, i32),
@@ -632,8 +643,8 @@ struct AppState {
     cursor_surface: Option<WlSurface>,
     last_cursor_bitmap: Option<(u32, u32, u32, u32, i32, i32, Vec<u8>)>,
     clipboard_owner: SelectionOwner,
-    clipboard_text: Option<String>,
-    pending_clipboard_mime: Option<String>,
+    clipboard_data: Option<HostClipboard>,
+    pending_clipboard: Option<ClipboardRequest>,
     primary_owner: SelectionOwner,
     primary_text: Option<String>,
     pending_primary_mime: Option<String>,
@@ -861,6 +872,7 @@ impl AppState {
     fn cleanup_xwayland_state(&mut self) {
         crate::session::clear_x11_env();
         self.xwm = None;
+        self.x11_display = None;
         let x11_wins: Vec<X11Window> = self.x11_id_by_win.keys().copied().collect();
         for win in x11_wins {
             self.remove_x11_window(win);
@@ -1372,18 +1384,10 @@ impl AppState {
                 }
             }
             CompositorCommand::SetClipboardText { text } => {
-                if self.clipboard_owner == SelectionOwner::RemoteHost
-                    && self.clipboard_text.as_deref() == Some(text.as_str())
-                {
-                    return;
-                }
-                self.clipboard_owner = SelectionOwner::RemoteHost;
-                self.clipboard_text = Some(text);
-                let mimes = text_selection_mimes();
-                set_data_device_selection(&self.display_handle, &self.seat, mimes.clone(), ());
-                if let Some(xwm) = self.xwm.as_mut() {
-                    let _ = xwm.new_selection(SelectionTarget::Clipboard, Some(mimes));
-                }
+                self.set_host_clipboard(HostClipboard::Text(text));
+            }
+            CompositorCommand::SetClipboardFiles { paths } => {
+                self.set_host_clipboard(HostClipboard::Files(paths));
             }
             CompositorCommand::SetPrimarySelectionText { text } => {
                 if self.primary_owner == SelectionOwner::RemoteHost
@@ -3276,7 +3280,114 @@ impl SeatHandler for AppState {
     }
 }
 
-const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Clipboard contents owned by the client (the remote host of this session).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostClipboard {
+    Text(String),
+    /// Paths inside the transfer FUSE mount.
+    Files(Vec<PathBuf>),
+}
+
+impl HostClipboard {
+    fn mime_types(&self) -> Vec<String> {
+        match self {
+            HostClipboard::Text(_) => text_selection_mimes(),
+            HostClipboard::Files(_) => oriel_proto::xfer::file_selection_mimes(),
+        }
+    }
+
+    /// The selection body for `mime`; text is served for any requested type.
+    fn body(&self, mime: &str) -> Option<Vec<u8>> {
+        match self {
+            HostClipboard::Text(text) => Some(text.clone().into_bytes()),
+            HostClipboard::Files(paths) => oriel_proto::xfer::file_selection_body(mime, paths),
+        }
+    }
+}
+
+impl AppState {
+    /// Make the client's clipboard contents the session's clipboard selection.
+    fn set_host_clipboard(&mut self, data: HostClipboard) {
+        if self.clipboard_owner == SelectionOwner::RemoteHost
+            && self.clipboard_data.as_ref() == Some(&data)
+        {
+            return;
+        }
+        let mimes = data.mime_types();
+        self.clipboard_owner = SelectionOwner::RemoteHost;
+        self.clipboard_data = Some(data);
+        set_data_device_selection(&self.display_handle, &self.seat, mimes.clone(), ());
+        if let Some(xwm) = self.xwm.as_mut() {
+            let _ = xwm.new_selection(SelectionTarget::Clipboard, Some(mimes));
+        }
+    }
+}
+
+/// Formats to read from an app's new clipboard selection: its file list when it offers
+/// one, and text as the fallback for selections without local files.
+struct ClipboardRequest {
+    uri_list: bool,
+    text_mime: Option<String>,
+}
+
+impl ClipboardRequest {
+    fn for_mimes(mime_types: &[String]) -> Option<Self> {
+        let req = Self {
+            uri_list: mime_types
+                .iter()
+                .any(|m| m == oriel_proto::xfer::URI_LIST_MIME),
+            text_mime: pick_preferred_text_mime(mime_types),
+        };
+        (req.uri_list || req.text_mime.is_some()).then_some(req)
+    }
+
+    /// Ask the owner for each format through `request` (which hands it the write end of a
+    /// pipe), then read them on a worker thread and emit the clipboard event. With `x11`,
+    /// the owner is an X11 client and the file list is read over our own X connection,
+    /// because `X11Wm::send_selection` cannot convert it.
+    fn spawn_reader(
+        self,
+        event_tx: mpsc::UnboundedSender<CompositorEvent>,
+        mut request: impl FnMut(String, OwnedFd) -> bool,
+        x11: Option<crate::x11_selection::X11Display>,
+    ) {
+        let mut open = |mime: String| -> Option<OwnedFd> {
+            let (read_pipe, write_pipe) = std::io::pipe().ok()?;
+            request(mime, write_pipe.into()).then(|| read_pipe.into())
+        };
+        enum UriSource {
+            Pipe(OwnedFd),
+            X11(crate::x11_selection::X11Display),
+        }
+        let uri = match (self.uri_list, x11) {
+            (false, _) => None,
+            (true, Some(display)) => Some(UriSource::X11(display)),
+            (true, None) => open(oriel_proto::xfer::URI_LIST_MIME.to_string()).map(UriSource::Pipe),
+        };
+        let text_fd = self.text_mime.and_then(&mut open);
+        if uri.is_none() && text_fd.is_none() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let body = uri.and_then(|source| match source {
+                UriSource::Pipe(fd) => read_selection_fd_complete(fd),
+                UriSource::X11(display) => display
+                    .read_clipboard(oriel_proto::xfer::URI_LIST_MIME)
+                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+            });
+            if let Some(paths) = body.and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body))
+            {
+                let _ = event_tx.send(CompositorEvent::ClipboardFiles { paths });
+                return;
+            }
+            if let Some(text) = text_fd.and_then(read_selection_fd_bounded) {
+                let _ = event_tx.send(CompositorEvent::ClipboardText { text });
+            }
+        });
+    }
+}
 
 fn text_selection_mimes() -> Vec<String> {
     SUPPORTED_TEXT_MIMES
@@ -3293,40 +3404,21 @@ fn pick_preferred_text_mime(mime_types: &[String]) -> Option<String> {
 }
 
 /// Read up to `MAX_SELECTION_BYTES` of UTF-8 text from a selection pipe with a
-/// bounded `poll(2)` deadline so a misbehaving client cannot leak threads or RAM.
+/// bounded `poll(2)` deadline so a misbehaving peer cannot leak threads or RAM.
+/// Text cut short by the limits is still returned.
 fn read_selection_fd_bounded(fd: OwnedFd) -> Option<String> {
-    let raw = fd.as_raw_fd();
-    let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    while buf.len() < MAX_SELECTION_BYTES {
-        let rem = deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
-            break;
-        }
-        let mut pfd = libc::pollfd {
-            fd: raw,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().min(i32::MAX as u128) as i32) };
-        if rc < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        if rc == 0 {
-            break;
-        }
-        let max_read = chunk.len().min(MAX_SELECTION_BYTES - buf.len());
-        let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast::<libc::c_void>(), max_read) };
-        if n <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n as usize]);
-    }
+    let (buf, _complete) = oriel_proto::read_selection_fd(fd, SELECTION_IO_TIMEOUT);
     String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+}
+
+/// Like [`read_selection_fd_bounded`], but `None` unless the owner sent everything: a
+/// file list cut mid-path could name a different file.
+fn read_selection_fd_complete(fd: OwnedFd) -> Option<String> {
+    let (buf, complete) = oriel_proto::read_selection_fd(fd, SELECTION_IO_TIMEOUT);
+    complete
+        .then(|| String::from_utf8(buf).ok())
+        .flatten()
+        .filter(|s| !s.is_empty())
 }
 
 /// Write selection bytes to `fd` with a bounded `poll(2)` deadline so a stalled
@@ -3380,7 +3472,7 @@ impl SelectionHandler for AppState {
     ) {
         let is_clipboard = ty == SelectionTarget::Clipboard;
         if is_clipboard {
-            self.clipboard_text = None;
+            self.clipboard_data = None;
             self.clipboard_owner = if source.is_some() {
                 SelectionOwner::WaylandClient
             } else {
@@ -3400,15 +3492,13 @@ impl SelectionHandler for AppState {
             if let Some(xwm) = self.xwm.as_mut() {
                 let _ = xwm.new_selection(ty, Some(mime_types.clone()));
             }
-            if let Some(mime) = pick_preferred_text_mime(&mime_types) {
-                // Note: Smithay invokes `SelectionHandler::new_selection` BEFORE storing the new
-                // `OfferReplySource::Client(source)` into `SeatData`.
-                // Defer requesting client selection until right after dispatch finishes.
-                if is_clipboard {
-                    self.pending_clipboard_mime = Some(mime);
-                } else {
-                    self.pending_primary_mime = Some(mime);
-                }
+            // Note: Smithay invokes `SelectionHandler::new_selection` BEFORE storing the new
+            // `OfferReplySource::Client(source)` into `SeatData`.
+            // Defer requesting client selection until right after dispatch finishes.
+            if is_clipboard {
+                self.pending_clipboard = ClipboardRequest::for_mimes(&mime_types);
+            } else if let Some(mime) = pick_preferred_text_mime(&mime_types) {
+                self.pending_primary_mime = Some(mime);
             }
         } else if let Some(xwm) = self.xwm.as_mut() {
             let _ = xwm.new_selection(ty, None);
@@ -3424,18 +3514,42 @@ impl SelectionHandler for AppState {
         _user_data: &Self::SelectionUserData,
     ) {
         let (owner, cached) = match ty {
-            SelectionTarget::Clipboard => (self.clipboard_owner, self.clipboard_text.clone()),
-            SelectionTarget::Primary => (self.primary_owner, self.primary_text.clone()),
+            SelectionTarget::Clipboard => (
+                self.clipboard_owner,
+                self.clipboard_data
+                    .as_ref()
+                    .and_then(|d| d.body(&mime_type)),
+            ),
+            SelectionTarget::Primary => (
+                self.primary_owner,
+                self.primary_text.clone().map(String::into_bytes),
+            ),
         };
         match owner {
             SelectionOwner::RemoteHost => {
-                if let Some(text) = cached {
+                if let Some(bytes) = cached {
                     std::thread::spawn(move || {
-                        write_selection_fd_timeout(fd, text.as_bytes());
+                        write_selection_fd_timeout(fd, &bytes);
                     });
                 }
             }
             SelectionOwner::X11Client => {
+                // `X11Wm::send_selection` only converts the two text formats (see
+                // `x11_selection`); read other clipboard formats over our own connection.
+                let smithay_converts = matches!(
+                    mime_type.as_str(),
+                    "text/plain;charset=utf-8" | "text/plain"
+                );
+                if ty == SelectionTarget::Clipboard && !smithay_converts {
+                    if let Some(display) = self.x11_display.clone() {
+                        std::thread::spawn(move || {
+                            if let Some(bytes) = display.read_clipboard(&mime_type) {
+                                write_selection_fd_timeout(fd, &bytes);
+                            }
+                        });
+                    }
+                    return;
+                }
                 if let Some(xwm) = self.xwm.as_mut() {
                     if let Err(err) =
                         xwm.send_selection(ty, mime_type, fd, self.loop_handle.clone())
@@ -3451,20 +3565,14 @@ impl SelectionHandler for AppState {
 
 impl AppState {
     fn poll_pending_selections(&mut self) {
-        if let Some(mime) = self.pending_clipboard_mime.take() {
-            if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
-                let write_fd: OwnedFd = write_pipe.into();
-                if request_data_device_client_selection(&self.seat, mime, write_fd).is_ok() {
-                    let _ = self.display_handle.flush_clients();
-                    let event_tx = self.event_tx.clone();
-                    let read_fd: OwnedFd = read_pipe.into();
-                    std::thread::spawn(move || {
-                        if let Some(text) = read_selection_fd_bounded(read_fd) {
-                            let _ = event_tx.send(CompositorEvent::ClipboardText { text });
-                        }
-                    });
-                }
-            }
+        if let Some(req) = self.pending_clipboard.take() {
+            let seat = self.seat.clone();
+            req.spawn_reader(
+                self.event_tx.clone(),
+                |mime, fd| request_data_device_client_selection(&seat, mime, fd).is_ok(),
+                None,
+            );
+            let _ = self.display_handle.flush_clients();
         }
         if let Some(mime) = self.pending_primary_mime.take() {
             if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
@@ -4233,14 +4341,22 @@ impl XwmHandler for AppState {
         fd: OwnedFd,
     ) {
         let (owner, cached) = match selection {
-            SelectionTarget::Clipboard => (self.clipboard_owner, self.clipboard_text.clone()),
-            SelectionTarget::Primary => (self.primary_owner, self.primary_text.clone()),
+            SelectionTarget::Clipboard => (
+                self.clipboard_owner,
+                self.clipboard_data
+                    .as_ref()
+                    .and_then(|d| d.body(&mime_type)),
+            ),
+            SelectionTarget::Primary => (
+                self.primary_owner,
+                self.primary_text.clone().map(String::into_bytes),
+            ),
         };
         match owner {
             SelectionOwner::RemoteHost => {
-                if let Some(text) = cached {
+                if let Some(bytes) = cached {
                     std::thread::spawn(move || {
-                        write_selection_fd_timeout(fd, text.as_bytes());
+                        write_selection_fd_timeout(fd, &bytes);
                     });
                 }
             }
@@ -4262,7 +4378,7 @@ impl XwmHandler for AppState {
         match selection {
             SelectionTarget::Clipboard => {
                 self.clipboard_owner = SelectionOwner::X11Client;
-                self.clipboard_text = None;
+                self.clipboard_data = None;
                 set_data_device_selection(&self.display_handle, &self.seat, mime_types.clone(), ());
             }
             SelectionTarget::Primary => {
@@ -4272,7 +4388,26 @@ impl XwmHandler for AppState {
             }
         }
 
-        if let Some(mime) = pick_preferred_text_mime(&mime_types) {
+        if selection == SelectionTarget::Clipboard {
+            if let (Some(req), Some(xwm)) =
+                (ClipboardRequest::for_mimes(&mime_types), self.xwm.as_mut())
+            {
+                let loop_handle = self.loop_handle.clone();
+                req.spawn_reader(
+                    self.event_tx.clone(),
+                    |mime, fd| {
+                        xwm.send_selection(
+                            SelectionTarget::Clipboard,
+                            mime,
+                            fd,
+                            loop_handle.clone(),
+                        )
+                        .is_ok()
+                    },
+                    self.x11_display.clone(),
+                );
+            }
+        } else if let Some(mime) = pick_preferred_text_mime(&mime_types) {
             if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
                 let write_fd: OwnedFd = write_pipe.into();
                 if let Some(xwm) = self.xwm.as_mut() {
@@ -4688,6 +4823,11 @@ fn run_compositor_loop(
                             ) {
                                 Ok(wm) => {
                                     state.xwm = Some(wm);
+                                    state.x11_display =
+                                        Some(crate::x11_selection::X11Display::new(
+                                            display_number,
+                                            xauth_path.clone(),
+                                        ));
                                     state.xwayland_scale = sanitize_scale(state.display_scale);
                                     state.apply_xwayland_scale();
                                     info!(
@@ -4755,6 +4895,7 @@ fn run_compositor_loop(
         output_manager_state,
         xwayland_shell_state,
         xwm: None,
+        x11_display: None,
         xwayland_client,
         output,
         output_size: (1920, 1080),
@@ -4775,8 +4916,8 @@ fn run_compositor_loop(
         cursor_surface: None,
         last_cursor_bitmap: None,
         clipboard_owner: SelectionOwner::None,
-        clipboard_text: None,
-        pending_clipboard_mime: None,
+        clipboard_data: None,
+        pending_clipboard: None,
         primary_owner: SelectionOwner::None,
         primary_text: None,
         pending_primary_mime: None,

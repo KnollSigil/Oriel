@@ -7,9 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use oriel_proto::{
-    ControlMessage, FrameRect, WindowId, MAX_CURSOR_DIM, MAX_SELECTION_BYTES, SUPPORTED_TEXT_MIMES,
+use std::path::PathBuf;
+
+use oriel_proto::xfer::{
+    file_selection_body, file_selection_mimes, parse_file_uri_list, PORTAL_FILE_TRANSFER_MIME,
+    URI_LIST_MIME,
 };
+use oriel_proto::{ControlMessage, FrameRect, WindowId, MAX_CURSOR_DIM, SUPPORTED_TEXT_MIMES};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Sender as CalloopSender};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -175,6 +179,10 @@ pub enum ClientUiEvent {
     },
     ClipboardText {
         text: String,
+    },
+    /// The server's clipboard holds files, presented locally at `paths`.
+    ClipboardFiles {
+        paths: Vec<PathBuf>,
     },
     PrimarySelectionText {
         text: String,
@@ -515,6 +523,8 @@ struct ClientApp {
 
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
     last_clipboard: String,
+    /// Files our clipboard source offers instead of `last_clipboard` text.
+    clipboard_files: Option<Vec<PathBuf>>,
     last_primary: String,
     exit: bool,
 }
@@ -1108,9 +1118,12 @@ impl ClientApp {
             }
             ClientUiEvent::ClipboardText { text } => {
                 if !text.is_empty()
-                    && (self.copy_paste_source.is_none() || text != self.last_clipboard)
+                    && (self.copy_paste_source.is_none()
+                        || self.clipboard_files.is_some()
+                        || text != self.last_clipboard)
                 {
-                    self.last_clipboard = text;
+                    // `send_request` answers from these fields, so they change only along
+                    // with the source.
                     if let (Some(mgr), Some(data_device)) =
                         (&self.data_device_manager_state, &self.data_device)
                     {
@@ -1118,6 +1131,20 @@ impl ClientApp {
                             mgr.create_copy_paste_source(&self.qh, SUPPORTED_TEXT_MIMES.to_vec());
                         source.set_selection(data_device, self.last_input_serial);
                         self.copy_paste_source = Some(source);
+                        self.last_clipboard = text;
+                        self.clipboard_files = None;
+                    }
+                }
+            }
+            ClientUiEvent::ClipboardFiles { paths } => {
+                if !paths.is_empty() && self.clipboard_files.as_ref() != Some(&paths) {
+                    if let (Some(mgr), Some(data_device)) =
+                        (&self.data_device_manager_state, &self.data_device)
+                    {
+                        let source = mgr.create_copy_paste_source(&self.qh, file_selection_mimes());
+                        source.set_selection(data_device, self.last_input_serial);
+                        self.copy_paste_source = Some(source);
+                        self.clipboard_files = Some(paths);
                     }
                 }
             }
@@ -1932,39 +1959,34 @@ const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Read up to `MAX_SELECTION_BYTES` of UTF-8 text from a selection pipe with a
 /// bounded `poll(2)` deadline so a misbehaving peer cannot leak threads or RAM.
+/// Text cut short by the limits is still returned.
 fn read_selection_fd_bounded(fd: OwnedFd) -> Option<String> {
-    let raw = fd.as_raw_fd();
-    let deadline = Instant::now() + SELECTION_IO_TIMEOUT;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    while buf.len() < MAX_SELECTION_BYTES {
-        let rem = deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
-            break;
-        }
-        let mut pfd = libc::pollfd {
-            fd: raw,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().min(i32::MAX as u128) as i32) };
-        if rc < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        if rc == 0 {
-            break;
-        }
-        let max_read = chunk.len().min(MAX_SELECTION_BYTES - buf.len());
-        let n = unsafe { libc::read(raw, chunk.as_mut_ptr().cast::<libc::c_void>(), max_read) };
-        if n <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n as usize]);
-    }
+    let (buf, _complete) = oriel_proto::read_selection_fd(fd, SELECTION_IO_TIMEOUT);
     String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+}
+
+/// Like [`read_selection_fd_bounded`], but `None` unless the owner sent everything: a
+/// file list cut mid-path could name a different file.
+fn read_selection_fd_complete(fd: OwnedFd) -> Option<String> {
+    let (buf, complete) = oriel_proto::read_selection_fd(fd, SELECTION_IO_TIMEOUT);
+    complete
+        .then(|| String::from_utf8(buf).ok())
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read a file selection (`text/uri-list` or a FileTransfer portal key) and register its
+/// readable files for transfer. `None` when it holds no readable local files, in which case
+/// the caller falls back to text.
+fn file_selection_offer(mime: &str, fd: OwnedFd) -> Option<ControlMessage> {
+    let body = read_selection_fd_complete(fd)?;
+    let paths = if mime == PORTAL_FILE_TRANSFER_MIME {
+        crate::xfer::retrieve_portal_files(&body)?
+    } else {
+        crate::xfer::visible_host_paths(parse_file_uri_list(&body)?)?
+    };
+    let (offer_id, roots) = crate::xfer::OWNER.offer(&paths)?;
+    Some(ControlMessage::ClipboardFiles { offer_id, roots })
 }
 
 /// Write selection bytes to `fd` with a bounded `poll(2)` deadline so a stalled
@@ -2037,23 +2059,44 @@ impl DataDeviceHandler for ClientApp {
         let Some(offer) = data_device.data().selection_offer() else {
             return;
         };
-        let mime = offer.with_mime_types(|mimes| {
-            SUPPORTED_TEXT_MIMES
+        let in_flatpak = crate::pty::flatpak_app_id().is_some();
+        let (text_mime, file_mime) = offer.with_mime_types(|mimes| {
+            let has = |want: &str| mimes.iter().any(|m| m == want);
+            let text = SUPPORTED_TEXT_MIMES
                 .iter()
-                .find(|&&want| mimes.iter().any(|m| m == want))
-                .map(|&s| s.to_string())
+                .find(|&&want| has(want))
+                .map(|&s| s.to_string());
+            // Inside Flatpak only some host paths are readable (see
+            // `xfer::visible_host_paths`); the FileTransfer portal key resolves to
+            // document-portal paths that always are. Apps without the portal MIME
+            // (Cosmic Files) only offer `text/uri-list`.
+            let file = if in_flatpak && has(PORTAL_FILE_TRANSFER_MIME) {
+                Some(PORTAL_FILE_TRANSFER_MIME)
+            } else if has(URI_LIST_MIME) {
+                Some(URI_LIST_MIME)
+            } else {
+                None
+            };
+            (text, file)
         });
-        let Some(mime) = mime else {
+        let file_pipe = file_mime.and_then(|m| offer.receive(m.to_string()).ok());
+        let text_pipe = text_mime.and_then(|m| offer.receive(m).ok());
+        if file_pipe.is_none() && text_pipe.is_none() {
             return;
-        };
-        let Ok(read_pipe) = offer.receive(mime) else {
-            return;
-        };
+        }
         let _ = self.conn.flush();
         let ctrl_tx = self.ctrl_tx.clone();
         std::thread::spawn(move || {
-            if let Some(text) = read_selection_fd_bounded(OwnedFd::from(read_pipe)) {
-                let _ = ctrl_tx.send(ControlMessage::ClipboardText { text });
+            if let (Some(pipe), Some(mime)) = (file_pipe, file_mime) {
+                if let Some(msg) = file_selection_offer(mime, OwnedFd::from(pipe)) {
+                    let _ = ctrl_tx.send(msg);
+                    return;
+                }
+            }
+            if let Some(pipe) = text_pipe {
+                if let Some(text) = read_selection_fd_bounded(OwnedFd::from(pipe)) {
+                    let _ = ctrl_tx.send(ControlMessage::ClipboardText { text });
+                }
             }
         });
     }
@@ -2099,15 +2142,23 @@ impl DataSourceHandler for ClientApp {
         mime: String,
         write_pipe: WritePipe,
     ) {
-        if self
+        if !self
             .copy_paste_source
             .as_ref()
             .is_some_and(|s| s.inner() == source)
-            && SUPPORTED_TEXT_MIMES.contains(&mime.as_str())
         {
-            let text = self.last_clipboard.clone();
+            return;
+        }
+        let body = match &self.clipboard_files {
+            Some(paths) => file_selection_body(&mime, paths),
+            None if SUPPORTED_TEXT_MIMES.contains(&mime.as_str()) => {
+                Some(self.last_clipboard.clone().into_bytes())
+            }
+            None => None,
+        };
+        if let Some(body) = body {
             std::thread::spawn(move || {
-                write_selection_fd_timeout(OwnedFd::from(write_pipe), text.as_bytes());
+                write_selection_fd_timeout(OwnedFd::from(write_pipe), &body);
             });
         }
     }
@@ -2119,6 +2170,7 @@ impl DataSourceHandler for ClientApp {
             .is_some_and(|s| s.inner() == source)
         {
             self.copy_paste_source = None;
+            self.clipboard_files = None;
         } else {
             source.destroy();
         }
@@ -2399,6 +2451,7 @@ pub fn run_event_loop(
         latest_frames,
         ctrl_tx,
         last_clipboard: String::new(),
+        clipboard_files: None,
         last_primary: String::new(),
         exit: false,
     };

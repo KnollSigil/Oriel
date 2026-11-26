@@ -14,7 +14,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -151,6 +151,9 @@ pub struct SessionGuard {
     runtime_dir: PathBuf,
     dbus_address: Option<String>,
     children: Vec<Child>,
+    /// The file transfer mount in the session directory, unmounted once the session's
+    /// processes are gone (they may have files open in it).
+    xfer_mount: Option<Arc<oriel_proto::xfer_fuse::XferMount>>,
     /// Exclusive `flock` on the session's lock file for the server's lifetime, telling
     /// other servers' [`reap_stale_sessions`] that this session is live.
     _lock: Option<fs::File>,
@@ -166,7 +169,7 @@ impl SessionGuard {
         let runtime_dir =
             host_runtime_dir.join(format!("{SESSION_DIR_PREFIX}{}", std::process::id()));
         if runtime_dir.exists() {
-            let _ = fs::remove_dir_all(&runtime_dir);
+            remove_session_dir(&runtime_dir).ok();
         }
         create_private_dir(&runtime_dir)?;
         let lock = match lock_session_dir(&runtime_dir) {
@@ -251,8 +254,14 @@ impl SessionGuard {
             runtime_dir,
             dbus_address,
             children,
+            xfer_mount: None,
             _lock: lock,
         })
+    }
+
+    /// Hand the session's file transfer mount to the guard, which unmounts it on drop.
+    pub fn set_xfer_mount(&mut self, mount: Arc<oriel_proto::xfer_fuse::XferMount>) {
+        self.xfer_mount = Some(mount);
     }
 
     pub fn runtime_dir(&self) -> &Path {
@@ -371,6 +380,9 @@ impl Drop for SessionGuard {
             &session_process_ids(&self.runtime_dir),
             Duration::from_secs(2),
         );
+        if let Some(mount) = self.xfer_mount.take() {
+            mount.unmount();
+        }
         if let Err(err) = fs::remove_dir_all(&self.runtime_dir) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(
@@ -381,6 +393,16 @@ impl Drop for SessionGuard {
             }
         }
     }
+}
+
+/// Name of the file transfer mount inside a session directory.
+pub const XFER_MOUNT_DIR: &str = "oriel-xfer";
+
+/// Remove a session directory, first detaching a transfer mount a crashed server left
+/// in it (`remove_dir_all` cannot remove a dead mount).
+fn remove_session_dir(dir: &Path) -> std::io::Result<()> {
+    oriel_proto::xfer_fuse::unmount_stale(&dir.join(XFER_MOUNT_DIR));
+    fs::remove_dir_all(dir)
 }
 
 /// Session runtime directories are `<host XDG_RUNTIME_DIR>/<prefix><server pid>`.
@@ -553,7 +575,7 @@ fn reap_stale_sessions(host_runtime_dir: &Path) {
             continue;
         }
         terminate_processes(&pids, Duration::from_secs(2));
-        match fs::remove_dir_all(&dir) {
+        match remove_session_dir(&dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => warn!(

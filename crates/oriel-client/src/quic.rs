@@ -357,6 +357,39 @@ pub async fn run_client(
         None
     };
 
+    // Serves the server's reads of files this client put on the clipboard.
+    let xfer_task = crate::xfer::spawn_stream_acceptor(conn.clone());
+
+    // Clipboard updates from the server, applied in order: a file offer takes a moment to
+    // set up (the first one mounts the transfer filesystem), and text copied after it must
+    // not be overtaken.
+    let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    let clipboard_task = {
+        let conn = conn.clone();
+        let ui_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = clipboard_rx.recv().await {
+                match msg {
+                    ControlMessage::ClipboardText { text } => {
+                        let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
+                    }
+                    ControlMessage::ClipboardFiles { offer_id, roots } => {
+                        let conn = conn.clone();
+                        let paths = tokio::task::spawn_blocking(move || {
+                            crate::xfer::receive_offer(conn, offer_id, roots)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if !paths.is_empty() {
+                            let _ = ui_tx.send(ClientUiEvent::ClipboardFiles { paths });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+    };
+
     let stats_task = launcher_tx.as_ref().map(|tx| {
         let stats_conn = conn.clone();
         let tx = tx.clone();
@@ -768,8 +801,9 @@ pub async fn run_client(
                         bgra,
                     });
                 }
-                ControlMessage::ClipboardText { text } => {
-                    let _ = ui_tx.send(ClientUiEvent::ClipboardText { text });
+                msg @ (ControlMessage::ClipboardText { .. }
+                | ControlMessage::ClipboardFiles { .. }) => {
+                    let _ = clipboard_tx.send(msg);
                 }
                 ControlMessage::PrimarySelectionText { text } => {
                     let _ = ui_tx.send(ClientUiEvent::PrimarySelectionText { text });
@@ -849,6 +883,8 @@ pub async fn run_client(
         t.abort();
     }
     color_scheme_task.abort();
+    xfer_task.abort();
+    clipboard_task.abort();
     ctrl_reader_task.abort();
     writer_task.abort();
     if let Some((handle, task)) = active_mic.take() {

@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use oriel_proto::xfer::{self, XferOwner};
+use oriel_proto::xfer_fuse::XferMount;
 use oriel_proto::{
     read_audio_packet, read_bidi_stream_header, read_control_message, read_protocol_preamble,
     read_stream_header, write_audio_packet, write_control_message, write_stream_header,
@@ -18,7 +20,7 @@ use oriel_proto::{
 use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::audio::{start_per_app_playback_capture, AudioMicInjector};
 use crate::compositor::{CompositorCommand, CompositorEvent, CompositorHandle};
@@ -297,6 +299,10 @@ struct Shared {
     events: broadcast::Sender<CompositorEvent>,
     pty_mgr: Arc<crate::pty::PtyManager>,
     display: Arc<Mutex<DisplaySlot>>,
+    /// Files this server offered on the clipboard, served to the display client.
+    xfer_owner: Arc<XferOwner>,
+    /// Where files offered by the display client are presented; `None` without FUSE.
+    xfer_mount: Option<Arc<XferMount>>,
 }
 
 /// Handle incoming authenticated client sessions on an endpoint from [`bind_endpoint`].
@@ -305,6 +311,7 @@ pub async fn run_server(
     creds: EphemeralCredentials,
     comp_handle: CompositorHandle,
     mut event_rx: mpsc::UnboundedReceiver<CompositorEvent>,
+    xfer_mount: Option<Arc<XferMount>>,
 ) -> Result<()> {
     let actual_addr = endpoint
         .local_addr()
@@ -328,6 +335,8 @@ pub async fn run_server(
         pty_mgr: crate::pty::PtyManager::new(bcast_tx.clone()),
         events: bcast_tx,
         display: Arc::new(Mutex::new(DisplaySlot::default())),
+        xfer_owner: Arc::new(XferOwner::new()),
+        xfer_mount,
     });
     while let Some(incoming) = endpoint.accept().await {
         let shared = Arc::clone(&shared);
@@ -421,7 +430,11 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
     )
     .await?;
 
-    let pty_streams = spawn_pty_stream_acceptor(conn.clone(), Arc::clone(&shared.pty_mgr));
+    let pty_streams = spawn_bidi_stream_acceptor(
+        conn.clone(),
+        Arc::clone(&shared.pty_mgr),
+        Arc::clone(&shared.xfer_owner),
+    );
     let res = match role {
         ClientRole::PtyOnly => {
             info!(%remote, "PTY-only client authenticated");
@@ -466,16 +479,25 @@ async fn reject_auth(send: &mut quinn::SendStream, reason: String) -> Result<()>
     Ok(())
 }
 
-/// Accept secondary bidirectional QUIC streams (persistent remote PTYs) on `conn`.
-fn spawn_pty_stream_acceptor(
+/// Accept secondary bidirectional QUIC streams on `conn`: persistent remote PTYs and
+/// reads of files this server offered on the clipboard.
+fn spawn_bidi_stream_acceptor(
     conn: quinn::Connection,
     pty_mgr: Arc<crate::pty::PtyManager>,
+    xfer_owner: Arc<XferOwner>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok((send_bi, mut recv_bi)) = conn.accept_bi().await {
+        while let Ok((mut send_bi, mut recv_bi)) = conn.accept_bi().await {
             let pty = Arc::clone(&pty_mgr);
+            let xfer_owner = Arc::clone(&xfer_owner);
             tokio::spawn(async move {
                 match read_bidi_stream_header(&mut recv_bi).await {
+                    Ok(
+                        header @ (BidiStreamHeader::FileList { .. }
+                        | BidiStreamHeader::FileRead { .. }),
+                    ) => {
+                        xfer::serve_request(&xfer_owner, &header, &mut send_bi).await;
+                    }
                     Ok(BidiStreamHeader::Pty {
                         pty_id,
                         resume_offset,
@@ -776,7 +798,12 @@ async fn run_display_session(
     // slow work never stalls event forwarding and makes the event receiver lag.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ControlMessage>();
 
-    let mut fwd = EventForwarder::new(conn.clone(), selected_codec);
+    let mut fwd = EventForwarder::new(
+        conn.clone(),
+        selected_codec,
+        Arc::clone(&shared.xfer_owner),
+        out_tx.clone(),
+    );
 
     // Bridge compositor events -> QUIC control/video streams and QUIC control messages -> compositor.
     let loop_res: Result<()> = async {
@@ -878,6 +905,16 @@ async fn run_display_session(
                     }
                     Some(ControlMessage::ClipboardText { text }) => {
                         let _ = cmd_tx.send(CompositorCommand::SetClipboardText { text });
+                    }
+                    Some(ControlMessage::ClipboardFiles { offer_id, roots }) => {
+                        if let Some(mount) = &shared.xfer_mount {
+                            let paths = mount.add_offer(conn.clone(), offer_id, roots);
+                            if !paths.is_empty() {
+                                let _ = cmd_tx.send(CompositorCommand::SetClipboardFiles { paths });
+                            }
+                        } else {
+                            debug!("ignoring clipboard files: no transfer mount");
+                        }
                     }
                     Some(ControlMessage::PrimarySelectionText { text }) => {
                         let _ = cmd_tx.send(CompositorCommand::SetPrimarySelectionText { text });
@@ -1002,6 +1039,39 @@ const POPUP_IDLE_REFRESH_DELAY: Duration = Duration::from_millis(120);
 
 /// Forwards compositor events to one display client and tracks what that client has been
 /// told, so a snapshot can retract windows and programs it missed the end of.
+/// Turn clipboard changes into control messages on `out_tx`, in order. Registering files
+/// stats every path, which can block (a stalled network mount, or the transfer mount
+/// itself), so it runs here and not in the session loop.
+fn spawn_clipboard_worker(
+    xfer_owner: Arc<XferOwner>,
+    out_tx: mpsc::UnboundedSender<ControlMessage>,
+) -> mpsc::UnboundedSender<CompositorEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<CompositorEvent>();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let msg = match ev {
+                CompositorEvent::ClipboardText { text } => ControlMessage::ClipboardText { text },
+                CompositorEvent::ClipboardFiles { paths } => {
+                    let owner = Arc::clone(&xfer_owner);
+                    let offer = tokio::task::spawn_blocking(move || owner.offer(&paths))
+                        .await
+                        .ok()
+                        .flatten();
+                    let Some((offer_id, roots)) = offer else {
+                        continue;
+                    };
+                    ControlMessage::ClipboardFiles { offer_id, roots }
+                }
+                _ => continue,
+            };
+            if out_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    tx
+}
+
 struct EventForwarder {
     conn: quinn::Connection,
     selected_codec: VideoCodec,
@@ -1012,12 +1082,20 @@ struct EventForwarder {
     announced_windows: HashSet<WindowId>,
     /// Programs (launched apps, window entries, PTYs) the client shows as live, by launch id.
     live_programs: HashMap<u64, String>,
+    /// Clipboard changes, applied in order by [`spawn_clipboard_worker`].
+    clipboard_tx: mpsc::UnboundedSender<CompositorEvent>,
 }
 
 impl EventForwarder {
-    fn new(conn: quinn::Connection, selected_codec: VideoCodec) -> Self {
+    fn new(
+        conn: quinn::Connection,
+        selected_codec: VideoCodec,
+        xfer_owner: Arc<XferOwner>,
+        out_tx: mpsc::UnboundedSender<ControlMessage>,
+    ) -> Self {
         Self {
             conn,
+            clipboard_tx: spawn_clipboard_worker(xfer_owner, out_tx),
             selected_codec,
             session_start: Instant::now(),
             video_pipelines: HashMap::new(),
@@ -1345,8 +1423,9 @@ impl EventForwarder {
                 )
                 .await?;
             }
-            CompositorEvent::ClipboardText { text } => {
-                write_control_message(send, &ControlMessage::ClipboardText { text }).await?;
+            ev @ (CompositorEvent::ClipboardText { .. }
+            | CompositorEvent::ClipboardFiles { .. }) => {
+                let _ = self.clipboard_tx.send(ev);
             }
             CompositorEvent::PrimarySelectionText { text } => {
                 write_control_message(send, &ControlMessage::PrimarySelectionText { text }).await?;

@@ -167,7 +167,7 @@ fn is_valid_flatpak_app_id(id: &str) -> bool {
 }
 
 /// Return the Flatpak application ID when running inside a Flatpak sandbox, or `None` otherwise.
-fn flatpak_app_id() -> Option<String> {
+pub(crate) fn flatpak_app_id() -> Option<String> {
     if !Path::new("/.flatpak-info").exists() {
         return None;
     }
@@ -189,6 +189,25 @@ fn pty_tunnel_socket_path_with(
     flatpak_id: Option<&str>,
     session_key: &str,
 ) -> Result<PathBuf> {
+    let dir = oriel_runtime_dir_with(runtime_dir, flatpak_id)?;
+
+    let mut sanitized: String = session_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push_str("default");
+    }
+    Ok(dir.join(format!("pty-{sanitized}.sock")))
+}
+
+fn oriel_runtime_dir_with(runtime_dir: &Path, flatpak_id: Option<&str>) -> Result<PathBuf> {
     verify_private_dir(runtime_dir)?;
 
     let dir = match flatpak_id {
@@ -206,21 +225,14 @@ fn pty_tunnel_socket_path_with(
         None => runtime_dir.join("oriel"),
     };
     ensure_private_dir(&dir)?;
+    Ok(dir)
+}
 
-    let mut sanitized: String = session_key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        sanitized.push_str("default");
-    }
-    Ok(dir.join(format!("pty-{sanitized}.sock")))
+/// This client's private `0700` runtime directory: `$XDG_RUNTIME_DIR/oriel`, or
+/// `$XDG_RUNTIME_DIR/app/$FLATPAK_ID/oriel` inside Flatpak (the same path on the host).
+pub fn oriel_runtime_dir() -> Result<PathBuf> {
+    let raw = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
+    oriel_runtime_dir_with(Path::new(&raw), flatpak_app_id().as_deref())
 }
 
 /// Compute the local `0600` Unix tunnel socket path for a connected host session

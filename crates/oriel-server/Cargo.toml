@@ -24,6 +24,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zbus.workspace = true
+# Same version smithay uses; see x11_selection.rs.
+x11rb = "0.13"
 
 [lints]
 workspace = true

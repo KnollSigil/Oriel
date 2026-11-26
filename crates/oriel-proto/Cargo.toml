@@ -9,10 +9,12 @@ anyhow.workspace = true
 ash.workspace = true
 bytemuck.workspace = true
 bytes.workspace = true
+fuser.workspace = true
 libc.workspace = true
 lz4_flex.workspace = true
 pollster.workspace = true
 postcard.workspace = true
+quinn.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -20,3 +22,7 @@ wgpu.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
