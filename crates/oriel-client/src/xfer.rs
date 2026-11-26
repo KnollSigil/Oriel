@@ -117,6 +117,64 @@ pub fn unmount() {
     }
 }
 
+/// Write end of the pipe the termination signal handler reports signals on.
+static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_termination_signal(sig: libc::c_int) {
+    let fd = SIGNAL_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    let byte = sig as u8;
+    // SAFETY: write(2) is async-signal-safe; `byte` outlives the call.
+    unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+}
+
+/// On SIGTERM, SIGINT or SIGHUP, unmount the transfer mount and exit (128 + signal), so a
+/// killed client does not leave a dead mount behind. A handler, not a blocked signal mask:
+/// handlers reset on exec, so the programs this client starts keep default behaviour.
+pub fn unmount_on_termination_signals() {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe2 returns.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        warn!("cannot watch termination signals: pipe2 failed");
+        return;
+    }
+    let [read_fd, write_fd] = fds;
+    SIGNAL_PIPE.store(write_fd, std::sync::atomic::Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name("oriel-signals".into())
+        .spawn(move || {
+            let mut byte = 0u8;
+            loop {
+                // SAFETY: reads one byte into `byte`.
+                let n = unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) };
+                if n == 1 {
+                    break;
+                }
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                return;
+            }
+            unmount();
+            std::process::exit(128 + i32::from(byte));
+        });
+    if spawned.is_err() {
+        warn!("cannot watch termination signals: thread spawn failed");
+        return;
+    }
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: installs a handler that only calls async-signal-safe write(2).
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_termination_signal as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Serve the server's reads of files this client offered, until the connection closes.
 pub fn spawn_stream_acceptor(conn: quinn::Connection) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

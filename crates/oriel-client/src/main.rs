@@ -150,6 +150,7 @@ fn main() -> Result<()> {
 
     if !matches!(cli.subcommand, Some(ClientSubcommand::PtyAttach { .. })) {
         xfer::cleanup_stale_in_background();
+        xfer::unmount_on_termination_signals();
     }
     let result = match cli.subcommand {
         Some(ClientSubcommand::PtyAttach {
