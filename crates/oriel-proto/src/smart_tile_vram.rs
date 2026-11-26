@@ -617,8 +617,13 @@ fn prepare_vram_tile_mvs(
         }
         workgroupBarrier();
     }
+    // Every lane must read the reduced totals before any lane reuses `wg_sad_acc`
+    // (implementations that don't run all 64 lanes in lockstep, e.g. lavapipe, race here).
+    let frame_mv_sad = wg_sad_acc[0];
+    let frame_zero_sad = wg_sad_acc2[0];
+    workgroupBarrier();
 
-    if (is_gpu_lossy && mv_in_bounds && wg_sad_acc[0] < wg_sad_acc2[0]) {
+    if (is_gpu_lossy && mv_in_bounds && frame_mv_sad < frame_zero_sad) {
         pred_x_h = mv_sx * 2u;
         pred_y_h = mv_sy * 2u;
         pred_from_prev = 1u;
@@ -640,6 +645,7 @@ fn prepare_vram_tile_mvs(
         }
     }
     let zero_sad = wg_sad_acc[0];
+    workgroupBarrier();
     var best_sad = zero_sad;
     var best_int_dx: i32 = 0;
     var best_int_dy: i32 = 0;
@@ -682,8 +688,10 @@ fn prepare_vram_tile_mvs(
                     }
                     workgroupBarrier();
                 }
-                if (valid && wg_sad_acc[0] < best_sad) {
-                    best_sad = wg_sad_acc[0];
+                let cand_sad = wg_sad_acc[0];
+                workgroupBarrier();
+                if (valid && cand_sad < best_sad) {
+                    best_sad = cand_sad;
                     best_int_dx = ndx;
                     best_int_dy = ndy;
                     best_dx_h = dx_h;
@@ -719,8 +727,10 @@ fn prepare_vram_tile_mvs(
                     }
                     workgroupBarrier();
                 }
-                if (valid && wg_sad_acc[0] < best_sad) {
-                    best_sad = wg_sad_acc[0];
+                let cand_sad = wg_sad_acc[0];
+                workgroupBarrier();
+                if (valid && cand_sad < best_sad) {
+                    best_sad = cand_sad;
                     best_dx_h = nhx;
                     best_dy_h = nhy;
                 }
