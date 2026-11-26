@@ -13,7 +13,7 @@ use std::fs::Metadata;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -264,12 +264,12 @@ pub fn list_dir(dir: &Path) -> Result<Vec<FileEntry>, i32> {
 
 /// Serve a [`BidiStreamHeader::FileList`](crate::BidiStreamHeader::FileList) request.
 pub async fn serve_list<W: AsyncWrite + Unpin>(
-    owner: &XferOwner,
+    owner: &Arc<XferOwner>,
     offer_id: u64,
     path: &[String],
     writer: &mut W,
 ) -> Result<()> {
-    let reply = match owner.resolve(offer_id, path) {
+    let reply = match resolve_blocking(owner, offer_id, path).await {
         Ok(dir) => match tokio::task::spawn_blocking(move || list_dir(&dir)).await {
             Ok(Ok(entries)) => FileListReply::Ok(entries),
             Ok(Err(errno)) => FileListReply::Err(errno),
@@ -280,16 +280,31 @@ pub async fn serve_list<W: AsyncWrite + Unpin>(
     write_frame(writer, &reply).await
 }
 
+/// [`XferOwner::resolve`] off the async runtime: each path component is a `stat`, which
+/// for files offered from another transfer mount (a copy between two remote sessions) is
+/// a FUSE lookup that may wait on the network.
+async fn resolve_blocking(
+    owner: &Arc<XferOwner>,
+    offer_id: u64,
+    path: &[String],
+) -> Result<PathBuf, i32> {
+    let owner = Arc::clone(owner);
+    let path = path.to_vec();
+    tokio::task::spawn_blocking(move || owner.resolve(offer_id, &path))
+        .await
+        .unwrap_or(Err(libc::EIO))
+}
+
 /// Serve a [`BidiStreamHeader::FileRead`](crate::BidiStreamHeader::FileRead) request:
 /// stream the file from `offset` until EOF or until the reader stops the stream.
 pub async fn serve_read<W: AsyncWrite + Unpin>(
-    owner: &XferOwner,
+    owner: &Arc<XferOwner>,
     offer_id: u64,
     path: &[String],
     offset: u64,
     writer: &mut W,
 ) -> Result<()> {
-    let file = match owner.resolve(offer_id, path) {
+    let file = match resolve_blocking(owner, offer_id, path).await {
         Ok(p) => open_regular(&p, offset).await,
         Err(errno) => Err(errno),
     };
@@ -312,7 +327,7 @@ pub async fn serve_read<W: AsyncWrite + Unpin>(
 /// [`BidiStreamHeader::FileRead`](crate::BidiStreamHeader::FileRead) stream and finish
 /// it. Returns `false` (leaving the stream alone) for any other header.
 pub async fn serve_request(
-    owner: &XferOwner,
+    owner: &Arc<XferOwner>,
     header: &crate::BidiStreamHeader,
     send: &mut quinn::SendStream,
 ) -> bool {
@@ -593,7 +608,7 @@ mod tests {
     async fn serve_read_streams_from_offset() {
         let dir = scratch_dir("read");
         std::fs::write(dir.join("f"), b"0123456789").unwrap();
-        let owner = XferOwner::new();
+        let owner = Arc::new(XferOwner::new());
         let (id, _) = owner.offer(OfferSlot::Clipboard, &[dir.join("f")]).unwrap();
         let mut out = Vec::new();
         serve_read(&owner, id, &["f".to_string()], 4, &mut out)

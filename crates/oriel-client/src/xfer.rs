@@ -227,12 +227,20 @@ fn host_path_visible(path: &Path, in_flatpak: bool) -> bool {
 }
 
 /// The paths of a `text/uri-list` selection from a host app that this process can read
-/// (in Flatpak, those under [`SANDBOX_SHARED_HOST_DIRS`]). `None` when there are none.
+/// (in Flatpak, those under [`SANDBOX_SHARED_HOST_DIRS`] or Oriel's own runtime dir, where
+/// every Oriel client mounts the files its servers offer: a copy in one remote session
+/// pasted into another). `None` when there are none.
 pub fn visible_host_paths(paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
     let in_flatpak = crate::pty::flatpak_app_id().is_some();
+    let own_dir = crate::pty::oriel_runtime_dir().ok();
     let visible: Vec<PathBuf> = paths
         .into_iter()
-        .filter(|p| host_path_visible(p, in_flatpak))
+        .filter(|p| {
+            host_path_visible(p, in_flatpak)
+                || own_dir.as_deref().is_some_and(|dir| {
+                    !p.components().any(|c| matches!(c, Component::ParentDir)) && p.starts_with(dir)
+                })
+        })
         .collect();
     (!visible.is_empty()).then_some(visible)
 }
