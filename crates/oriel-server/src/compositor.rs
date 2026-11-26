@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -3579,6 +3579,7 @@ impl AppState {
                 std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
             }
             Serve::Fetch(owner_mime) => (data.fetch.0)(data.clip.offer_id, owner_mime, fd),
+            Serve::PortalFiles(paths) => write_portal_key(paths, fd),
             Serve::Nothing => {}
         }
     }
@@ -3704,6 +3705,35 @@ fn read_selection_fd_complete(fd: OwnedFd) -> Option<String> {
         .then(|| String::from_utf8(buf).ok())
         .flatten()
         .filter(|s| !s.is_empty())
+}
+
+/// Connection to the session bus for FileTransfer portal transfers, kept for the server's
+/// lifetime: the portal ends a transfer when the connection that started it closes.
+fn session_portal_bus() -> Result<zbus::blocking::Connection> {
+    static BUS: Mutex<Option<zbus::blocking::Connection>> = Mutex::new(None);
+    let mut slot = BUS.lock().unwrap();
+    if let Some(bus) = slot.as_ref() {
+        return Ok(bus.clone());
+    }
+    let addr = crate::session::session_dbus_address().context("the session has no D-Bus")?;
+    let bus = zbus::blocking::connection::Builder::address(addr.as_str())?.build()?;
+    *slot = Some(bus.clone());
+    Ok(bus)
+}
+
+/// Answer a sandboxed session app's request for the client's files: register them with
+/// the session's FileTransfer portal and write the key to `fd`, on a worker thread.
+fn write_portal_key(paths: Vec<PathBuf>, fd: OwnedFd) {
+    std::thread::spawn(move || {
+        let key = session_portal_bus()
+            .and_then(|bus| oriel_proto::selection::portal_transfer_key(&bus, &paths));
+        match key {
+            Ok(key) => write_selection_fd_timeout(fd, &key),
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "FileTransfer portal registration failed")
+            }
+        }
+    });
 }
 
 /// Write selection bytes to `fd` with a bounded `poll(2)` deadline so a stalled
@@ -4776,6 +4806,7 @@ impl ServerDndGrabHandler for AppState {
                 std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
             }
             Serve::Fetch(mime) => (drag.fetch.0)(drag.clip.offer_id, mime, fd),
+            Serve::PortalFiles(paths) => write_portal_key(paths, fd),
             Serve::Nothing => {}
         }
     }

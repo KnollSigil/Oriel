@@ -1589,6 +1589,14 @@ fn set_ini_value(existing: &str, section: &str, key: &str, value: &str) -> Strin
     out
 }
 
+/// The isolated session's D-Bus address, if it has one.
+pub fn session_dbus_address() -> Option<String> {
+    SESSION_INFO
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .and_then(|info| info.dbus_address.clone())
+}
+
 /// Return the isolated session runtime directory if initialized.
 pub fn session_runtime_dir() -> Option<PathBuf> {
     SESSION_INFO
@@ -1604,19 +1612,27 @@ pub fn session_runtime_dir() -> Option<PathBuf> {
 /// apps mount into their sandbox (`xdg-config/kdeglobals:ro`). KDE apps take most of their
 /// palette from the settings portal, but Breeze builds the toolbar/header colors from
 /// `kdeglobals` itself, and reloads them from it on every palette change.
+///
+/// Also the session's document portal mount, read-only: the portal hands sandboxed apps
+/// paths under its own mount point (`<session runtime dir>/doc/...`), but Flatpak binds the
+/// documents at `/run/user/<uid>/doc` in the sandbox, which matches only on a normal
+/// desktop. Without this, files passed to a sandboxed app through the FileTransfer portal
+/// (pasted or dropped files) cannot be opened.
 pub fn flatpak_run_options(run_args: &[&str]) -> Vec<String> {
-    let Some(dir) = SESSION_INFO
+    let Some((dir, runtime_dir)) = SESSION_INFO
         .get()
         .and_then(|lock| lock.lock().ok())
-        .map(|info| info.portal_config_dir.clone())
+        .map(|info| (info.portal_config_dir.clone(), info.runtime_dir.clone()))
     else {
         return Vec::new();
     };
+    let docs = runtime_dir.join("doc");
     let dir = dir.display();
     let config_dirs = flatpak_config_dirs(run_args);
     vec![
         format!("--filesystem={dir}:ro"),
         format!("--env=XDG_CONFIG_DIRS={dir}:{config_dirs}"),
+        format!("--filesystem={}:ro", docs.display()),
     ]
 }
 

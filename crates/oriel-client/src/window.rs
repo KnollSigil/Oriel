@@ -2552,6 +2552,9 @@ impl DataSourceHandler for ClientApp {
                     drag.fetch
                         .fetch(drag.clip.offer_id, owner_mime, OwnedFd::from(write_pipe));
                 }
+                Serve::PortalFiles(paths) => {
+                    crate::xfer::write_portal_key(paths, OwnedFd::from(write_pipe));
+                }
                 Serve::Nothing => {}
             }
             return;
@@ -2574,6 +2577,9 @@ impl DataSourceHandler for ClientApp {
             }
             Serve::Fetch(owner_mime) => {
                 fetch.fetch(clip.offer_id, owner_mime, OwnedFd::from(write_pipe));
+            }
+            Serve::PortalFiles(paths) => {
+                crate::xfer::write_portal_key(paths, OwnedFd::from(write_pipe));
             }
             Serve::Nothing => {}
         }

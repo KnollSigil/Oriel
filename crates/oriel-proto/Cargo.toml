@@ -19,6 +19,7 @@ serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
+zbus.workspace = true
 
 [lints]
 workspace = true

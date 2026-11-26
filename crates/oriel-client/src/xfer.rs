@@ -145,6 +145,36 @@ impl SelectionFetcher {
     }
 }
 
+/// Session bus connection for FileTransfer portal transfers, kept for the process
+/// lifetime: the portal ends a transfer when the connection that started it closes.
+fn portal_bus() -> anyhow::Result<zbus::blocking::Connection> {
+    static BUS: Mutex<Option<zbus::blocking::Connection>> = Mutex::new(None);
+    let mut slot = BUS.lock().unwrap();
+    if let Some(bus) = slot.as_ref() {
+        return Ok(bus.clone());
+    }
+    let bus = zbus::blocking::Connection::session()?;
+    *slot = Some(bus.clone());
+    Ok(bus)
+}
+
+/// Answer a sandboxed app's request for files from a server: register them with the
+/// host's FileTransfer portal and write the key to `fd`, on a worker thread.
+pub fn write_portal_key(paths: Vec<PathBuf>, fd: std::os::fd::OwnedFd) {
+    std::thread::spawn(move || {
+        let key =
+            portal_bus().and_then(|bus| oriel_proto::selection::portal_transfer_key(&bus, &paths));
+        match key {
+            Ok(key) => {
+                let _ = std::io::Write::write_all(&mut std::fs::File::from(fd), &key);
+            }
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "FileTransfer portal registration failed")
+            }
+        }
+    });
+}
+
 /// Local selections (clipboard contents, drags) offered to servers, by offer id, so a
 /// server's paste can read any type from the app that owns it. wayland-client objects can
 /// send requests from any thread, so reads need no trip through a window loop.

@@ -21,6 +21,9 @@ use crate::xfer::{
 };
 use crate::SUPPORTED_TEXT_MIMES;
 
+/// The FileTransfer portal's older type name, still read by some toolkits.
+pub const PORTAL_FILES_MIME: &str = "application/vnd.portal.files";
+
 /// Text up to this size travels with the offer; larger text is fetched like other types.
 pub const INLINE_TEXT_MAX: usize = 64 * 1024;
 
@@ -48,7 +51,7 @@ pub fn proxyable_mimes(mimes: &[String]) -> Vec<String> {
     for mime in mimes {
         let local_only = !mime.contains('/')
             || mime == PORTAL_FILE_TRANSFER_MIME
-            || mime == "application/vnd.portal.files"
+            || mime == PORTAL_FILES_MIME
             || mime.starts_with("application/x-kde-ark-dndextract")
             // GTK's marker for drags within one process.
             || mime == "application/x-gtk-local-dnd";
@@ -101,6 +104,9 @@ pub enum Serve {
     Bytes(Vec<u8>),
     /// Fetch this type from the owner.
     Fetch(String),
+    /// Register these files with the FileTransfer portal and answer with its key (see
+    /// [`portal_transfer_key`]), for sandboxed apps that cannot see the paths.
+    PortalFiles(Vec<PathBuf>),
     Nothing,
 }
 
@@ -122,11 +128,19 @@ impl ReceivedClipboard {
                 out.push(mime.clone());
             }
         }
+        if self.files.is_some() {
+            // Last, so apps that can read the paths keep using them.
+            out.push(PORTAL_FILE_TRANSFER_MIME.to_string());
+            out.push(PORTAL_FILES_MIME.to_string());
+        }
         out
     }
 
     pub fn serve(&self, mime: &str) -> Serve {
         if let Some(paths) = &self.files {
+            if mime == PORTAL_FILE_TRANSFER_MIME || mime == PORTAL_FILES_MIME {
+                return Serve::PortalFiles(paths.clone());
+            }
             if let Some(body) = file_selection_body(mime, paths) {
                 return Serve::Bytes(body);
             }
@@ -144,6 +158,42 @@ impl ReceivedClipboard {
         }
         Serve::Nothing
     }
+}
+
+/// Register `paths` with the FileTransfer portal on `bus` and return the key a sandboxed
+/// app passes to `RetrieveFiles`, followed by the NUL toolkits write after it. Blocking.
+pub fn portal_transfer_key(bus: &zbus::blocking::Connection, paths: &[PathBuf]) -> Result<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::os::unix::fs::OpenOptionsExt;
+    use zbus::zvariant::{Fd, Value};
+
+    let proxy = zbus::blocking::Proxy::new(
+        bus,
+        "org.freedesktop.portal.Documents",
+        "/org/freedesktop/portal/documents",
+        "org.freedesktop.portal.FileTransfer",
+    )?;
+    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    options.insert("writable", Value::from(false));
+    // One app retrieves the files; the transfer then ends.
+    options.insert("autostop", Value::from(true));
+    let key: String = proxy.call("StartTransfer", &(options,))?;
+    let files = paths
+        .iter()
+        .map(|p| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH)
+                .open(p)
+                .with_context(|| format!("cannot open {}", p.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fds: Vec<Fd<'_>> = files.iter().map(Fd::from).collect();
+    let no_options: HashMap<&str, Value<'_>> = HashMap::new();
+    proxy.call::<_, _, ()>("AddFiles", &(key.as_str(), fds, no_options))?;
+    let mut body = key.into_bytes();
+    body.push(0);
+    Ok(body)
 }
 
 /// Answer a [`BidiStreamHeader::SelectionData`](crate::BidiStreamHeader) stream with the
