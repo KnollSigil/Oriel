@@ -2132,9 +2132,19 @@ mod tests {
         assert!(session.exists(), "a locked session must not be reaped");
 
         drop(lock);
-        assert!(!session_is_live(&session, 999_999_997));
-        reap_stale_sessions(&host.0);
-        assert!(!session.exists());
+        // Other tests spawn processes in parallel. A child forked before it execs shares
+        // our lock file's open file description (close-on-exec only closes it at exec),
+        // so the lock can briefly outlive `drop`: wait for it to go, and reap again if a
+        // fork held it just then.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.exists() && Instant::now() < deadline {
+            if !session_is_live(&session, 999_999_997) {
+                reap_stale_sessions(&host.0);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(!session.exists(), "an unlocked session must be reaped");
     }
 
     #[test]
