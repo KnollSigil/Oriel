@@ -5,12 +5,15 @@
 //! any other MIME type it looks the atom up in a `TARGETS` property it never stores), and
 //! for large data sent incrementally (INCR) it passes the INCR size header on as data. All
 //! clipboard reads from X11 apps go through here instead.
+//!
+//! A second connection reads window properties smithay's window manager drops (see
+//! [`X11Display::is_modal`]).
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -18,7 +21,8 @@ use x11rb::protocol::xproto::{
     WindowClass,
 };
 use x11rb::protocol::Event;
-use x11rb::rust_connection::{DefaultStream, RustConnection};
+use x11rb::rust_connection::{DefaultStream, PollMode, RustConnection, Stream};
+use x11rb::utils::RawFdContainer;
 use x11rb::CURRENT_TIME;
 
 use oriel_proto::MAX_SELECTION_BYTES;
@@ -40,6 +44,44 @@ pub struct X11Display {
     number: u32,
     xauthority: Option<PathBuf>,
     reader: Arc<Mutex<Option<Reader>>>,
+    /// Separate from `reader` so a long clipboard transfer never holds up window mapping.
+    props: Arc<Mutex<PropsSlot>>,
+}
+
+/// How long a window property read may wait for XWayland, in all.
+const PROP_READ_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long to go without property reads after one failed, before connecting again.
+const PROP_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// The property connection: made on a thread of its own, so the compositor thread never
+/// waits for a connection to XWayland.
+#[derive(Debug)]
+enum PropsSlot {
+    /// Not connected; connect again once `retry_at` has passed (at once when `None`).
+    Idle {
+        retry_at: Option<Instant>,
+    },
+    Connecting,
+    Ready(Box<PropReader>),
+}
+
+impl Default for PropsSlot {
+    fn default() -> Self {
+        PropsSlot::Idle { retry_at: None }
+    }
+}
+
+/// A connection for reading window properties, with the atoms it needs.
+struct PropReader {
+    conn: RustConnection<DeadlineStream>,
+    net_wm_state: Atom,
+    modal: Atom,
+}
+
+impl std::fmt::Debug for PropReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PropReader").finish_non_exhaustive()
+    }
 }
 
 /// A connection and the requestor window conversions are delivered to. Both live as long
@@ -67,7 +109,83 @@ impl X11Display {
             number,
             xauthority,
             reader: Arc::default(),
+            props: Arc::default(),
         }
+    }
+
+    /// Start connecting for [`Self::is_modal`] in the background, so the connection is
+    /// ready by the time windows map.
+    pub fn prepare_props(&self) {
+        let mut slot = self.props.lock().unwrap();
+        self.maybe_connect_props(&mut slot);
+    }
+
+    /// Connect on a new thread if not connected and not waiting out a failure.
+    fn maybe_connect_props(&self, slot: &mut PropsSlot) {
+        let PropsSlot::Idle { retry_at } = *slot else {
+            return;
+        };
+        if retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        *slot = PropsSlot::Connecting;
+        let display = self.clone();
+        std::thread::spawn(move || {
+            let result = display.connect_props();
+            let mut slot = display.props.lock().unwrap();
+            *slot = match result {
+                Ok(props) => PropsSlot::Ready(Box::new(props)),
+                Err(err) => {
+                    tracing::debug!(error = %err, "cannot connect to XWayland for window state");
+                    PropsSlot::Idle {
+                        retry_at: Some(Instant::now() + PROP_RETRY_DELAY),
+                    }
+                }
+            };
+        });
+    }
+
+    /// Whether X11 window `window` asks to be modal: `_NET_WM_STATE_MODAL` in its
+    /// `_NET_WM_STATE`. Smithay never reads the state an app sets before mapping (GTK and
+    /// Qt set the modal state that way) and later replaces the property with its own, so
+    /// call this from `map_window_request`, before the window is activated.
+    ///
+    /// It waits for XWayland's reply on the calling thread (the compositor's), at most
+    /// [`PROP_READ_TIMEOUT`] in all: XWayland is a Wayland client of that thread and could
+    /// be waiting on it. It never connects on that thread (see [`PropsSlot`]): without a
+    /// connection, or when the read fails, the window counts as not modal. After a failure
+    /// reads stop for [`PROP_RETRY_DELAY`], so a stuck XWayland stalls one map, not each.
+    pub fn is_modal(&self, window: u32) -> bool {
+        let mut slot = self.props.lock().unwrap();
+        let PropsSlot::Ready(props) = &*slot else {
+            self.maybe_connect_props(&mut slot);
+            return false;
+        };
+        match props.is_modal(window) {
+            Ok(modal) => modal,
+            Err(err) => {
+                tracing::debug!(error = %err, window, "cannot read X11 window state");
+                *slot = PropsSlot::Idle {
+                    retry_at: Some(Instant::now() + PROP_RETRY_DELAY),
+                };
+                false
+            }
+        }
+    }
+
+    fn connect_props(&self) -> anyhow::Result<PropReader> {
+        let conn = self.open(|inner| DeadlineStream {
+            inner,
+            deadline: Mutex::new(None),
+        })?;
+        let net_wm_state = conn.intern_atom(false, b"_NET_WM_STATE")?;
+        let modal = conn.intern_atom(false, b"_NET_WM_STATE_MODAL")?;
+        let (net_wm_state, modal) = (net_wm_state.reply()?.atom, modal.reply()?.atom);
+        Ok(PropReader {
+            conn,
+            net_wm_state,
+            modal,
+        })
     }
 
     /// Stream the `CLIPBOARD` selection converted to `mime` into `fd` as it arrives, at most
@@ -114,9 +232,14 @@ impl X11Display {
         }
     }
 
-    fn connect(&self) -> anyhow::Result<Reader> {
+    /// A new authenticated connection to the XWayland.
+    fn open<S: Stream>(
+        &self,
+        wrap: impl FnOnce(DefaultStream) -> S,
+    ) -> anyhow::Result<RustConnection<S>> {
         let socket = UnixStream::connect(format!("/tmp/.X11-unix/X{}", self.number))?;
         let (stream, _) = DefaultStream::from_unix_stream(socket)?;
+        let stream = wrap(stream);
         let cookie = self
             .xauthority
             .as_deref()
@@ -125,8 +248,13 @@ impl X11Display {
             Some(cookie) => (COOKIE_AUTH.to_vec(), cookie),
             None => (Vec::new(), Vec::new()),
         };
-        let conn =
-            RustConnection::connect_to_stream_with_auth_info(stream, 0, auth_name, auth_data)?;
+        Ok(RustConnection::connect_to_stream_with_auth_info(
+            stream, 0, auth_name, auth_data,
+        )?)
+    }
+
+    fn connect(&self) -> anyhow::Result<Reader> {
+        let conn = self.open(|s| s)?;
         let root = conn
             .setup()
             .roots
@@ -177,6 +305,83 @@ fn target_name(mime: &str) -> &str {
         "text/plain;charset=utf-8" => "UTF8_STRING",
         "text/plain" => "TEXT",
         other => other,
+    }
+}
+
+/// A stream whose waits give up at `deadline` (or, without one, after
+/// [`SELECTION_IO_TIMEOUT`] each), failing the request with `TimedOut` instead of blocking
+/// for good.
+#[derive(Debug)]
+struct DeadlineStream {
+    inner: DefaultStream,
+    deadline: Mutex<Option<Instant>>,
+}
+
+impl Stream for DeadlineStream {
+    fn poll(&self, mode: PollMode) -> std::io::Result<()> {
+        let mut events = 0;
+        if mode.readable() {
+            events |= libc::POLLIN;
+        }
+        if mode.writable() {
+            events |= libc::POLLOUT;
+        }
+        let deadline = self
+            .deadline
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| Instant::now() + SELECTION_IO_TIMEOUT);
+        loop {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            let mut pfd = libc::pollfd {
+                fd: self.inner.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, rem.as_millis().max(1) as i32) };
+            if rc > 0 {
+                return Ok(());
+            }
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    fn read(&self, buf: &mut [u8], fd_storage: &mut Vec<RawFdContainer>) -> std::io::Result<usize> {
+        self.inner.read(buf, fd_storage)
+    }
+
+    fn write(&self, buf: &[u8], fds: &mut Vec<RawFdContainer>) -> std::io::Result<usize> {
+        self.inner.write(buf, fds)
+    }
+
+    fn write_vectored(
+        &self,
+        bufs: &[std::io::IoSlice<'_>],
+        fds: &mut Vec<RawFdContainer>,
+    ) -> std::io::Result<usize> {
+        self.inner.write_vectored(bufs, fds)
+    }
+}
+
+impl PropReader {
+    fn is_modal(&self, window: u32) -> anyhow::Result<bool> {
+        *self.conn.stream().deadline.lock().unwrap() = Some(Instant::now() + PROP_READ_TIMEOUT);
+        // A window has a few states; 64 atoms is plenty.
+        let reply = self
+            .conn
+            .get_property(false, window, self.net_wm_state, AtomEnum::ATOM, 0, 64)?
+            .reply()?;
+        Ok(reply
+            .value32()
+            .is_some_and(|mut atoms| atoms.any(|a| a == self.modal)))
     }
 }
 

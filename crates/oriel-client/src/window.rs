@@ -78,6 +78,10 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::{self, WpViewport},
     wp_viewporter::{self, WpViewporter},
 };
+use wayland_protocols::xdg::dialog::v1::client::{
+    xdg_dialog_v1::{self, XdgDialogV1},
+    xdg_wm_dialog_v1::{self, XdgWmDialogV1},
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_positioner::{Anchor, ConstraintAdjustment, Gravity},
     xdg_surface,
@@ -100,6 +104,11 @@ pub enum ClientUiEvent {
         app_id: String,
         width: u32,
         height: u32,
+    },
+    WindowParent {
+        window_id: WindowId,
+        parent_id: Option<WindowId>,
+        modal: bool,
     },
     PopupCreated {
         window_id: WindowId,
@@ -365,6 +374,15 @@ struct RemoteWindow {
     frame_size: (u32, u32),
     geometry: FrameRect,
     input_bounds: Option<FrameRect>,
+    /// The remote window this one is a dialog of, kept while the link can't be made yet
+    /// (see [`ClientApp::dialog_link_target`]) so it is made once it can.
+    dialog_parent: Option<WindowId>,
+    /// The parent the host compositor has for this window: the one last set with
+    /// `xdg_toplevel.set_parent`, moved up when that parent closes as xdg-shell does.
+    host_parent: Option<WindowId>,
+    modal: bool,
+    /// The `xdg_dialog_v1` marking this window a dialog, while it has a parent.
+    xdg_dialog: Option<XdgDialogV1>,
 }
 
 impl RemoteWindow {
@@ -464,6 +482,9 @@ impl Drop for RemoteWindow {
         if let Some(vp) = self.viewport.take() {
             vp.destroy();
         }
+        if let Some(dialog) = self.xdg_dialog.take() {
+            dialog.destroy();
+        }
     }
 }
 
@@ -495,6 +516,7 @@ struct ClientApp {
     data_device_manager_state: Option<DataDeviceManagerState>,
     primary_selection_manager_state: Option<PrimarySelectionManagerState>,
     toplevel_icon_manager: Option<XdgToplevelIconManagerV1>,
+    dialog_manager: Option<XdgWmDialogV1>,
     fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
     max_scale: RenderScaleCap,
@@ -636,6 +658,82 @@ impl ClientApp {
                 button,
                 pressed: false,
             });
+        }
+    }
+
+    /// The parent window `window_id` can be given on the host compositor now: its remote
+    /// parent, once that is mapped (xdg-shell treats an unmapped parent as none) and if
+    /// the link makes no loop (a protocol error that would end the connection).
+    fn dialog_link_target(&self, window_id: WindowId) -> Option<WindowId> {
+        dialog_link_target(
+            window_id,
+            self.windows.get(&window_id)?.dialog_parent,
+            |id| self.windows.get(&id).map(|w| (w.configured, w.host_parent)),
+        )
+    }
+
+    /// Make window `window_id` a dialog of its remote parent on the host compositor
+    /// (`xdg_toplevel.set_parent`, plus `xdg_dialog_v1` for the modal hint), or an
+    /// ordinary window while [`Self::dialog_link_target`] has no parent for it.
+    /// `true` when its parent on the host changed.
+    fn apply_dialog_parent(&mut self, window_id: WindowId) -> bool {
+        let target = self.dialog_link_target(window_id);
+        let Some(win) = self.windows.get(&window_id) else {
+            return false;
+        };
+        let changed = win.host_parent != target;
+        if changed {
+            let parent = target.and_then(|p| self.windows.get(&p)).map(|p| &p.window);
+            win.window.set_parent(parent);
+        }
+        let dialog_manager = self.dialog_manager.clone();
+        let Some(win) = self.windows.get_mut(&window_id) else {
+            return false;
+        };
+        win.host_parent = target;
+        if target.is_none() {
+            if let Some(dialog) = win.xdg_dialog.take() {
+                dialog.destroy();
+            }
+        } else if let Some(mgr) = dialog_manager {
+            let dialog = win
+                .xdg_dialog
+                .get_or_insert_with(|| mgr.get_xdg_dialog(win.window.xdg_toplevel(), &self.qh, ()));
+            if win.modal {
+                dialog.set_modal();
+            } else {
+                dialog.unset_modal();
+            }
+        }
+        debug!(
+            window_id,
+            parent = ?win.dialog_parent,
+            host_parent = ?target,
+            modal = win.modal,
+            "applied remote dialog relationship"
+        );
+        changed
+    }
+
+    /// Make the dialog links that are waiting and can be made now: after a window mapped,
+    /// closed, or changed its own link.
+    fn apply_waiting_dialog_parents(&mut self) {
+        // Each pass that changes a link may unblock another; there are at most as many
+        // links as windows.
+        for _ in 0..=self.windows.len() {
+            let waiting: Vec<WindowId> = self
+                .windows
+                .iter()
+                .filter(|(_, w)| w.dialog_parent.is_some() && w.dialog_parent != w.host_parent)
+                .map(|(&id, _)| id)
+                .collect();
+            let mut changed = false;
+            for id in waiting {
+                changed |= self.apply_dialog_parent(id);
+            }
+            if !changed {
+                break;
+            }
         }
     }
 
@@ -797,6 +895,10 @@ impl ClientApp {
                         frame_size: (0, 0),
                         geometry: FrameRect::full(0, 0),
                         input_bounds: None,
+                        dialog_parent: None,
+                        host_parent: None,
+                        modal: false,
+                        xdg_dialog: None,
                     },
                 );
                 if has_app_id {
@@ -807,6 +909,20 @@ impl ClientApp {
                 if let Some(win) = self.windows.get(&window_id) {
                     win.window.commit();
                 }
+            }
+            ClientUiEvent::WindowParent {
+                window_id,
+                parent_id,
+                modal,
+            } => {
+                let Some(win) = self.windows.get_mut(&window_id) else {
+                    return;
+                };
+                win.dialog_parent = parent_id;
+                win.modal = modal;
+                self.apply_dialog_parent(window_id);
+                // A link changing can unblock others waiting on a loop it would have made.
+                self.apply_waiting_dialog_parents();
             }
             ClientUiEvent::PopupCreated {
                 window_id,
@@ -1022,12 +1138,19 @@ impl ClientApp {
                 if let Some(win) = self.windows.remove(&window_id) {
                     self.surface_to_remote
                         .remove(&win.window.wl_surface().id().protocol_id());
+                    // xdg-shell gives the closed window's children its own parent.
+                    for child in self.windows.values_mut() {
+                        if child.host_parent == Some(window_id) {
+                            child.host_parent = win.host_parent;
+                        }
+                    }
                 }
                 if let Some(rp) = self.popups.remove(&window_id) {
                     self.surface_to_remote
                         .remove(&rp.popup.wl_surface().id().protocol_id());
                 }
                 self.latest_frames.lock().unwrap().remove(&window_id);
+                self.apply_waiting_dialog_parents();
             }
             ClientUiEvent::FrameReady { window_id } => {
                 let Some(LatestDecodedFrame {
@@ -1343,6 +1466,31 @@ fn border_resize_edge(x: f64, y: f64, width: u32, height: u32) -> Option<(Resize
     }
 }
 
+/// The parent `child` can be given on the host compositor now (see
+/// [`ClientApp::dialog_link_target`]), from its remote parent `parent` and `window`, which
+/// gives a shown window's `(mapped, parent on the host)`.
+fn dialog_link_target(
+    child: WindowId,
+    parent: Option<WindowId>,
+    window: impl Fn(WindowId) -> Option<(bool, Option<WindowId>)>,
+) -> Option<WindowId> {
+    let parent = parent?;
+    if !window(parent).is_some_and(|(mapped, _)| mapped) {
+        return None;
+    }
+    // Walk up from the parent through the host's links; reaching the child is a loop. Any
+    // walk longer than this has looped already.
+    let mut cur = Some(parent);
+    for _ in 0..1024 {
+        match cur {
+            None => return Some(parent),
+            Some(id) if id == child => return None,
+            Some(id) => cur = window(id).and_then(|(_, host_parent)| host_parent),
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_shm_surface(
     pool: &mut SlotPool,
@@ -1627,6 +1775,10 @@ impl WindowHandler for ClientApp {
                 activated,
                 tiled,
             });
+        }
+        if first {
+            // Mapped now: dialogs waiting for this window can be attached to it.
+            self.apply_waiting_dialog_parents();
         }
     }
 }
@@ -2848,6 +3000,30 @@ impl Dispatch2<XdgToplevelIconManagerV1, ClientApp> for () {
     }
 }
 
+impl Dispatch2<XdgWmDialogV1, ClientApp> for () {
+    fn event(
+        &self,
+        _state: &mut ClientApp,
+        _proxy: &XdgWmDialogV1,
+        _event: xdg_wm_dialog_v1::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<ClientApp>,
+    ) {
+    }
+}
+
+impl Dispatch2<XdgDialogV1, ClientApp> for () {
+    fn event(
+        &self,
+        _state: &mut ClientApp,
+        _proxy: &XdgDialogV1,
+        _event: xdg_dialog_v1::Event,
+        _conn: &Connection,
+        _qh: &QueueHandle<ClientApp>,
+    ) {
+    }
+}
+
 impl Dispatch2<XdgToplevelIconV1, ClientApp> for () {
     fn event(
         &self,
@@ -2974,6 +3150,7 @@ pub fn run_event_loop(
     let data_device_manager_state = DataDeviceManagerState::bind(&globals, &qh).ok();
     let primary_selection_manager_state = PrimarySelectionManagerState::bind(&globals, &qh).ok();
     let toplevel_icon_manager: Option<XdgToplevelIconManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let dialog_manager: Option<XdgWmDialogV1> = globals.bind(&qh, 1..=1, ()).ok();
     let fractional_scale_manager: Option<WpFractionalScaleManagerV1> =
         globals.bind(&qh, 1..=1, ()).ok();
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
@@ -2991,6 +3168,7 @@ pub fn run_event_loop(
         data_device_manager_state,
         primary_selection_manager_state,
         toplevel_icon_manager,
+        dialog_manager,
         fractional_scale_manager,
         viewporter,
         max_scale,
@@ -3047,6 +3225,52 @@ pub fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dialog_link_target` over windows given as `(id, mapped, parent on the host)`.
+    fn link_target(
+        windows: &[(WindowId, bool, Option<WindowId>)],
+        child: WindowId,
+        parent: Option<WindowId>,
+    ) -> Option<WindowId> {
+        dialog_link_target(child, parent, |id| {
+            windows
+                .iter()
+                .find(|w| w.0 == id)
+                .map(|&(_, mapped, host)| (mapped, host))
+        })
+    }
+
+    #[test]
+    fn dialog_links_to_a_mapped_parent() {
+        let windows = [(1, true, None), (2, true, None)];
+        assert_eq!(link_target(&windows, 2, Some(1)), Some(1));
+        assert_eq!(link_target(&windows, 2, None), None);
+    }
+
+    #[test]
+    fn dialog_waits_for_its_parent_to_map() {
+        // Unmapped or not shown yet: xdg-shell would treat it as no parent.
+        assert_eq!(
+            link_target(&[(1, false, None), (2, true, None)], 2, Some(1)),
+            None
+        );
+        assert_eq!(link_target(&[(2, true, None)], 2, Some(1)), None);
+    }
+
+    #[test]
+    fn dialog_link_never_makes_a_loop() {
+        // 1 is already a dialog of 2: 2 -> 1 would make a loop.
+        let windows = [(1, true, Some(2)), (2, true, None)];
+        assert_eq!(link_target(&windows, 2, Some(1)), None);
+        // Nor through a grandchild: 3 -> 2 -> 1, then 1 -> 3.
+        let windows = [(1, true, None), (2, true, Some(1)), (3, true, Some(2))];
+        assert_eq!(link_target(&windows, 1, Some(3)), None);
+        // A window can't be its own parent.
+        assert_eq!(link_target(&[(1, true, None)], 1, Some(1)), None);
+        // A sibling is fine: 3 -> 1 while 2 -> 1.
+        let windows = [(1, true, None), (2, true, Some(1)), (3, true, None)];
+        assert_eq!(link_target(&windows, 3, Some(1)), Some(1));
+    }
 
     #[test]
     fn fractional_output_scale_uses_logical_size() {

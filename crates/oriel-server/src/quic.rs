@@ -1485,6 +1485,21 @@ impl EventForwarder {
                 )
                 .await?;
             }
+            CompositorEvent::WindowParent {
+                window_id,
+                parent_id,
+                modal,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::WindowParent {
+                        window_id,
+                        parent_id,
+                        modal,
+                    },
+                )
+                .await?;
+            }
             CompositorEvent::ShowWindowMenu { window_id, x, y } => {
                 write_control_message(send, &ControlMessage::ShowWindowMenu { window_id, x, y })
                     .await?;

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -385,6 +385,16 @@ pub enum ControlMessage {
         app_id: String,
         width: u32,
         height: u32,
+    },
+    /// Server -> Client: a toplevel's dialog relationship: the window it is a dialog of
+    /// (`xdg_toplevel.set_parent`, X11 `WM_TRANSIENT_FOR`), `None` for an ordinary window,
+    /// and whether it is modal (`xdg_dialog_v1.set_modal`, X11 `_NET_WM_STATE_MODAL`).
+    /// Sent after [`ControlMessage::WindowCreated`] and whenever either changes. The parent
+    /// may not be announced yet; the client applies the link once it is.
+    WindowParent {
+        window_id: WindowId,
+        parent_id: Option<WindowId>,
+        modal: bool,
     },
     /// Server -> Client: a new `xdg_popup` appeared relative to a parent window.
     PopupCreated {

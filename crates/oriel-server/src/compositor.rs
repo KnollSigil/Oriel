@@ -97,6 +97,7 @@ use smithay::wayland::shell::xdg::{
 use smithay::wayland::shm::{with_buffer_contents, ShmHandler, ShmState};
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::tablet_manager::TabletSeatHandler;
+use smithay::wayland::shell::xdg::dialog::{XdgDialogHandler, XdgDialogState};
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{
     Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, WmWindowType, X11Window, XwmId,
@@ -107,7 +108,8 @@ use smithay::{
     delegate_drm_syncobj,
     delegate_fractional_scale,
     delegate_kde_decoration, delegate_output, delegate_primary_selection, delegate_seat,
-    delegate_shm, delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_shm, delegate_viewporter, delegate_xdg_decoration, delegate_xdg_dialog,
+    delegate_xdg_shell,
     delegate_xwayland_shell,
 };
 use tokio::sync::mpsc;
@@ -132,6 +134,12 @@ pub enum CompositorEvent {
         app_id: String,
         width: u32,
         height: u32,
+    },
+    /// See [`ControlMessage::WindowParent`].
+    WindowParent {
+        window_id: WindowId,
+        parent_id: Option<WindowId>,
+        modal: bool,
     },
     PopupCreated {
         window_id: WindowId,
@@ -508,6 +516,8 @@ struct TrackedWindow {
     server_side_decoration: bool,
     announced: bool,
     has_window_entry: bool,
+    /// The dialog relationship last sent to clients; see [`DialogOf`].
+    dialog_of: DialogOf,
     latest_bgra: Option<CachedFrame>,
     last_sub_info: Vec<(bool, u32, u32, i32, i32)>,
     /// Inputs of the last composite; an equal signature means the composite would be identical.
@@ -537,7 +547,19 @@ struct TrackedX11Window {
     server_side_decoration: bool,
     announced: bool,
     has_window_entry: bool,
+    /// The dialog relationship last sent to clients; see [`DialogOf`].
+    dialog_of: DialogOf,
+    /// Whether the window asked to be modal before it was mapped; see
+    /// [`crate::x11_selection::X11Display::is_modal`].
+    modal_at_map: bool,
     latest_bgra: Option<CachedFrame>,
+}
+
+/// A toplevel's dialog relationship: the window it is a dialog of, and whether it is modal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DialogOf {
+    parent_id: Option<WindowId>,
+    modal: bool,
 }
 
 struct TrackedX11Popup {
@@ -666,6 +688,7 @@ struct AppState {
     surface_readbacks: HashMap<ObjectId, VecDeque<u64>>,
     xdg_shell_state: XdgShellState,
     xdg_decoration_state: XdgDecorationState,
+    _xdg_dialog_state: XdgDialogState,
     kde_decoration_state: KdeDecorationState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
@@ -1995,7 +2018,106 @@ impl AppState {
                 }
             }
         }
+        // After every window is announced, so each parent already exists on the client.
+        // Plain windows too: a resyncing client may have missed the message that unlinked
+        // one.
+        let dialogs = self
+            .windows
+            .values()
+            .filter(|t| t.announced)
+            .map(|t| (t.window_id, t.dialog_of))
+            .chain(
+                self.x11_windows
+                    .values()
+                    .filter(|x| x.announced)
+                    .map(|x| (x.window_id, x.dialog_of)),
+            );
+        for (window_id, dialog_of) in dialogs {
+            events.push(CompositorEvent::WindowParent {
+                window_id,
+                parent_id: dialog_of.parent_id,
+                modal: dialog_of.modal,
+            });
+        }
         events
+    }
+
+    /// The current dialog relationship of toplevel `window_id`, Wayland or X11.
+    fn current_dialog_of(&self, window_id: WindowId) -> Option<DialogOf> {
+        let dialog_of = if let Some(tracked) = self.windows.get(&window_id) {
+            let toplevel = tracked.window.toplevel()?;
+            let parent_id = toplevel
+                .parent()
+                .and_then(|p| self.surface_to_window.get(&p.id()).copied())
+                .filter(|pid| self.windows.contains_key(pid));
+            let modal = with_states(toplevel.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|d| d.lock().ok())
+                    .is_some_and(|d| d.modal)
+            });
+            DialogOf { parent_id, modal }
+        } else {
+            let xwin = self.x11_windows.get(&window_id)?;
+            let parent_id = xwin
+                .surface
+                .is_transient_for()
+                .and_then(|w| self.x11_id_by_win.get(&w).copied())
+                .filter(|pid| self.x11_windows.contains_key(pid));
+            // Smithay never records `_NET_WM_STATE_MODAL` (its `is_popup` is always
+            // false), so modality is what the window asked for when it was mapped.
+            DialogOf {
+                parent_id,
+                modal: xwin.modal_at_map,
+            }
+        };
+        // A window can't be its own dialog.
+        Some(DialogOf {
+            parent_id: dialog_of.parent_id.filter(|&p| p != window_id),
+            ..dialog_of
+        })
+    }
+
+    /// Re-check every toplevel's dialog relationship, after a toplevel appeared or went
+    /// away: dialogs of a parent that wasn't tracked yet get linked to it, and dialogs of a
+    /// parent that is gone are unlinked.
+    fn resync_dialogs(&mut self) {
+        let ids: Vec<WindowId> = self
+            .windows
+            .keys()
+            .chain(self.x11_windows.keys())
+            .copied()
+            .collect();
+        for window_id in ids {
+            self.sync_dialog_of(window_id);
+        }
+    }
+
+    /// Tell clients about toplevel `window_id`'s dialog relationship if it changed since
+    /// they last heard. Before the window is announced this does nothing; announcing calls
+    /// it again.
+    fn sync_dialog_of(&mut self, window_id: WindowId) {
+        let Some(current) = self.current_dialog_of(window_id) else {
+            return;
+        };
+        let (announced, last) = if let Some(t) = self.windows.get_mut(&window_id) {
+            (t.announced, &mut t.dialog_of)
+        } else if let Some(x) = self.x11_windows.get_mut(&window_id) {
+            (x.announced, &mut x.dialog_of)
+        } else {
+            return;
+        };
+        if !announced || *last == current {
+            return;
+        }
+        *last = current;
+        debug!(window_id, ?current, "toplevel dialog relationship changed");
+        let _ = self.event_tx.send(CompositorEvent::WindowParent {
+            window_id,
+            parent_id: current.parent_id,
+            modal: current.modal,
+        });
     }
 
     /// Launch the initial command once XWayland has settled and the session is ready.
@@ -2429,7 +2551,8 @@ impl AppState {
             return;
         }
 
-        if !tracked.announced && win_log_w > 0 && win_log_h > 0 {
+        let announcing = !tracked.announced && win_log_w > 0 && win_log_h > 0;
+        if announcing {
             tracked.announced = true;
             tracked.last_width = win_log_w;
             tracked.last_height = win_log_h;
@@ -2495,6 +2618,9 @@ impl AppState {
             pixels: new_frame.pixels,
             damage,
         });
+        if announcing {
+            self.sync_dialog_of(window_id);
+        }
     }
 
     fn recomposite_popup(&mut self, window_id: WindowId) {
@@ -3294,6 +3420,7 @@ impl XdgShellHandler for AppState {
                 server_side_decoration: initial_ssd,
                 announced: false,
                 has_window_entry: false,
+                dialog_of: DialogOf::default(),
                 latest_bgra: None,
                 last_sub_info: Vec::new(),
                 last_composite_sig: None,
@@ -3306,6 +3433,12 @@ impl XdgShellHandler for AppState {
             keyboard.set_focus(self, Some(KeyboardFocusTarget::Wayland(wl_surface)), serial);
         }
         debug!(window_id, ?surf_id, "new xdg_toplevel registered");
+    }
+
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        if let Some(&window_id) = self.surface_to_window.get(&surface.wl_surface().id()) {
+            self.sync_dialog_of(window_id);
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -3328,6 +3461,7 @@ impl XdgShellHandler for AppState {
                     }
                 }
             }
+            self.resync_dialogs();
             debug!(window_id, "xdg_toplevel destroyed");
         }
     }
@@ -4027,7 +4161,8 @@ impl AppState {
         xwin.last_height = log_h;
         xwin.latest_bgra = Some(new_frame.clone());
 
-        if !xwin.announced {
+        let announcing = !xwin.announced;
+        if announcing {
             xwin.announced = true;
             let ssd = xwin.server_side_decoration;
             let _ = self.event_tx.send(CompositorEvent::WindowCreated {
@@ -4092,6 +4227,9 @@ impl AppState {
             pixels: new_frame.pixels,
             damage,
         });
+        if announcing {
+            self.sync_dialog_of(window_id);
+        }
     }
 
     fn recomposite_x11_popup(&mut self, window_id: WindowId, wl_surface: &WlSurface) {
@@ -4213,6 +4351,7 @@ impl AppState {
                     .event_tx
                     .send(CompositorEvent::WindowClosed { window_id });
             }
+            self.resync_dialogs();
         } else if let Some(xpop) = self.x11_popups.remove(&window_id) {
             debug!(
                 window_id,
@@ -4371,6 +4510,11 @@ impl XwmHandler for AppState {
         let (px, py) = self.alloc_x11_position(geo.size.w, geo.size.h);
         geo.loc = (px, py).into();
 
+        // Before the window is activated, which replaces its `_NET_WM_STATE`.
+        let modal_at_map = self
+            .x11_display
+            .as_ref()
+            .is_some_and(|d| d.is_modal(x11_win));
         if let Err(err) = window.set_mapped(true) {
             warn!(error = ?err, x11_win, "failed to map X11 window");
             return;
@@ -4421,12 +4565,16 @@ impl XwmHandler for AppState {
                 server_side_decoration: ssd,
                 announced: false,
                 has_window_entry: false,
+                dialog_of: DialogOf::default(),
+                modal_at_map,
                 latest_bgra: None,
             },
         );
         if let Some(wl) = wl_opt {
             self.recomposite_x11_window(window_id, &wl);
         }
+        // Dialogs mapped before this window can now be linked to it.
+        self.resync_dialogs();
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -4485,12 +4633,17 @@ impl XwmHandler for AppState {
                     server_side_decoration: false,
                     announced: false,
                     has_window_entry: false,
+                    dialog_of: DialogOf::default(),
+                    // Override-redirect: not managed, so never modal.
+                    modal_at_map: false,
                     latest_bgra: None,
                 },
             );
             if let Some(wl) = wl_opt {
                 self.recomposite_x11_window(window_id, &wl);
             }
+            // It can be a dialog's parent too.
+            self.resync_dialogs();
         }
     }
 
@@ -4572,6 +4725,12 @@ impl XwmHandler for AppState {
     }
 
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if property == WmWindowProperty::TransientFor {
+            if let Some(&wid) = self.x11_id_by_win.get(&window.window_id()) {
+                self.sync_dialog_of(wid);
+            }
+            return;
+        }
         if !matches!(
             property,
             WmWindowProperty::Title | WmWindowProperty::Class | WmWindowProperty::MotifHints
@@ -5006,6 +5165,15 @@ delegate_shm!(AppState);
 delegate_dmabuf!(AppState);
 delegate_drm_syncobj!(AppState);
 delegate_xdg_shell!(AppState);
+delegate_xdg_dialog!(AppState);
+
+impl XdgDialogHandler for AppState {
+    fn modal_changed(&mut self, toplevel: ToplevelSurface, _is_modal: bool) {
+        if let Some(&window_id) = self.surface_to_window.get(&toplevel.wl_surface().id()) {
+            self.sync_dialog_of(window_id);
+        }
+    }
+}
 delegate_xdg_decoration!(AppState);
 delegate_kde_decoration!(AppState);
 delegate_seat!(AppState);
@@ -5190,6 +5358,7 @@ fn run_compositor_loop(
         .map(|device| DrmSyncobjState::new::<AppState>(&dh, device));
     let xdg_shell_state = XdgShellState::new::<AppState>(&dh);
     let xdg_decoration_state = XdgDecorationState::new::<AppState>(&dh);
+    let xdg_dialog_state = XdgDialogState::new::<AppState>(&dh);
     let kde_decoration_state =
         KdeDecorationState::new::<AppState>(&dh, KdeDefaultDecorationMode::Server);
     let mut seat_state = SeatState::new();
@@ -5257,11 +5426,12 @@ fn run_compositor_loop(
                             ) {
                                 Ok(wm) => {
                                     state.xwm = Some(wm);
-                                    state.x11_display =
-                                        Some(crate::x11_selection::X11Display::new(
-                                            display_number,
-                                            xauth_path.clone(),
-                                        ));
+                                    let x11_display = crate::x11_selection::X11Display::new(
+                                        display_number,
+                                        xauth_path.clone(),
+                                    );
+                                    x11_display.prepare_props();
+                                    state.x11_display = Some(x11_display);
                                     state.xwayland_scale = sanitize_scale(state.display_scale);
                                     state.apply_xwayland_scale();
                                     info!(
@@ -5319,6 +5489,7 @@ fn run_compositor_loop(
         surface_readbacks: HashMap::new(),
         xdg_shell_state,
         xdg_decoration_state,
+        _xdg_dialog_state: xdg_dialog_state,
         kde_decoration_state,
         seat_state,
         data_device_state,

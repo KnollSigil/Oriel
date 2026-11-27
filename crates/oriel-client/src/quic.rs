@@ -822,6 +822,17 @@ pub async fn run_client(
                 ControlMessage::ShowWindowMenu { window_id, x, y } => {
                     let _ = ui_tx.send(ClientUiEvent::ShowWindowMenu { window_id, x, y });
                 }
+                ControlMessage::WindowParent {
+                    window_id,
+                    parent_id,
+                    modal,
+                } => {
+                    let _ = ui_tx.send(ClientUiEvent::WindowParent {
+                        window_id,
+                        parent_id,
+                        modal,
+                    });
+                }
                 ControlMessage::SetDecorationMode {
                     window_id,
                     server_side,
