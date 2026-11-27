@@ -187,6 +187,9 @@ impl SessionGuard {
         std::env::remove_var("DISPLAY");
         std::env::remove_var("XAUTHORITY");
 
+        // Before the private bus starts, so apps it activates inherit it too.
+        crate::flatpak_bwrap::install(host_runtime_dir);
+
         let mut children = Vec::new();
         let dbus_address = match start_private_dbus(&runtime_dir) {
             Ok((addr, child)) => {
@@ -1613,26 +1616,21 @@ pub fn session_runtime_dir() -> Option<PathBuf> {
 /// palette from the settings portal, but Breeze builds the toolbar/header colors from
 /// `kdeglobals` itself, and reloads them from it on every palette change.
 ///
-/// Also the session's document portal mount, read-only: the portal hands sandboxed apps
-/// paths under its own mount point (`<session runtime dir>/doc/...`), but Flatpak binds the
-/// documents at `/run/user/<uid>/doc` in the sandbox, which matches only on a normal
-/// desktop. Without this, files passed to a sandboxed app through the FileTransfer portal
-/// (pasted or dropped files) cannot be opened.
+/// Not the session's document portal mount: that would show the app every document in the
+/// store. `flatpak_bwrap` binds the app's own view there instead.
 pub fn flatpak_run_options(run_args: &[&str]) -> Vec<String> {
-    let Some((dir, runtime_dir)) = SESSION_INFO
+    let Some(dir) = SESSION_INFO
         .get()
         .and_then(|lock| lock.lock().ok())
-        .map(|info| (info.portal_config_dir.clone(), info.runtime_dir.clone()))
+        .map(|info| info.portal_config_dir.clone())
     else {
         return Vec::new();
     };
-    let docs = runtime_dir.join("doc");
     let dir = dir.display();
     let config_dirs = flatpak_config_dirs(run_args);
     vec![
         format!("--filesystem={dir}:ro"),
         format!("--env=XDG_CONFIG_DIRS={dir}:{config_dirs}"),
-        format!("--filesystem={}:ro", docs.display()),
     ]
 }
 

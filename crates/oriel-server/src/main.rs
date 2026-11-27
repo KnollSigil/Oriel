@@ -9,6 +9,7 @@ mod audio;
 mod compositor;
 mod damage;
 mod downscale;
+mod flatpak_bwrap;
 mod gpu;
 mod media;
 mod pty;
@@ -163,6 +164,8 @@ fn parse_cert_fingerprint(s: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<()> {
+    // Flatpak runs this binary as its bwrap in our sessions (see `flatpak_bwrap`).
+    flatpak_bwrap::run_if_wrapper();
     let cli = Cli::parse();
     if matches!(cli.subcommand, Some(ServerSubcommand::PrintShellEnv)) {
         return shell_env::print_env();
