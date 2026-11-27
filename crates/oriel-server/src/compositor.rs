@@ -21,7 +21,7 @@ use calloop::channel::{self, Channel, Sender as CalloopSender};
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use oriel_proto::{
-    LaunchState, FrameRect, WindowId, MAX_CURSOR_DIM,
+    LaunchState, FrameRect, WindowId, MAX_CURSOR_DIM, WINDOW_LAUNCH_ID_BASE,
     SUPPORTED_TEXT_MIMES,
 };
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -260,6 +260,11 @@ pub enum CompositorEvent {
         name: String,
         state: LaunchState,
     },
+    /// See [`ControlMessage::AppWindow`](oriel_proto::ControlMessage::AppWindow).
+    AppWindow {
+        launch_id: u64,
+        window_id: WindowId,
+    },
     /// Emitted at the exact point a [`CompositorCommand::Snapshot`] with this id was taken.
     /// Every event before it is already reflected in the snapshot.
     SnapshotTaken {
@@ -416,8 +421,6 @@ impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
     ) {
     }
 }
-
-const WINDOW_LAUNCH_ID_BASE: u64 = 1u64 << 62;
 
 /// Everything a composite of a surface tree depends on, cheap to compute without touching pixels.
 /// Clients such as Firefox commit at vsync rate without attaching new buffers (to drive frame
@@ -1882,6 +1885,12 @@ impl AppState {
                     name: app.name.clone(),
                     state: app.state,
                 });
+                if let Some(window_id) = app.linked_window_id {
+                    events.push(CompositorEvent::AppWindow {
+                        launch_id: app.launch_id,
+                        window_id,
+                    });
+                }
             }
         }
         for tracked in self.windows.values() {
@@ -2579,6 +2588,10 @@ impl AppState {
                     launch_id,
                     name,
                     state: LaunchState::Running,
+                });
+                let _ = self.event_tx.send(CompositorEvent::AppWindow {
+                    launch_id,
+                    window_id,
                 });
             } else {
                 tracked.has_window_entry = true;
@@ -4187,6 +4200,10 @@ impl AppState {
                     launch_id: lid,
                     name: lname,
                     state: LaunchState::Running,
+                });
+                let _ = self.event_tx.send(CompositorEvent::AppWindow {
+                    launch_id: lid,
+                    window_id,
                 });
             } else if let Some(xwin_mut) = self.x11_windows.get_mut(&window_id) {
                 xwin_mut.has_window_entry = true;

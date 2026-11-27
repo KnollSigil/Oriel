@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -257,8 +257,23 @@ pub enum StreamHeader {
 }
 
 /// High-bit tag applied to `launch_id` values representing server-managed persistent PTYs.
-/// Disjoint from `WINDOW_LAUNCH_ID_BASE` (`1 << 62`) used for GUI windows.
+/// Disjoint from [`WINDOW_LAUNCH_ID_BASE`] used for GUI windows.
 pub const PTY_LAUNCH_ID_BASE: u64 = 1u64 << 61;
+
+/// High-bit tag of the `launch_id` of a window listed as a program of its own (one no
+/// launch claimed): `WINDOW_LAUNCH_ID_BASE | window_id`.
+pub const WINDOW_LAUNCH_ID_BASE: u64 = 1u64 << 62;
+
+/// The window a program entry shows: its own window for a window entry
+/// ([`WINDOW_LAUNCH_ID_BASE`]), else `claimed`, the window an
+/// [`ControlMessage::AppWindow`] named.
+pub fn program_window(launch_id: u64, claimed: Option<WindowId>) -> Option<WindowId> {
+    if launch_id & WINDOW_LAUNCH_ID_BASE != 0 {
+        Some(launch_id & !WINDOW_LAUNCH_ID_BASE)
+    } else {
+        claimed
+    }
+}
 
 /// Identifies the role of a newly opened secondary bidirectional QUIC stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +591,10 @@ pub enum ControlMessage {
         name: String,
         state: LaunchState,
     },
+    /// Server -> Client: launched program `launch_id` showed its window `window_id`. Sent
+    /// after the program's [`ControlMessage::AppState`]. Windows that no launch claims are
+    /// listed as programs of their own instead ([`WINDOW_LAUNCH_ID_BASE`]).
+    AppWindow { launch_id: u64, window_id: WindowId },
     /// Client -> Server: terminate a launched remote application (`SIGTERM`, or `SIGKILL` if `force`).
     TerminateApp { launch_id: u64, force: bool },
     /// Client -> Server: XDG `org.freedesktop.appearance` `color-scheme` preference

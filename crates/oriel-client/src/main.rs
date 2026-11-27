@@ -19,6 +19,7 @@ mod search;
 mod session;
 #[cfg(feature = "gtk4")]
 mod symbolic_icon;
+mod traffic;
 mod window;
 mod xfer;
 

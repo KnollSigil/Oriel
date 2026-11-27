@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use oriel_proto::{ControlMessage, LaunchState, RemoteAppEntry, PTY_LAUNCH_ID_BASE};
+use oriel_proto::{ControlMessage, LaunchState, RemoteAppEntry, WindowId, PTY_LAUNCH_ID_BASE};
 use tokio::sync::mpsc;
 
 use crate::hosts::{
@@ -35,7 +35,8 @@ use crate::hosts::{
     ClientSettings, HostProfile, RenderScaleCap,
 };
 use crate::pty::{pty_tunnel_socket_path, spawn_local_terminal_pty_socket_with_terminal};
-use crate::quic::{self, LauncherNetEvent, TransferStatus};
+use crate::quic::{self, LauncherNetEvent, SourceRate, TransferStatus};
+use crate::traffic::Source;
 use crate::window::{self, ClientUiEvent};
 
 const INITIAL_RECONNECT_BACKOFF_SECS: u64 = 2;
@@ -78,9 +79,16 @@ pub struct TrackedProgram {
     pub state: LaunchState,
     /// A graceful terminate was already requested; the next request force-kills.
     pub term_sent: bool,
+    /// The window a launched program showed ([`LauncherNetEvent::AppWindow`]).
+    claimed_window: Option<WindowId>,
 }
 
 impl TrackedProgram {
+    /// The remote window this program entry stands for, if it has one.
+    pub fn window_id(&self) -> Option<WindowId> {
+        oriel_proto::program_window(self.launch_id, self.claimed_window)
+    }
+
     /// A persistent remote PTY with no attached local terminal, which can be reattached.
     pub fn is_detached_pty(&self) -> bool {
         is_detached_pty(self.launch_id, &self.name)
@@ -101,6 +109,8 @@ pub struct HostSession {
     pub rates: Option<(u64, u64)>,
     /// File transfers over the connection, oldest first.
     pub transfers: Vec<TransferStatus>,
+    /// Windows and app audio streams using the connection, busiest first.
+    pub sources: Vec<SourceRate>,
     /// Reconnect automatically after an unexpected disconnect. Armed once a QUIC session
     /// is established; cleared by an explicit disconnect.
     pub auto_reconnect: bool,
@@ -112,6 +122,28 @@ pub struct HostSession {
 }
 
 impl HostSession {
+    /// Bytes per second the window of program `launch_id` receives, when it is listed.
+    pub fn program_rate(&self, launch_id: u64) -> Option<u64> {
+        let window = self
+            .programs
+            .iter()
+            .find(|p| p.launch_id == launch_id)?
+            .window_id()?;
+        self.sources
+            .iter()
+            .find(|s| s.source == Source::Window(window))
+            .map(|s| s.rate)
+    }
+
+    /// Listed traffic that no program row shows: app audio, and windows of no listed
+    /// program.
+    pub fn other_sources(&self) -> impl Iterator<Item = &SourceRate> {
+        self.sources.iter().filter(|s| match s.source {
+            Source::Window(id) => !self.programs.iter().any(|p| p.window_id() == Some(id)),
+            Source::Audio(_) => true,
+        })
+    }
+
     /// Whether this host can show a disconnect control (connected, connecting, or
     /// waiting to reconnect).
     pub fn wants_connection(&self) -> bool {
@@ -133,6 +165,7 @@ impl HostSession {
         self.congested = false;
         self.rates = None;
         self.transfers.clear();
+        self.sources.clear();
     }
 
     /// Stop everything belonging to the current attempt and invalidate it, so late
@@ -167,7 +200,7 @@ pub struct Changes {
     pub status: bool,
     /// The active host's running programs.
     pub programs: bool,
-    /// The active host's file transfers.
+    /// The active host's file transfers or per-window traffic.
     pub transfers: bool,
 }
 
@@ -480,6 +513,7 @@ impl SessionManager {
                 congested: false,
                 rates: None,
                 transfers: Vec::new(),
+                sources: Vec::new(),
                 auto_reconnect: is_auto_reconnect && prev_auto,
                 attempt_id,
                 reconnect_backoff_secs: if is_auto_reconnect {
@@ -678,12 +712,23 @@ impl SessionManager {
                 track_program_state(&mut sess.programs, launch_id, name, state);
                 Changes::PROGRAMS.if_active(is_active)
             }
+            LauncherNetEvent::AppWindow {
+                launch_id,
+                window_id,
+            } => {
+                if let Some(p) = sess.programs.iter_mut().find(|p| p.launch_id == launch_id) {
+                    p.claimed_window = Some(window_id);
+                }
+                // Only per-program traffic depends on it, refreshed with the next stats.
+                Changes::NONE
+            }
             LauncherNetEvent::NetStats {
                 rtt_ms,
                 congested,
                 rx_rate,
                 tx_rate,
                 transfers,
+                sources,
             } => {
                 let changed = sess.rtt_ms != Some(rtt_ms)
                     || sess.congested != congested
@@ -691,8 +736,9 @@ impl SessionManager {
                 sess.rtt_ms = Some(rtt_ms);
                 sess.congested = congested;
                 sess.rates = Some((rx_rate, tx_rate));
-                let transfers_changed = sess.transfers != transfers;
+                let transfers_changed = sess.transfers != transfers || sess.sources != sources;
                 sess.transfers = transfers;
+                sess.sources = sources;
                 let status = Changes::STATUS.if_active(is_active && changed);
                 let transfers = Changes::TRANSFERS.if_active(is_active && transfers_changed);
                 status | transfers
@@ -765,6 +811,7 @@ impl SessionManager {
             name,
             state: LaunchState::Launching,
             term_sent: false,
+            claimed_window: None,
         });
         Changes::PROGRAMS
     }
@@ -1076,6 +1123,7 @@ fn track_program_state(
             name,
             state,
             term_sent: false,
+            claimed_window: None,
         });
     }
 }
@@ -1404,6 +1452,58 @@ mod tests {
     }
 
     #[test]
+    fn window_traffic_is_shown_by_the_program_it_belongs_to() {
+        let (mut mgr, _events) = manager(&["a@h"]);
+        let (attempt, _ctrl_rx) = connected(&mut mgr, "a@h");
+        let running = |launch_id: u64| LauncherNetEvent::AppState {
+            launch_id,
+            name: format!("app {launch_id}"),
+            state: LaunchState::Running,
+        };
+        // A launch that claims window 5, and window 6 listed as a program of its own.
+        let _ = mgr.handle_event(net("a@h", attempt, running(1)));
+        let claim = LauncherNetEvent::AppWindow {
+            launch_id: 1,
+            window_id: 5,
+        };
+        let _ = mgr.handle_event(net("a@h", attempt, claim));
+        let _ = mgr.handle_event(net(
+            "a@h",
+            attempt,
+            running(oriel_proto::WINDOW_LAUNCH_ID_BASE | 6),
+        ));
+        let source = |source, rate| SourceRate {
+            source,
+            name: String::new(),
+            detail: String::new(),
+            rate,
+        };
+        let stats = LauncherNetEvent::NetStats {
+            rtt_ms: 1,
+            congested: false,
+            rx_rate: 0,
+            tx_rate: 0,
+            transfers: Vec::new(),
+            sources: vec![
+                source(Source::Window(5), 5000),
+                source(Source::Window(6), 6000),
+                source(Source::Window(7), 7000),
+                source(Source::Audio(1), 1000),
+            ],
+        };
+        let changes = mgr.handle_event(net("a@h", attempt, stats));
+        assert!(changes.transfers);
+        let sess = mgr.session("a@h").unwrap();
+        assert_eq!(sess.program_rate(1), Some(5000));
+        assert_eq!(
+            sess.program_rate(oriel_proto::WINDOW_LAUNCH_ID_BASE | 6),
+            Some(6000)
+        );
+        let others: Vec<Source> = sess.other_sources().map(|s| s.source).collect();
+        assert_eq!(others, vec![Source::Window(7), Source::Audio(1)]);
+    }
+
+    #[test]
     fn events_for_inactive_hosts_only_touch_the_host_list() {
         let (mut mgr, _events) = manager(&["a@h", "b@h"]);
         let (attempt, _ctrl_rx) = connected(&mut mgr, "b@h");
@@ -1414,6 +1514,7 @@ mod tests {
             rx_rate: 0,
             tx_rate: 0,
             transfers: Vec::new(),
+            sources: Vec::new(),
         };
         assert_eq!(mgr.handle_event(net("b@h", attempt, stats)), Changes::NONE);
         let dc = LauncherNetEvent::Disconnected(None);

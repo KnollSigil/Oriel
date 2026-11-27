@@ -1486,6 +1486,19 @@ impl EventForwarder {
                 )
                 .await?;
             }
+            CompositorEvent::AppWindow {
+                launch_id,
+                window_id,
+            } => {
+                write_control_message(
+                    send,
+                    &ControlMessage::AppWindow {
+                        launch_id,
+                        window_id,
+                    },
+                )
+                .await?;
+            }
             CompositorEvent::WindowParent {
                 window_id,
                 parent_id,

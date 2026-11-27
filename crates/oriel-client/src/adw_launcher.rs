@@ -23,7 +23,7 @@ use oriel_proto::{LaunchState, PortRange, RemoteAppEntry};
 
 use crate::hosts::{HostProfile, RenderScaleCap};
 use crate::pty::{available_local_terminals, terminal_basename};
-use crate::quic::TransferStatus;
+use crate::quic::{SourceRate, TransferStatus};
 use crate::search::{self, MatchTier, SearchIndexEntry};
 use crate::session::{Changes, ConnStatus, HostEditError, SessionEvents, SessionManager};
 use crate::symbolic_icon::SymbolicIcon;
@@ -182,6 +182,17 @@ fn format_rate(bytes_per_sec: u64) -> String {
         "0 kB/s".to_string()
     } else {
         format!("{}/s", format_size(bytes_per_sec))
+    }
+}
+
+/// Show a program's received traffic in its row, or nothing while it is idle.
+fn set_program_rate(lbl: &gtk::Label, rate: Option<u64>) {
+    match rate {
+        Some(rate) => {
+            lbl.set_text(&format!("↓ {}", format_rate(rate)));
+            lbl.set_visible(true);
+        }
+        None => lbl.set_visible(false),
     }
 }
 
@@ -518,6 +529,20 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     popover_content.set_margin_start(6);
     popover_content.set_margin_end(6);
     popover_content.set_width_request(340);
+    // Traffic no program row shows (app audio, windows of no listed program), busiest
+    // first, shown while there is any.
+    let sources_section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    sources_section.set_visible(false);
+    sources_section.append(
+        &gtk::Label::builder()
+            .label("Other Traffic")
+            .halign(gtk::Align::Start)
+            .css_classes(["heading"])
+            .build(),
+    );
+    let sources_list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    sources_section.append(&sources_list);
+    sources_section.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     // File transfers, shown above the programs while there are any.
     let transfers_section = gtk::Box::new(gtk::Orientation::Vertical, 6);
     transfers_section.set_visible(false);
@@ -532,6 +557,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     transfers_section.append(&transfers_list);
     transfers_section.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let programs_list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    popover_content.append(&sources_section);
     popover_content.append(&transfers_section);
     popover_content.append(&programs_list);
     programs_popover.set_child(Some(&popover_content));
@@ -886,8 +912,11 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         })
     };
 
+    // Each program row's traffic label, by launch id; updated every second in place.
+    let program_rate_lbls: Rc<RefCell<HashMap<u64, gtk::Label>>> = Rc::default();
     let refresh_programs_ui: Rc<dyn Fn()> = {
         let state = Rc::clone(&state);
+        let program_rate_lbls = Rc::clone(&program_rate_lbls);
         let status_pills_box = status_pills_box.clone();
         let status_count_lbl = status_count_lbl.clone();
         let programs_list = programs_list.clone();
@@ -901,6 +930,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
             while let Some(c) = programs_list.first_child() {
                 programs_list.remove(&c);
             }
+            program_rate_lbls.borrow_mut().clear();
 
             let st = state.borrow();
             let Some((target, sess)) = st
@@ -946,7 +976,16 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                     })
                     .css_classes(["dim-label", "caption"])
                     .build();
+                let rate_lbl = gtk::Label::builder()
+                    .css_classes(["dim-label", "caption", "numeric"])
+                    .tooltip_text("Received by this program's window")
+                    .build();
+                set_program_rate(&rate_lbl, sess.program_rate(prog.launch_id));
+                program_rate_lbls
+                    .borrow_mut()
+                    .insert(prog.launch_id, rate_lbl.clone());
                 row.append(&name_lbl);
+                row.append(&rate_lbl);
                 row.append(&state_lbl);
 
                 if prog.is_detached_pty() && sess.status == ConnStatus::Connected {
@@ -1025,6 +1064,9 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         let transfers_section = transfers_section.clone();
         let transfers_list = transfers_list.clone();
         let status_xfer_lbl = status_xfer_lbl.clone();
+        let sources_section = sources_section.clone();
+        let sources_list = sources_list.clone();
+        let program_rate_lbls = Rc::clone(&program_rate_lbls);
         let rows: RefCell<HashMap<(String, u64), TransferRow>> = RefCell::default();
         Rc::new(move || {
             let st = state.borrow();
@@ -1032,6 +1074,38 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 .sessions
                 .active_target()
                 .and_then(|t| st.sessions.session(t).map(|s| (t, s)));
+
+            for (launch_id, lbl) in program_rate_lbls.borrow().iter() {
+                set_program_rate(lbl, active.and_then(|(_, s)| s.program_rate(*launch_id)));
+            }
+            let sources: Vec<&SourceRate> = active
+                .map(|(_, s)| s.other_sources().collect())
+                .unwrap_or_default();
+            while let Some(c) = sources_list.first_child() {
+                sources_list.remove(&c);
+            }
+            for src in &sources {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                let name = gtk::Label::builder()
+                    .label(&src.name)
+                    .halign(gtk::Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build();
+                if !src.detail.is_empty() && src.detail != src.name {
+                    name.set_tooltip_text(Some(&src.detail));
+                }
+                row.append(&name);
+                row.append(
+                    &gtk::Label::builder()
+                        .label(format!("↓ {}", format_rate(src.rate)))
+                        .css_classes(["dim-label", "caption", "numeric"])
+                        .build(),
+                );
+                sources_list.append(&row);
+            }
+            sources_section.set_visible(!sources.is_empty());
+
             let transfers = active.map(|(_, s)| s.transfers.as_slice()).unwrap_or(&[]);
             let target = active.map(|(t, _)| t).unwrap_or_default();
             let mut rows = rows.borrow_mut();

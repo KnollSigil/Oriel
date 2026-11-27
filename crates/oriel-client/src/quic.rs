@@ -276,6 +276,11 @@ pub enum LauncherNetEvent {
         name: String,
         state: LaunchState,
     },
+    /// See [`ControlMessage::AppWindow`].
+    AppWindow {
+        launch_id: u64,
+        window_id: oriel_proto::WindowId,
+    },
     /// Sent every second.
     NetStats {
         rtt_ms: u32,
@@ -285,10 +290,31 @@ pub enum LauncherNetEvent {
         tx_rate: u64,
         /// File transfers over the connection, oldest first.
         transfers: Vec<TransferStatus>,
+        /// Windows and app audio streams receiving at least [`MIN_LISTED_RATE`], busiest
+        /// first.
+        sources: Vec<SourceRate>,
     },
     Disconnected(Option<String>),
     /// The server closed the session because another display client took it over.
     TakenOver,
+}
+
+/// Received traffic slower than this (bytes per second) is not listed per window: an idle
+/// window still gets the odd cursor blink or clock tick.
+pub const MIN_LISTED_RATE: u64 = 1000;
+/// Most windows and audio streams listed in [`LauncherNetEvent::NetStats`].
+const MAX_LISTED_SOURCES: usize = 8;
+
+/// A window's or app audio stream's received traffic in [`LauncherNetEvent::NetStats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRate {
+    pub source: crate::traffic::Source,
+    /// The window title or the audio stream's app.
+    pub name: String,
+    /// The window's app id, or what the audio stream plays.
+    pub detail: String,
+    /// Bytes per second received over the last second.
+    pub rate: u64,
 }
 
 /// One file transfer in [`LauncherNetEvent::NetStats`].
@@ -470,11 +496,15 @@ pub async fn run_client(
         })
     };
 
+    let traffic = Arc::new(crate::traffic::TrafficMeter::default());
     let stats_task = launcher_tx.as_ref().map(|tx| {
         let stats_conn = conn.clone();
         let tx = tx.clone();
+        let traffic = Arc::clone(&traffic);
         tokio::spawn(async move {
             let mut prev_lost = 0u64;
+            let mut prev_source_bytes =
+                std::collections::HashMap::<crate::traffic::Source, u64>::new();
             let mut prev_bytes = (0u64, 0u64);
             let mut prev_moved = std::collections::HashMap::<u64, u64>::new();
             let mut prev_at = std::time::Instant::now();
@@ -511,12 +541,31 @@ pub async fn run_client(
                     .iter()
                     .map(|t| (t.info.id, t.info.moved))
                     .collect();
+                let totals = traffic.totals();
+                let mut sources: Vec<SourceRate> = totals
+                    .iter()
+                    .filter_map(|t| {
+                        // A source seen for the first time counts from zero.
+                        let before = prev_source_bytes.get(&t.source).copied().unwrap_or(0);
+                        let rate = per_sec(t.bytes.saturating_sub(before));
+                        (rate >= MIN_LISTED_RATE).then(|| SourceRate {
+                            source: t.source,
+                            name: t.name.clone(),
+                            detail: t.detail.clone(),
+                            rate,
+                        })
+                    })
+                    .collect();
+                prev_source_bytes = totals.iter().map(|t| (t.source, t.bytes)).collect();
+                sources.sort_by(|a, b| b.rate.cmp(&a.rate).then_with(|| a.name.cmp(&b.name)));
+                sources.truncate(MAX_LISTED_SOURCES);
                 let event = LauncherNetEvent::NetStats {
                     rtt_ms,
                     congested,
                     rx_rate,
                     tx_rate,
                     transfers,
+                    sources,
                 };
                 if tx.send(event).is_err() {
                     break;
@@ -564,17 +613,20 @@ pub async fn run_client(
     let uni_conn = conn.clone();
     let uni_tx = ui_tx.clone();
     let uni_ack_tx = frame_ack_tx.clone();
+    let uni_traffic = Arc::clone(&traffic);
     let uni_task = tokio::spawn(async move {
         let mut streams = tokio::task::JoinSet::new();
         while let Ok(mut recv_uni) = uni_conn.accept_uni().await {
             while streams.try_join_next().is_some() {}
             let tx = uni_tx.clone();
             let ack_tx = uni_ack_tx.clone();
+            let traffic = Arc::clone(&uni_traffic);
             streams.spawn(async move {
                 match read_stream_header(&mut recv_uni).await {
                     Ok(StreamHeader::Video { window_id, codec }) => {
                         let mut decoder = Some(WindowVideoDecoder::new(codec));
                         while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
+                            traffic.add_window(window_id, payload.len());
                             let mut dec = decoder.take().unwrap();
                             let decode_res = tokio::task::spawn_blocking(move || {
                                 let res =
@@ -636,14 +688,17 @@ pub async fn run_client(
                     ) {
                         Ok(sink) => {
                             info!(stream_id, %app_name, %media_name, "opened per-app host audio stream");
+                            traffic.audio_opened(stream_id, &app_name, &media_name);
                             while let Ok(Some((hdr, payload))) =
                                 read_audio_packet(&mut recv_uni).await
                             {
+                                traffic.add_audio(stream_id, payload.len());
                                 if let Err(err) = sink.push_audio(hdr.pts_ns, &payload) {
                                     warn!(stream_id, error = %err, "audio playback push error");
                                     break;
                                 }
                             }
+                            traffic.audio_closed(stream_id);
                         }
                         Err(err) => {
                             warn!(stream_id, %app_name, error = %err, "client per-app audio playback unavailable")
@@ -768,6 +823,7 @@ pub async fn run_client(
                     width,
                     height,
                 } => {
+                    traffic.window_named(window_id, &title, &app_id);
                     let _ = ui_tx.send(ClientUiEvent::WindowCreated {
                         window_id,
                         title,
@@ -784,6 +840,7 @@ pub async fn run_client(
                     width,
                     height,
                 } => {
+                    traffic.popup_created(window_id, parent_id);
                     let _ = ui_tx.send(ClientUiEvent::PopupCreated {
                         window_id,
                         parent_id,
@@ -819,6 +876,7 @@ pub async fn run_client(
                     is_keyframe,
                     bgra,
                 } => {
+                    traffic.add_window(window_id, bgra.len());
                     let decoder = popup_decoders
                         .entry(window_id)
                         .or_insert_with(|| WindowVideoDecoder::new(selected_codec));
@@ -891,6 +949,7 @@ pub async fn run_client(
                 }
                 ControlMessage::WindowClosed { window_id } => {
                     popup_decoders.remove(&window_id);
+                    traffic.window_closed(window_id);
                     let _ = ui_tx.send(ClientUiEvent::WindowClosed { window_id });
                 }
                 ControlMessage::CursorUpdate {
@@ -969,6 +1028,17 @@ pub async fn run_client(
                             .collect();
                         let _ = ui_tx.send(ClientUiEvent::AppIconsUpdated {
                             entries: icon_entries,
+                        });
+                    }
+                }
+                ControlMessage::AppWindow {
+                    launch_id,
+                    window_id,
+                } => {
+                    if let Some(tx) = &launcher_tx {
+                        let _ = tx.send(LauncherNetEvent::AppWindow {
+                            launch_id,
+                            window_id,
                         });
                     }
                 }
