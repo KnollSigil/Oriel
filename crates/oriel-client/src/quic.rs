@@ -1378,6 +1378,29 @@ fn spawn_settings_monitor() -> Option<(tokio::process::Child, bool)> {
         }
     };
 
+    // `kill_on_drop` only helps when the `Child` is dropped. A client that is killed or
+    // crashes drops nothing, and the monitor runs on forever: hundreds of them piled up
+    // during testing, and inside the Flatpak sandbox each one also kept `bwrap` alive.
+    // Have the kernel kill it when the client goes. The death signal follows the spawning
+    // thread, a tokio worker here, which lives until the process exits; it survives the
+    // `stdbuf` exec.
+    let parent = unsafe { libc::getpid() };
+    // SAFETY: pre_exec runs in the forked child before exec; prctl and getppid are
+    // async-signal-safe, and no error path allocates (another thread may have held the
+    // malloc lock at fork time).
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The client may have died before the death signal was set.
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+
     match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1596,5 +1619,91 @@ mod tests {
         assert_eq!(parse_gdbus_contrast("(<<uint32 1>>,)"), Some(1));
         assert_eq!(parse_gdbus_contrast("(<<uint32 0>>,)"), Some(0));
         assert_eq!(parse_gdbus_contrast("(<<uint32 7>>,)"), None);
+    }
+
+    /// Run by `settings_monitor_dies_with_the_client` in a child process, which it then
+    /// kills. `PATH` holds only a fake `dbus-monitor` that sleeps, so no D-Bus is needed.
+    #[tokio::test]
+    #[ignore = "helper for settings_monitor_dies_with_the_client"]
+    async fn settings_monitor_pdeathsig_helper() {
+        // Does nothing under `--include-ignored`; only the parent test sets this.
+        let Some(dir) = std::env::var_os("ORIEL_PDEATHSIG_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let (child, using_dbus_monitor) = spawn_settings_monitor().unwrap();
+        assert!(using_dbus_monitor);
+        std::fs::write(dir.join("monitor.pid"), child.id().unwrap().to_string()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        drop(child);
+    }
+
+    #[test]
+    fn settings_monitor_dies_with_the_client() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir =
+            std::env::temp_dir().join(format!("oriel-monitor-pdeathsig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sleep = find_on_path("sleep").expect("sleep not on PATH");
+        let fake = dir.join("dbus-monitor");
+        std::fs::write(&fake, format!("#!/bin/sh\nexec {} 60\n", sleep.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pid_file = dir.join("monitor.pid");
+
+        let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "quic::tests::settings_monitor_pdeathsig_helper",
+            ])
+            .env("ORIEL_PDEATHSIG_DIR", &dir)
+            .env("PATH", &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "monitor never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let gone = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit(')')
+                    .next()
+                    .is_some_and(|s| s.trim_start().starts_with('Z'))
+            })
+        };
+        // Otherwise the test would pass without the death signal doing anything.
+        assert!(!gone(pid), "fake monitor {pid} was not running");
+
+        // Like a crash or SIGKILL: no destructors run, so `kill_on_drop` can't help.
+        helper.kill().unwrap();
+        helper.wait().unwrap();
+
+        let started = Instant::now();
+        while !gone(pid) && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let died = gone(pid);
+        if !died {
+            // Still ours: it never died, so its PID can't have been reused.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(died, "settings monitor {pid} outlived the client");
     }
 }
