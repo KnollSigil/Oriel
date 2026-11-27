@@ -61,8 +61,8 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{
         wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
-        wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
-        wl_surface,
+        wl_data_offer::WlDataOffer, wl_data_source::WlDataSource, wl_keyboard, wl_output,
+        wl_pointer, wl_seat, wl_shm, wl_surface,
     },
     Connection, Proxy, QueueHandle, WEnum,
 };
@@ -2038,18 +2038,83 @@ fn read_file_offer(
     offer
 }
 
-/// The format to read files from in an offer with `mimes`, if it carries files.
+/// The format to accept a drag carrying files as, if `mimes` carries files.
 fn file_offer_mime(mimes: &[String]) -> Option<&'static str> {
     let has = |want: &str| mimes.iter().any(|m| m == want);
-    // Inside Flatpak only some host paths are readable (see `xfer::visible_host_paths`);
-    // the FileTransfer portal key resolves to document-portal paths that always are. Apps
-    // without the portal MIME (Cosmic Files) only offer `text/uri-list`.
-    if crate::pty::flatpak_app_id().is_some() && has(PORTAL_FILE_TRANSFER_MIME) {
-        Some(PORTAL_FILE_TRANSFER_MIME)
-    } else if has(URI_LIST_MIME) {
+    if has(URI_LIST_MIME) {
         Some(URI_LIST_MIME)
+    } else if crate::pty::flatpak_app_id().is_some() && has(PORTAL_FILE_TRANSFER_MIME) {
+        Some(PORTAL_FILE_TRANSFER_MIME)
     } else {
         None
+    }
+}
+
+/// Where to read the files of a local selection or drag from.
+///
+/// The `text/uri-list` paths come first: outside Flatpak they are always readable, inside
+/// only some are (see `xfer::visible_host_paths`). The FileTransfer portal key is asked for
+/// only when they are not: the portal's paths are not always readable either (a desktop
+/// session with its own document portal, such as Atrium, hands out paths under its own
+/// mount point, which the sandbox does not have).
+struct FileSource {
+    uri_list: Option<OwnedFd>,
+    /// The offer, to ask for the portal key from the reading thread (wayland-client
+    /// objects can send requests from any thread).
+    portal: Option<(WlDataOffer, Connection)>,
+}
+
+impl FileSource {
+    /// Start reading the files of `offer` with `mimes`; `None` when it carries none.
+    fn new(offer: &WlDataOffer, mimes: &[String], conn: &Connection) -> Option<Self> {
+        let has = |want: &str| mimes.iter().any(|m| m == want);
+        let uri_list = if has(URI_LIST_MIME) {
+            smithay_client_toolkit::data_device_manager::data_offer::receive(
+                offer,
+                URI_LIST_MIME.to_string(),
+            )
+            .ok()
+            .map(OwnedFd::from)
+        } else {
+            None
+        };
+        let portal = (crate::pty::flatpak_app_id().is_some() && has(PORTAL_FILE_TRANSFER_MIME))
+            .then(|| (offer.clone(), conn.clone()));
+        (uri_list.is_some() || portal.is_some()).then_some(Self { uri_list, portal })
+    }
+
+    /// Register the readable files for transfer in `slot` (blocking).
+    /// The uri-list is used when all of its paths are readable; otherwise the portal is
+    /// asked (it can give all of them), and if that fails too, the readable ones are used.
+    fn read(self, slot: OfferSlot) -> Option<(u64, Vec<oriel_proto::xfer::FileEntry>)> {
+        let mut readable_part = None;
+        if let Some(listed) = self
+            .uri_list
+            .and_then(read_selection_fd_complete)
+            .and_then(|body| parse_file_uri_list(&body))
+        {
+            let visible = crate::xfer::visible_host_paths(listed.clone()).unwrap_or_default();
+            if visible.len() == listed.len() {
+                if let Some(files) = crate::xfer::OWNER.offer(slot, &visible) {
+                    return Some(files);
+                }
+            } else if !visible.is_empty() {
+                debug!(?listed, "file offer: some paths are not readable here");
+                readable_part = Some(visible);
+            }
+        }
+        if let Some((offer, conn)) = self.portal {
+            if let Ok(pipe) = smithay_client_toolkit::data_device_manager::data_offer::receive(
+                &offer,
+                PORTAL_FILE_TRANSFER_MIME.to_string(),
+            ) {
+                let _ = conn.flush();
+                if let Some(files) = read_file_offer(PORTAL_FILE_TRANSFER_MIME, pipe.into(), slot) {
+                    return Some(files);
+                }
+            }
+        }
+        crate::xfer::OWNER.offer(slot, &readable_part?)
     }
 }
 
@@ -2099,8 +2164,8 @@ struct DragEntered {
     offer_id: u64,
     /// The drag's types the server can fetch (when it carries no files).
     mimes: Vec<String>,
-    /// The format files are read from, and the pipe it arrives on.
-    files: Option<(&'static str, OwnedFd)>,
+    /// Where its files are read from, if it carries any.
+    files: Option<FileSource>,
     window_id: WindowId,
     x: f64,
     y: f64,
@@ -2123,8 +2188,8 @@ fn relay_incoming_drag(drag: DragEntered, events: std::sync::mpsc::Receiver<Inco
         ctrl_tx,
     } = drag;
     let files = match files {
-        Some((mime, pipe)) => {
-            let files = read_file_offer(mime, pipe, OfferSlot::Drag);
+        Some(source) => {
+            let files = source.read(OfferSlot::Drag);
             if files.is_some() {
                 mimes.clear();
             } else {
@@ -2372,10 +2437,7 @@ impl DataDeviceHandler for ClientApp {
             offer.set_actions(DndAction::empty(), DndAction::empty());
             return;
         };
-        let files = file_mime.and_then(|mime| {
-            let pipe = offer.receive(mime.to_string()).ok()?;
-            Some((mime, OwnedFd::from(pipe)))
-        });
+        let files = FileSource::new(offer.inner(), &all_mimes, &self.conn);
         // Accepted before the remote app is known to want it: the round trip to ask would
         // lag every motion. Always a copy: a move would make the source delete the data.
         offer.accept_mime_type(offer.serial, Some(accept));
@@ -2469,8 +2531,8 @@ impl DataDeviceHandler for ClientApp {
             .iter()
             .find(|&&want| all_mimes.iter().any(|m| m == want))
             .map(|&s| s.to_string());
-        let file_mime = file_offer_mime(&all_mimes);
-        let file_pipe = file_mime.and_then(|m| offer.receive(m.to_string()).ok());
+        let file_source = FileSource::new(offer.inner(), &all_mimes, &self.conn);
+        let had_files = file_source.is_some();
         let text_pipe = text_mime.and_then(|m| offer.receive(m).ok());
         let _ = self.conn.flush();
         // Every other type is read only when a server pastes it.
@@ -2483,12 +2545,7 @@ impl DataDeviceHandler for ClientApp {
         );
         let ctrl_tx = self.ctrl_tx.clone();
         std::thread::spawn(move || {
-            let files = match (file_pipe, file_mime) {
-                (Some(pipe), Some(mime)) => {
-                    read_file_offer(mime, OwnedFd::from(pipe), OfferSlot::Clipboard)
-                }
-                _ => None,
-            };
+            let files = file_source.and_then(|source| source.read(OfferSlot::Clipboard));
             let msg = match files {
                 // Files are offered as files only: their text form (paths here) and
                 // file-list types mean nothing to the server.
@@ -2511,7 +2568,7 @@ impl DataDeviceHandler for ClientApp {
                         complete.then(|| String::from_utf8(buf).ok()).flatten()
                     });
                     let mut mimes = oriel_proto::selection::proxyable_mimes(&all_mimes);
-                    if file_mime.is_some() {
+                    if had_files {
                         // A file list that is unreadable here.
                         mimes.retain(|m| {
                             !oriel_proto::xfer::FILE_SELECTION_MIMES.contains(&m.as_str())
