@@ -563,7 +563,8 @@ async fn run_shell(
             }
             // The parent may have died before the death signal was set.
             if libc::getppid() != parent {
-                return Err(std::io::Error::other("parent exited"));
+                // No allocation here: another thread may have held the malloc lock at fork time.
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
             }
             Ok(())
         });
@@ -879,7 +880,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "helper for shell_dies_with_the_server"]
     async fn pdeathsig_helper() {
-        let dir = PathBuf::from(std::env::var_os("ORIEL_PDEATHSIG_DIR").unwrap());
+        // Does nothing under `--include-ignored`; only the parent test sets this.
+        let Some(dir) = std::env::var_os("ORIEL_PDEATHSIG_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
         let opts = Options {
             interactive_timeout: Duration::from_secs(60),
             login_timeout: Duration::from_secs(60),
