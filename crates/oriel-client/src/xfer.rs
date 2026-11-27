@@ -334,6 +334,7 @@ pub fn unmount_on_termination_signals() {
 pub fn spawn_stream_acceptor(conn: quinn::Connection) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut streams = tokio::task::JoinSet::new();
+        let conn_id = conn.stable_id();
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             streams.spawn(async move {
                 match read_bidi_stream_header(&mut recv).await {
@@ -345,7 +346,7 @@ pub fn spawn_stream_acceptor(conn: quinn::Connection) -> tokio::task::JoinHandle
                         header @ (BidiStreamHeader::FileList { .. }
                         | BidiStreamHeader::FileRead { .. }),
                     ) => {
-                        oriel_proto::xfer::serve_request(&OWNER, &header, &mut send).await;
+                        oriel_proto::xfer::serve_request(&OWNER, conn_id, &header, &mut send).await;
                     }
                     Ok(other) => debug!(?other, "ignoring unexpected stream from server"),
                     Err(err) => warn!(error = %err, "failed to read stream header from server"),

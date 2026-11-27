@@ -18,10 +18,12 @@ use anyhow::Result;
 use gtk::gdk_pixbuf::PixbufLoader;
 use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
+use oriel_proto::transfers::TransferDirection;
 use oriel_proto::{LaunchState, PortRange, RemoteAppEntry};
 
 use crate::hosts::{HostProfile, RenderScaleCap};
 use crate::pty::{available_local_terminals, terminal_basename};
+use crate::quic::TransferStatus;
 use crate::search::{self, MatchTier, SearchIndexEntry};
 use crate::session::{Changes, ConnStatus, HostEditError, SessionEvents, SessionManager};
 use crate::symbolic_icon::SymbolicIcon;
@@ -166,6 +168,106 @@ fn set_status_class(widget: &impl IsA<gtk::Widget>, class: &str) {
         }
     }
     widget.add_css_class(class);
+}
+
+/// A byte count for people ("1.2 GB").
+fn format_size(bytes: u64) -> String {
+    glib::format_size(bytes).to_string()
+}
+
+/// A transfer rate for people, in kB/s at least ("0 kB/s", "1.2 MB/s"): an idle connection
+/// still sends a few bytes of keepalives.
+fn format_rate(bytes_per_sec: u64) -> String {
+    if bytes_per_sec < 1000 {
+        "0 kB/s".to_string()
+    } else {
+        format!("{}/s", format_size(bytes_per_sec))
+    }
+}
+
+/// One file transfer's row in the programs popover, updated in place every second.
+struct TransferRow {
+    row: gtk::Box,
+    bar: gtk::ProgressBar,
+    detail: gtk::Label,
+    cancel: gtk::Button,
+}
+
+impl TransferRow {
+    fn new(id: u64, direction: TransferDirection, name: &str, target: &str) -> Self {
+        // The same arrows as the status bar's received/sent rates.
+        let (arrow, tip) = match direction {
+            TransferDirection::Incoming => ("↓", format!("From {target}")),
+            TransferDirection::Outgoing => ("↑", format!("To {target}")),
+        };
+        let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        top.append(
+            &gtk::Label::builder()
+                .label(arrow)
+                .tooltip_text(&tip)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        top.append(
+            &gtk::Label::builder()
+                .label(name)
+                .tooltip_text(name)
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                .build(),
+        );
+        let cancel = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Cancel transfer")
+            .css_classes(["flat", "circular"])
+            .build();
+        cancel.connect_clicked(move |btn| {
+            oriel_proto::transfers::cancel(id);
+            btn.set_sensitive(false);
+        });
+        top.append(&cancel);
+        let bar = gtk::ProgressBar::new();
+        let detail = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .css_classes(["dim-label", "caption", "numeric"])
+            .build();
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        row.append(&top);
+        row.append(&bar);
+        row.append(&detail);
+        Self {
+            row,
+            bar,
+            detail,
+            cancel,
+        }
+    }
+
+    fn update(&self, t: &TransferStatus) {
+        let info = &t.info;
+        self.bar.set_fraction(if info.size == 0 {
+            1.0
+        } else {
+            info.position as f64 / info.size as f64
+        });
+        if info.cancelled {
+            self.cancel.set_sensitive(false);
+        }
+        let speed = if info.cancelled {
+            "Cancelled".to_string()
+        } else if t.rate == 0 {
+            // Nothing is reading it: the app paused or is busy writing.
+            "Idle".to_string()
+        } else {
+            format_rate(t.rate)
+        };
+        self.detail.set_text(&format!(
+            "{} of {} · {speed}",
+            format_size(info.position),
+            format_size(info.size)
+        ));
+    }
 }
 
 fn status_dot() -> gtk::Label {
@@ -392,20 +494,47 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         .label("0 active")
         .css_classes(["dim-label", "numeric"])
         .build();
+    let status_xfer_lbl = gtk::Label::builder()
+        .css_classes(["numeric"])
+        .visible(false)
+        .build();
+    let status_rate_lbl = gtk::Label::builder()
+        .css_classes(["dim-label", "numeric"])
+        .tooltip_text("Network traffic: received ↓, sent ↑")
+        .visible(false)
+        .build();
     status_bar_box.append(&status_dot_lbl);
     status_bar_box.append(&status_net_lbl);
     status_bar_box.append(&status_pills_box);
+    status_bar_box.append(&status_xfer_lbl);
+    status_bar_box.append(&status_rate_lbl);
     status_bar_box.append(&status_count_lbl);
     status_bar_btn.set_child(Some(&status_bar_box));
 
     let programs_popover = gtk::Popover::new();
+    let popover_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    popover_content.set_margin_top(6);
+    popover_content.set_margin_bottom(6);
+    popover_content.set_margin_start(6);
+    popover_content.set_margin_end(6);
+    popover_content.set_width_request(340);
+    // File transfers, shown above the programs while there are any.
+    let transfers_section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    transfers_section.set_visible(false);
+    transfers_section.append(
+        &gtk::Label::builder()
+            .label("File Transfers")
+            .halign(gtk::Align::Start)
+            .css_classes(["heading"])
+            .build(),
+    );
+    let transfers_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    transfers_section.append(&transfers_list);
+    transfers_section.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     let programs_list = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    programs_list.set_margin_top(6);
-    programs_list.set_margin_bottom(6);
-    programs_list.set_margin_start(6);
-    programs_list.set_margin_end(6);
-    programs_list.set_width_request(340);
-    programs_popover.set_child(Some(&programs_list));
+    popover_content.append(&transfers_section);
+    popover_content.append(&programs_list);
+    programs_popover.set_child(Some(&popover_content));
     status_bar_btn.set_popover(Some(&programs_popover));
 
     let bottom_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -514,26 +643,32 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     });
 
     // --- Programs popover keyboard navigation ---
-    let collect_kill_buttons = |list: &gtk::Box| -> Vec<gtk::Button> {
-        let mut btns = Vec::new();
-        let mut row = list.first_child();
-        while let Some(r) = row {
-            let mut child = r.first_child();
+    // Every visible button in `root`, in order: transfer cancel buttons, then each
+    // program's reattach and close buttons.
+    fn collect_kill_buttons(root: &impl IsA<gtk::Widget>) -> Vec<gtk::Button> {
+        fn walk(w: &gtk::Widget, out: &mut Vec<gtk::Button>) {
+            if !w.is_visible() {
+                return;
+            }
+            if let Some(btn) = w.downcast_ref::<gtk::Button>() {
+                out.push(btn.clone());
+                return;
+            }
+            let mut child = w.first_child();
             while let Some(c) = child {
-                if let Ok(btn) = c.clone().downcast::<gtk::Button>() {
-                    btns.push(btn);
-                }
+                walk(&c, out);
                 child = c.next_sibling();
             }
-            row = r.next_sibling();
         }
+        let mut btns = Vec::new();
+        walk(root.upcast_ref(), &mut btns);
         btns
-    };
+    }
 
     let pop_key_ctrl = gtk::EventControllerKey::new();
     pop_key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
     pop_key_ctrl.connect_key_pressed({
-        let programs_list = programs_list.clone();
+        let popover_content = popover_content.clone();
         let programs_popover = programs_popover.clone();
         let status_bar_btn = status_bar_btn.clone();
         let window_ref = window.clone();
@@ -549,7 +684,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 || key == gdk::Key::ISO_Left_Tab
                 || (key == gdk::Key::Tab && mods.contains(gdk::ModifierType::SHIFT_MASK));
             if is_next || is_prev {
-                let btns = collect_kill_buttons(&programs_list);
+                let btns = collect_kill_buttons(&popover_content);
                 if btns.is_empty() {
                     return glib::Propagation::Stop;
                 }
@@ -688,6 +823,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     let refresh_net_status: Rc<dyn Fn()> = {
         let state = Rc::clone(&state);
         let status_net_lbl = status_net_lbl.clone();
+        let status_rate_lbl = status_rate_lbl.clone();
         let status_dot_lbl = status_dot_lbl.clone();
         let term_split = term_split.clone();
         let term_popover = term_popover.clone();
@@ -725,6 +861,20 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                     },
                 };
                 set_status_class(&status_dot_lbl, class);
+                let rates = st
+                    .sessions
+                    .active_target()
+                    .and_then(|t| st.sessions.session(t))
+                    .and_then(|s| s.rates)
+                    .filter(|_| connected);
+                if let Some((rx, tx)) = rates {
+                    status_rate_lbl.set_text(&format!(
+                        "↓ {}  ↑ {}",
+                        format_rate(rx),
+                        format_rate(tx)
+                    ));
+                }
+                status_rate_lbl.set_visible(rates.is_some());
                 status_net_lbl.set_text(&msg);
                 status_net_lbl.set_tooltip_text(Some(&msg));
                 if !connected {
@@ -870,12 +1020,63 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         })
     };
 
+    let refresh_transfers_ui: Rc<dyn Fn()> = {
+        let state = Rc::clone(&state);
+        let transfers_section = transfers_section.clone();
+        let transfers_list = transfers_list.clone();
+        let status_xfer_lbl = status_xfer_lbl.clone();
+        let rows: RefCell<HashMap<(String, u64), TransferRow>> = RefCell::default();
+        Rc::new(move || {
+            let st = state.borrow();
+            let active = st
+                .sessions
+                .active_target()
+                .and_then(|t| st.sessions.session(t).map(|s| (t, s)));
+            let transfers = active.map(|(_, s)| s.transfers.as_slice()).unwrap_or(&[]);
+            let target = active.map(|(t, _)| t).unwrap_or_default();
+            let mut rows = rows.borrow_mut();
+            // Rows are keyed by host too: switching hosts must not reuse another's rows.
+            rows.retain(|(host, id), row| {
+                let keep = host == target && transfers.iter().any(|t| t.info.id == *id);
+                if !keep {
+                    transfers_list.remove(&row.row);
+                }
+                keep
+            });
+            for t in transfers {
+                let row = rows
+                    .entry((target.to_string(), t.info.id))
+                    .or_insert_with(|| {
+                        let row =
+                            TransferRow::new(t.info.id, t.info.direction, &t.info.name, target);
+                        transfers_list.append(&row.row);
+                        row
+                    });
+                row.update(t);
+            }
+            transfers_section.set_visible(!transfers.is_empty());
+            status_xfer_lbl.set_visible(!transfers.is_empty());
+            if !transfers.is_empty() {
+                let size: u64 = transfers.iter().map(|t| t.info.size).sum();
+                let done: u64 = transfers.iter().map(|t| t.info.position).sum();
+                let percent = (done * 100).checked_div(size).unwrap_or(100);
+                let count = match transfers.len() {
+                    1 => "1 transfer".to_string(),
+                    n => format!("{n} transfers"),
+                };
+                status_xfer_lbl.set_text(&format!("{count} · {percent}%"));
+            }
+        })
+    };
+
     let refresh_status_bar: Rc<dyn Fn()> = {
         let refresh_net_status = Rc::clone(&refresh_net_status);
         let refresh_programs_ui = Rc::clone(&refresh_programs_ui);
+        let refresh_transfers_ui = Rc::clone(&refresh_transfers_ui);
         Rc::new(move || {
             refresh_net_status();
             refresh_programs_ui();
+            refresh_transfers_ui();
         })
     };
 
@@ -1076,6 +1277,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         let rebuild_grid = Rc::clone(&rebuild_grid);
         let refresh_net_status = Rc::clone(&refresh_net_status);
         let refresh_programs_ui = Rc::clone(&refresh_programs_ui);
+        let refresh_transfers_ui = Rc::clone(&refresh_transfers_ui);
         Rc::new(move |changes: Changes| {
             if changes.hosts {
                 rebuild_sidebar();
@@ -1088,6 +1290,9 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
             }
             if changes.programs {
                 refresh_programs_ui();
+            }
+            if changes.transfers {
+                refresh_transfers_ui();
             }
         })
     });

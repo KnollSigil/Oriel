@@ -276,13 +276,27 @@ pub enum LauncherNetEvent {
         name: String,
         state: LaunchState,
     },
+    /// Sent every second.
     NetStats {
         rtt_ms: u32,
         congested: bool,
+        /// Bytes per second received and sent over the connection, everything included.
+        rx_rate: u64,
+        tx_rate: u64,
+        /// File transfers over the connection, oldest first.
+        transfers: Vec<TransferStatus>,
     },
     Disconnected(Option<String>),
     /// The server closed the session because another display client took it over.
     TakenOver,
+}
+
+/// One file transfer in [`LauncherNetEvent::NetStats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferStatus {
+    pub info: oriel_proto::transfers::TransferInfo,
+    /// Bytes per second it moved over the last second.
+    pub rate: u64,
 }
 
 /// Connect to the Oriel server, verify its TLS fingerprint, and run the session loops.
@@ -461,17 +475,50 @@ pub async fn run_client(
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut prev_lost = 0u64;
+            let mut prev_bytes = (0u64, 0u64);
+            let mut prev_moved = std::collections::HashMap::<u64, u64>::new();
+            let mut prev_at = std::time::Instant::now();
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tick.tick().await;
+                let secs = prev_at.elapsed().as_secs_f64().max(0.001);
+                prev_at = std::time::Instant::now();
+                let per_sec = |delta: u64| (delta as f64 / secs) as u64;
                 let rtt_ms = stats_conn.rtt().as_millis() as u32;
-                let lost = stats_conn.stats().path.lost_packets;
+                let stats = stats_conn.stats();
+                let lost = stats.path.lost_packets;
                 let loss_delta = lost.saturating_sub(prev_lost);
                 prev_lost = lost;
                 let congested = rtt_ms > 150 || loss_delta > 5;
-                if tx
-                    .send(LauncherNetEvent::NetStats { rtt_ms, congested })
-                    .is_err()
-                {
+                let bytes = (stats.udp_rx.bytes, stats.udp_tx.bytes);
+                let rx_rate = per_sec(bytes.0.saturating_sub(prev_bytes.0));
+                let tx_rate = per_sec(bytes.1.saturating_sub(prev_bytes.1));
+                prev_bytes = bytes;
+                let transfers: Vec<TransferStatus> =
+                    oriel_proto::transfers::list(stats_conn.stable_id())
+                        .into_iter()
+                        .map(|info| {
+                            // A transfer listed for the first time counts from zero: it is
+                            // listed after its first second.
+                            let before = prev_moved.get(&info.id).copied().unwrap_or(0);
+                            let rate = per_sec(info.moved.saturating_sub(before));
+                            TransferStatus { info, rate }
+                        })
+                        .collect();
+                prev_moved = transfers
+                    .iter()
+                    .map(|t| (t.info.id, t.info.moved))
+                    .collect();
+                let event = LauncherNetEvent::NetStats {
+                    rtt_ms,
+                    congested,
+                    rx_rate,
+                    tx_rate,
+                    transfers,
+                };
+                if tx.send(event).is_err() {
                     break;
                 }
             }

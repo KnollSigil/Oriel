@@ -19,6 +19,7 @@ use fuser::{
 };
 use tracing::{debug, warn};
 
+use crate::transfers::{self, TransferDirection, TransferGuard};
 use crate::xfer::{read_frame, FileEntry, FileKind, FileListReply, FileReadReply, OfferSlot};
 use crate::{write_bidi_stream_header, BidiStreamHeader};
 
@@ -96,6 +97,8 @@ struct ReadState {
     /// Bytes `[buf_start, buf_start + buf.len())` of the file; the stream continues after.
     buf: Vec<u8>,
     buf_start: u64,
+    /// This handle's part in the transfer shown to the user.
+    transfer: TransferGuard,
 }
 
 impl XferMount {
@@ -484,6 +487,9 @@ impl ReadState {
     }
 
     async fn read(&mut self, offset: u64, size: u32) -> Result<Vec<u8>, i32> {
+        if self.transfer.is_cancelled() {
+            return Err(libc::ECANCELED);
+        }
         if offset >= self.size {
             return Ok(Vec::new());
         }
@@ -504,7 +510,10 @@ impl ReadState {
                 break;
             };
             match stream.read(&mut chunk).await.map_err(errno_from_quic)? {
-                Some(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Some(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    self.transfer.advance(0, n as u64);
+                }
                 None => {
                     // EOF before the announced size: the file shrank on the owner's side.
                     self.stream = None;
@@ -519,6 +528,7 @@ impl ReadState {
         } else {
             Vec::new()
         };
+        self.transfer.advance(have_end, 0);
         // Keep only the trailing window.
         let pos = self.stream_pos();
         if pos - self.buf_start > READ_WINDOW {
@@ -654,7 +664,16 @@ impl Filesystem for XferFs {
             return;
         };
         offer.open_files += 1;
+        let transfer = transfers::track(
+            offer.conn.stable_id(),
+            TransferDirection::Incoming,
+            offer.offer_id,
+            &path,
+            size,
+        );
+        let cancelled = transfer.cancelled();
         let read_state = ReadState {
+            transfer,
             conn: offer.conn.clone(),
             offer_id: offer.offer_id,
             path,
@@ -665,8 +684,18 @@ impl Filesystem for XferFs {
         };
         let fh = st.next_fh;
         st.next_fh += 1;
-        st.handles
-            .insert(fh, Arc::new(tokio::sync::Mutex::new(read_state)));
+        let handle = Arc::new(tokio::sync::Mutex::new(read_state));
+        // A cancel stops the stream at once, even while the app is not reading (paused).
+        let weak = Arc::downgrade(&handle);
+        self.shared.rt.spawn(async move {
+            if !cancelled.await {
+                return;
+            }
+            if let Some(handle) = weak.upgrade() {
+                handle.lock().await.stop_stream();
+            }
+        });
+        st.handles.insert(fh, handle);
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
@@ -695,7 +724,15 @@ impl Filesystem for XferFs {
         };
         self.shared.rt.spawn(async move {
             let mut rs = handle.lock().await;
-            match tokio::time::timeout(READ_DEADLINE, rs.read(offset, size)).await {
+            let cancelled = rs.transfer.cancelled();
+            let read = async {
+                tokio::select! {
+                    res = rs.read(offset, size) => res,
+                    true = cancelled => Err(libc::ECANCELED),
+                }
+            };
+            let res = tokio::time::timeout(READ_DEADLINE, read).await;
+            match res {
                 Ok(Ok(data)) => reply.data(&data),
                 Ok(Err(errno)) => {
                     rs.stop_stream();

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use oriel_proto::transfers;
 use oriel_proto::xfer::{self, OfferSlot, XferOwner};
 use oriel_proto::xfer_fuse::XferMount;
 use oriel_proto::{read_bidi_stream_header, BidiStreamHeader};
@@ -42,23 +43,19 @@ async fn quic_pair() -> (quinn::Connection, quinn::Connection) {
 
 fn serve(conn: quinn::Connection, owner: Arc<XferOwner>) {
     tokio::spawn(async move {
+        let conn_id = conn.stable_id();
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let owner = Arc::clone(&owner);
             tokio::spawn(async move {
-                let res = match read_bidi_stream_header(&mut recv).await.unwrap() {
-                    BidiStreamHeader::FileList { offer_id, path } => {
-                        xfer::serve_list(&owner, offer_id, &path, &mut send).await
-                    }
-                    BidiStreamHeader::FileRead {
-                        offer_id,
-                        path,
-                        offset,
-                    } => xfer::serve_read(&owner, offer_id, &path, offset, &mut send).await,
-                    other => panic!("unexpected header {other:?}"),
-                };
-                if res.is_ok() {
-                    let _ = send.finish();
-                }
+                let header = read_bidi_stream_header(&mut recv).await.unwrap();
+                assert!(
+                    matches!(
+                        header,
+                        BidiStreamHeader::FileList { .. } | BidiStreamHeader::FileRead { .. }
+                    ),
+                    "unexpected header {header:?}"
+                );
+                xfer::serve_request(&owner, conn_id, &header, &mut send).await;
             });
         }
     });
@@ -178,6 +175,104 @@ async fn files_stream_through_fuse() {
     .expect("read must not hang")
     .unwrap();
     assert!(res.is_err(), "read after disconnect should fail: {res:?}");
+
+    drop(mount);
+    let _ = std::fs::remove_dir_all(&mnt_dir);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// The one transfer listed for `conn`, once it has run long enough to be listed.
+async fn only_transfer(conn: &quinn::Connection) -> transfers::TransferInfo {
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let listed = transfers::list(conn.stable_id());
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    listed.into_iter().next().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfers_are_listed_and_can_be_cancelled() {
+    let src = scratch("cancel-src");
+    let len = 40 * 1024 * 1024;
+    std::fs::write(src.join("in.bin"), pattern(len, 1)).unwrap();
+    std::fs::write(src.join("out.bin"), pattern(len, 2)).unwrap();
+    let (owner_conn, reader_conn) = quic_pair().await;
+    let owner = Arc::new(XferOwner::new());
+    serve(owner_conn.clone(), Arc::clone(&owner));
+    let mnt_dir = scratch("cancel-mnt");
+    let mount = match XferMount::mount(&mnt_dir.join("xfer"), tokio::runtime::Handle::current()) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("skipping: FUSE unavailable: {err:#}");
+            return;
+        }
+    };
+    let (id, roots) = owner
+        .offer(
+            OfferSlot::Clipboard,
+            &[src.join("in.bin"), src.join("out.bin")],
+        )
+        .unwrap();
+    let paths = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id, roots);
+
+    // Start reading a file and stop, like a paused copy; returns the open file.
+    let start = |path: std::path::PathBuf| {
+        tokio::task::spawn_blocking(move || {
+            let mut f = std::fs::File::open(path).unwrap();
+            let mut buf = vec![0u8; 1024 * 1024];
+            f.read_exact(&mut buf).unwrap();
+            f
+        })
+    };
+
+    // Cancelled on the reading side: the next read fails.
+    let mut f = start(paths[0].clone()).await.unwrap();
+    let t = only_transfer(&reader_conn).await;
+    assert_eq!(t.name, "in.bin");
+    assert_eq!(t.direction, transfers::TransferDirection::Incoming);
+    assert_eq!(t.size, len as u64);
+    assert!(t.position >= 1024 * 1024, "{t:?}");
+    assert!(
+        transfers::list(owner_conn.stable_id()).len() == 1,
+        "the owner serves it"
+    );
+    assert!(transfers::cancel(t.id));
+    let (f, res) = tokio::task::spawn_blocking(move || {
+        f.seek(SeekFrom::Start(30 * 1024 * 1024)).unwrap();
+        let mut buf = [0u8; 4096];
+        let res = f.read(&mut buf);
+        (f, res)
+    })
+    .await
+    .unwrap();
+    // The page cache reports any failed read as EIO, whatever the filesystem said.
+    assert!(res.is_err(), "read after cancel should fail: {res:?}");
+    drop(f);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        transfers::list(reader_conn.stable_id()).is_empty(),
+        "closed"
+    );
+
+    // Cancelled on the serving side: the reader gets an error, not a short file.
+    let f = start(paths[1].clone()).await.unwrap();
+    let t = only_transfer(&owner_conn).await;
+    assert_eq!(t.direction, transfers::TransferDirection::Outgoing);
+    assert!(transfers::cancel(t.id));
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            let mut f = f;
+            let mut rest = Vec::new();
+            f.read_to_end(&mut rest).map(|_| rest.len())
+        }),
+    )
+    .await
+    .expect("read must not hang")
+    .unwrap();
+    assert!(
+        res.is_err(),
+        "read after the owner cancelled should fail: {res:?}"
+    );
 
     drop(mount);
     let _ = std::fs::remove_dir_all(&mnt_dir);

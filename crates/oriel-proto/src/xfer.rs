@@ -20,6 +20,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+use crate::transfers::{self, TransferDirection};
+
 /// Most roots one offer may carry.
 pub const MAX_OFFER_ROOTS: usize = 4096;
 /// Most entries one directory listing may carry; larger directories are truncated.
@@ -303,10 +305,13 @@ async fn resolve_blocking(
         .unwrap_or(Err(libc::EIO))
 }
 
-/// Serve a [`BidiStreamHeader::FileRead`](crate::BidiStreamHeader::FileRead) request:
-/// stream the file from `offset` until EOF or until the reader stops the stream.
+/// Serve a [`BidiStreamHeader::FileRead`](crate::BidiStreamHeader::FileRead) request from
+/// the peer on connection `conn` (`quinn::Connection::stable_id`): stream the file from
+/// `offset` until EOF, until the reader stops the stream, or until the user cancels the
+/// transfer (an error, so the stream is reset rather than finished short).
 pub async fn serve_read<W: AsyncWrite + Unpin>(
     owner: &Arc<XferOwner>,
+    conn: usize,
     offer_id: u64,
     path: &[String],
     offset: u64,
@@ -316,18 +321,31 @@ pub async fn serve_read<W: AsyncWrite + Unpin>(
         Ok(p) => open_regular(&p, offset).await,
         Err(errno) => Err(errno),
     };
-    let mut file = match file {
+    let (mut file, size) = match file {
         Ok(f) => f,
         Err(errno) => return write_frame(writer, &FileReadReply::Err(errno)).await,
     };
+    let transfer = transfers::track(conn, TransferDirection::Outgoing, offer_id, path, size);
+    if transfer.is_cancelled() {
+        return write_frame(writer, &FileReadReply::Err(libc::ECANCELED)).await;
+    }
     write_frame(writer, &FileReadReply::Ok).await?;
+    let cancelled = transfer.cancelled();
+    tokio::pin!(cancelled);
     let mut buf = vec![0u8; READ_CHUNK];
+    let mut position = offset;
     loop {
         let n = file.read(&mut buf).await.context("file read failed")?;
         if n == 0 {
             return Ok(());
         }
-        writer.write_all(&buf[..n]).await?;
+        // A paused reader leaves the write waiting on flow control.
+        tokio::select! {
+            res = writer.write_all(&buf[..n]) => res?,
+            true = &mut cancelled => bail!("transfer cancelled"),
+        }
+        position += n as u64;
+        transfer.advance(position, n as u64);
     }
 }
 
@@ -336,6 +354,7 @@ pub async fn serve_read<W: AsyncWrite + Unpin>(
 /// it. Returns `false` (leaving the stream alone) for any other header.
 pub async fn serve_request(
     owner: &Arc<XferOwner>,
+    conn: usize,
     header: &crate::BidiStreamHeader,
     send: &mut quinn::SendStream,
 ) -> bool {
@@ -347,7 +366,7 @@ pub async fn serve_request(
             offer_id,
             path,
             offset,
-        } => serve_read(owner, *offer_id, path, *offset, send).await,
+        } => serve_read(owner, conn, *offer_id, path, *offset, send).await,
         _ => return false,
     };
     match res {
@@ -355,12 +374,17 @@ pub async fn serve_request(
             let _ = send.finish();
         }
         // The reader stopping the stream (cancel or seek) is the normal way reads end.
-        Err(err) => tracing::debug!(error = %err, "file transfer stream ended early"),
+        // Reset rather than finish: a finished stream reads as a file that got shorter.
+        Err(err) => {
+            tracing::debug!(error = %err, "file transfer stream ended early");
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+        }
     }
     true
 }
 
-async fn open_regular(path: &Path, offset: u64) -> Result<tokio::fs::File, i32> {
+/// The regular file at `path`, positioned at `offset`, and its size.
+async fn open_regular(path: &Path, offset: u64) -> Result<(tokio::fs::File, u64), i32> {
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|e| errno_of(&e))?;
@@ -371,7 +395,7 @@ async fn open_regular(path: &Path, offset: u64) -> Result<tokio::fs::File, i32> 
     file.seek(std::io::SeekFrom::Start(offset))
         .await
         .map_err(|e| errno_of(&e))?;
-    Ok(file)
+    Ok((file, meta.len()))
 }
 
 /// Write one length-prefixed postcard frame.
@@ -619,7 +643,7 @@ mod tests {
         let owner = Arc::new(XferOwner::new());
         let (id, _) = owner.offer(OfferSlot::Clipboard, &[dir.join("f")]).unwrap();
         let mut out = Vec::new();
-        serve_read(&owner, id, &["f".to_string()], 4, &mut out)
+        serve_read(&owner, 0, id, &["f".to_string()], 4, &mut out)
             .await
             .unwrap();
         let mut cursor = std::io::Cursor::new(out);
@@ -630,7 +654,7 @@ mod tests {
         assert_eq!(rest, b"456789");
 
         let mut out = Vec::new();
-        serve_read(&owner, id, &["g".to_string()], 0, &mut out)
+        serve_read(&owner, 0, id, &["g".to_string()], 0, &mut out)
             .await
             .unwrap();
         let reply: FileReadReply = read_frame(&mut std::io::Cursor::new(out)).await.unwrap();

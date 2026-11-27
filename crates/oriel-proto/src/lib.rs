@@ -2,6 +2,7 @@
 
 pub mod selection;
 pub mod smart_tile;
+pub mod transfers;
 pub mod xfer;
 pub mod xfer_fuse;
 

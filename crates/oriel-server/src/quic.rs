@@ -498,6 +498,7 @@ fn spawn_bidi_stream_acceptor(
             let pty = Arc::clone(&pty_mgr);
             let xfer_owner = Arc::clone(&xfer_owner);
             let cmd_tx = cmd_tx.clone();
+            let conn_id = conn.stable_id();
             tokio::spawn(async move {
                 match read_bidi_stream_header(&mut recv_bi).await {
                     Ok(BidiStreamHeader::SelectionData { offer_id, mime }) => {
@@ -522,7 +523,7 @@ fn spawn_bidi_stream_acceptor(
                         header @ (BidiStreamHeader::FileList { .. }
                         | BidiStreamHeader::FileRead { .. }),
                     ) => {
-                        xfer::serve_request(&xfer_owner, &header, &mut send_bi).await;
+                        xfer::serve_request(&xfer_owner, conn_id, &header, &mut send_bi).await;
                     }
                     Ok(BidiStreamHeader::Pty {
                         pty_id,

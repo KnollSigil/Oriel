@@ -35,7 +35,7 @@ use crate::hosts::{
     ClientSettings, HostProfile, RenderScaleCap,
 };
 use crate::pty::{pty_tunnel_socket_path, spawn_local_terminal_pty_socket_with_terminal};
-use crate::quic::{self, LauncherNetEvent};
+use crate::quic::{self, LauncherNetEvent, TransferStatus};
 use crate::window::{self, ClientUiEvent};
 
 const INITIAL_RECONNECT_BACKOFF_SECS: u64 = 2;
@@ -97,6 +97,10 @@ pub struct HostSession {
     pub programs: Vec<TrackedProgram>,
     pub rtt_ms: Option<u32>,
     pub congested: bool,
+    /// Bytes per second received and sent, once measured.
+    pub rates: Option<(u64, u64)>,
+    /// File transfers over the connection, oldest first.
+    pub transfers: Vec<TransferStatus>,
     /// Reconnect automatically after an unexpected disconnect. Armed once a QUIC session
     /// is established; cleared by an explicit disconnect.
     pub auto_reconnect: bool,
@@ -127,6 +131,8 @@ impl HostSession {
         self.programs.clear();
         self.rtt_ms = None;
         self.congested = false;
+        self.rates = None;
+        self.transfers.clear();
     }
 
     /// Stop everything belonging to the current attempt and invalidate it, so late
@@ -161,6 +167,8 @@ pub struct Changes {
     pub status: bool,
     /// The active host's running programs.
     pub programs: bool,
+    /// The active host's file transfers.
+    pub transfers: bool,
 }
 
 impl Changes {
@@ -169,12 +177,14 @@ impl Changes {
         apps: false,
         status: false,
         programs: false,
+        transfers: false,
     };
     pub const ALL: Self = Self {
         hosts: true,
         apps: true,
         status: true,
         programs: true,
+        transfers: true,
     };
     const HOSTS: Self = Self {
         hosts: true,
@@ -190,6 +200,10 @@ impl Changes {
     };
     const PROGRAMS: Self = Self {
         programs: true,
+        ..Self::NONE
+    };
+    const TRANSFERS: Self = Self {
+        transfers: true,
         ..Self::NONE
     };
 
@@ -211,6 +225,7 @@ impl BitOr for Changes {
             apps: self.apps | rhs.apps,
             status: self.status | rhs.status,
             programs: self.programs | rhs.programs,
+            transfers: self.transfers | rhs.transfers,
         }
     }
 }
@@ -463,6 +478,8 @@ impl SessionManager {
                 programs: Vec::new(),
                 rtt_ms: None,
                 congested: false,
+                rates: None,
+                transfers: Vec::new(),
                 auto_reconnect: is_auto_reconnect && prev_auto,
                 attempt_id,
                 reconnect_backoff_secs: if is_auto_reconnect {
@@ -661,11 +678,24 @@ impl SessionManager {
                 track_program_state(&mut sess.programs, launch_id, name, state);
                 Changes::PROGRAMS.if_active(is_active)
             }
-            LauncherNetEvent::NetStats { rtt_ms, congested } => {
-                let changed = sess.rtt_ms != Some(rtt_ms) || sess.congested != congested;
+            LauncherNetEvent::NetStats {
+                rtt_ms,
+                congested,
+                rx_rate,
+                tx_rate,
+                transfers,
+            } => {
+                let changed = sess.rtt_ms != Some(rtt_ms)
+                    || sess.congested != congested
+                    || sess.rates != Some((rx_rate, tx_rate));
                 sess.rtt_ms = Some(rtt_ms);
                 sess.congested = congested;
-                Changes::STATUS.if_active(is_active && changed)
+                sess.rates = Some((rx_rate, tx_rate));
+                let transfers_changed = sess.transfers != transfers;
+                sess.transfers = transfers;
+                let status = Changes::STATUS.if_active(is_active && changed);
+                let transfers = Changes::TRANSFERS.if_active(is_active && transfers_changed);
+                status | transfers
             }
             LauncherNetEvent::Connected
             | LauncherNetEvent::Disconnected(_)
@@ -1381,6 +1411,9 @@ mod tests {
         let stats = LauncherNetEvent::NetStats {
             rtt_ms: 10,
             congested: false,
+            rx_rate: 0,
+            tx_rate: 0,
+            transfers: Vec::new(),
         };
         assert_eq!(mgr.handle_event(net("b@h", attempt, stats)), Changes::NONE);
         let dc = LauncherNetEvent::Disconnected(None);
