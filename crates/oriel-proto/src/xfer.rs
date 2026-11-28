@@ -339,10 +339,14 @@ pub async fn serve_read<W: AsyncWrite + Unpin>(
         if n == 0 {
             return Ok(());
         }
-        // A paused reader leaves the write waiting on flow control.
+        if transfer.is_cancelled() {
+            bail!("transfer cancelled");
+        }
+        // A paused reader leaves the write waiting on flow control. A cancel comes first.
         tokio::select! {
-            res = writer.write_all(&buf[..n]) => res?,
+            biased;
             true = &mut cancelled => bail!("transfer cancelled"),
+            res = writer.write_all(&buf[..n]) => res?,
         }
         position += n as u64;
         transfer.advance(position, n as u64);

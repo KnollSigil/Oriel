@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current protocol version, sent in the control-stream preamble.
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Whether `layout` is a plausible GNOME `button-layout` (e.g. `appmenu:minimize,maximize,close`,
 /// or `close,minimize` with no `:` for left-side buttons only) for
@@ -595,6 +595,14 @@ pub enum ControlMessage {
     /// after the program's [`ControlMessage::AppState`]. Windows that no launch claims are
     /// listed as programs of their own instead ([`WINDOW_LAUNCH_ID_BASE`]).
     AppWindow { launch_id: u64, window_id: WindowId },
+    /// Client -> Server: hold (`paused`) or release the server's reads of file `path` of
+    /// offer `offer_id`, which the client offered. Reads must be paused where they happen:
+    /// a reader waiting on a sender that stopped would time out.
+    PauseTransfer {
+        offer_id: u64,
+        path: Vec<String>,
+        paused: bool,
+    },
     /// Client -> Server: terminate a launched remote application (`SIGTERM`, or `SIGKILL` if `force`).
     TerminateApp { launch_id: u64, force: bool },
     /// Client -> Server: XDG `org.freedesktop.appearance` `color-scheme` preference

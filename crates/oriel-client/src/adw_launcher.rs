@@ -12,6 +12,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use anyhow::Result;
@@ -201,10 +202,32 @@ struct TransferRow {
     row: gtk::Box,
     bar: gtk::ProgressBar,
     detail: gtk::Label,
+    pause: gtk::Button,
+    /// Whether the transfer is paused, as last reported or requested.
+    paused: Rc<Cell<bool>>,
+    /// The state last asked for with the button, and when: stats taken before the click
+    /// may still report the old one for a moment.
+    requested: Rc<Cell<Option<(bool, Instant)>>>,
     cancel: gtk::Button,
 }
 
+/// How long a click's state wins over reported stats that disagree with it.
+const PAUSE_REQUEST_GRACE: Duration = Duration::from_secs(3);
+
+/// Show `btn` as the control that toggles a transfer to the other state.
+fn set_pause_button(btn: &gtk::Button, paused: bool) {
+    if paused {
+        btn.set_icon_name("media-playback-start-symbolic");
+        btn.set_tooltip_text(Some("Resume transfer"));
+    } else {
+        btn.set_icon_name("media-playback-pause-symbolic");
+        btn.set_tooltip_text(Some("Pause transfer"));
+    }
+}
+
 impl TransferRow {
+    /// A row for transfer `id` of `name` with host `target`, with buttons that pause,
+    /// resume and cancel it.
     fn new(id: u64, direction: TransferDirection, name: &str, target: &str) -> Self {
         // The same arrows as the status bar's received/sent rates.
         let (arrow, tip) = match direction {
@@ -228,14 +251,61 @@ impl TransferRow {
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .build(),
         );
+        let paused = Rc::new(Cell::new(false));
+        let requested = Rc::new(Cell::new(None));
+        let pause = gtk::Button::builder()
+            .css_classes(["flat", "circular"])
+            .build();
+        set_pause_button(&pause, false);
+        pause.connect_clicked({
+            let paused = Rc::clone(&paused);
+            let requested = Rc::clone(&requested);
+            move |btn| {
+                let want = !paused.get();
+                // An outgoing transfer is paused on the server: the request is queued for
+                // the connection, in order with the resume sent if it ends meanwhile.
+                if oriel_proto::transfers::set_paused(id, want) {
+                    paused.set(want);
+                    requested.set(Some((want, Instant::now())));
+                    set_pause_button(btn, want);
+                }
+            }
+        });
+        top.append(&pause);
         let cancel = gtk::Button::builder()
             .icon_name("window-close-symbolic")
             .tooltip_text("Cancel transfer")
             .css_classes(["flat", "circular"])
             .build();
-        cancel.connect_clicked(move |btn| {
-            oriel_proto::transfers::cancel(id);
-            btn.set_sensitive(false);
+        cancel.connect_clicked({
+            let pause = pause.clone();
+            move |btn| {
+                oriel_proto::transfers::cancel(id);
+                if btn.has_focus() {
+                    // Keep keyboard focus in the popover's button ring: move it on to the
+                    // next button before this one and pause turn insensitive.
+                    let content = btn
+                        .ancestor(gtk::Popover::static_type())
+                        .and_then(|p| p.downcast::<gtk::Popover>().ok())
+                        .and_then(|p| p.child());
+                    if let Some(content) = content {
+                        let btns = collect_kill_buttons(&content);
+                        let here = btns.iter().position(|b| b == btn).unwrap_or(0);
+                        let next = btns
+                            .iter()
+                            .cycle()
+                            .skip(here + 1)
+                            .take(btns.len())
+                            .find(|b| *b != btn && **b != pause);
+                        if let Some(next) = next {
+                            next.grab_focus();
+                        }
+                    }
+                }
+                btn.set_sensitive(false);
+                // A cancelled transfer cannot be paused (its readers are being let go).
+                pause.set_sensitive(false);
+            }
         });
         top.append(&cancel);
         let bar = gtk::ProgressBar::new();
@@ -251,6 +321,9 @@ impl TransferRow {
             row,
             bar,
             detail,
+            pause,
+            paused,
+            requested,
             cancel,
         }
     }
@@ -264,9 +337,24 @@ impl TransferRow {
         });
         if info.cancelled {
             self.cancel.set_sensitive(false);
+            self.pause.set_sensitive(false);
+        }
+        // Stats taken just before a click may still report the old state.
+        let paused = match self.requested.get() {
+            Some((want, at)) if want != info.paused && at.elapsed() < PAUSE_REQUEST_GRACE => want,
+            _ => {
+                self.requested.set(None);
+                info.paused
+            }
+        };
+        if self.paused.get() != paused {
+            self.paused.set(paused);
+            set_pause_button(&self.pause, paused);
         }
         let speed = if info.cancelled {
             "Cancelled".to_string()
+        } else if paused {
+            "Paused".to_string()
         } else if t.rate == 0 {
             // Nothing is reading it: the app paused or is busy writing.
             "Idle".to_string()
@@ -279,6 +367,29 @@ impl TransferRow {
             format_size(info.size)
         ));
     }
+}
+
+/// Every visible, sensitive button in `root`, in order: each transfer's pause and cancel
+/// buttons, then each program's reattach and close buttons. Insensitive ones (a
+/// cancelled transfer's) are skipped: focus cannot land on them.
+fn collect_kill_buttons(root: &impl IsA<gtk::Widget>) -> Vec<gtk::Button> {
+    fn walk(w: &gtk::Widget, out: &mut Vec<gtk::Button>) {
+        if !w.is_visible() || !w.is_sensitive() {
+            return;
+        }
+        if let Some(btn) = w.downcast_ref::<gtk::Button>() {
+            out.push(btn.clone());
+            return;
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            walk(&c, out);
+            child = c.next_sibling();
+        }
+    }
+    let mut btns = Vec::new();
+    walk(root.upcast_ref(), &mut btns);
+    btns
 }
 
 fn status_dot() -> gtk::Label {
@@ -669,28 +780,6 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
     });
 
     // --- Programs popover keyboard navigation ---
-    // Every visible button in `root`, in order: transfer cancel buttons, then each
-    // program's reattach and close buttons.
-    fn collect_kill_buttons(root: &impl IsA<gtk::Widget>) -> Vec<gtk::Button> {
-        fn walk(w: &gtk::Widget, out: &mut Vec<gtk::Button>) {
-            if !w.is_visible() {
-                return;
-            }
-            if let Some(btn) = w.downcast_ref::<gtk::Button>() {
-                out.push(btn.clone());
-                return;
-            }
-            let mut child = w.first_child();
-            while let Some(c) = child {
-                walk(&c, out);
-                child = c.next_sibling();
-            }
-        }
-        let mut btns = Vec::new();
-        walk(root.upcast_ref(), &mut btns);
-        btns
-    }
-
     let pop_key_ctrl = gtk::EventControllerKey::new();
     pop_key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
     pop_key_ctrl.connect_key_pressed({
@@ -924,6 +1013,21 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
         let toasts = toasts.clone();
 
         Rc::new(move || {
+            // Focus on a program's button is lost when the list is rebuilt: put it back on
+            // the first one below. Focus elsewhere (a transfer's buttons) stays put.
+            let focus_in_list = programs_popover.is_visible() && {
+                // The focused widget inside the popover, down its focus-child chain.
+                let mut w = programs_popover.focus_child();
+                let mut inside = false;
+                while let Some(cur) = w {
+                    if cur == *programs_list.upcast_ref::<gtk::Widget>() {
+                        inside = true;
+                        break;
+                    }
+                    w = cur.focus_child();
+                }
+                inside
+            };
             while let Some(c) = status_pills_box.first_child() {
                 status_pills_box.remove(&c);
             }
@@ -1051,7 +1155,7 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                         .css_classes(["dim-label"])
                         .build(),
                 );
-            } else if programs_popover.is_visible() && programs_popover.focus_child().is_some() {
+            } else if focus_in_list {
                 if let Some(first) = collect_kill_buttons(&programs_list).into_iter().next() {
                     first.grab_focus();
                 }
@@ -1129,16 +1233,24 @@ fn build_ui(app: &adw::Application, cli_max_scale: Option<RenderScaleCap>) {
                 row.update(t);
             }
             transfers_section.set_visible(!transfers.is_empty());
-            status_xfer_lbl.set_visible(!transfers.is_empty());
-            if !transfers.is_empty() {
-                let size: u64 = transfers.iter().map(|t| t.info.size).sum();
-                let done: u64 = transfers.iter().map(|t| t.info.position).sum();
+            // The summary leaves out cancelled transfers (listed while their readers close):
+            // they never complete.
+            let active: Vec<_> = transfers.iter().filter(|t| !t.info.cancelled).collect();
+            status_xfer_lbl.set_visible(!active.is_empty());
+            if !active.is_empty() {
+                let size: u64 = active.iter().map(|t| t.info.size).sum();
+                let done: u64 = active.iter().map(|t| t.info.position).sum();
                 let percent = (done * 100).checked_div(size).unwrap_or(100);
-                let count = match transfers.len() {
+                let count = match active.len() {
                     1 => "1 transfer".to_string(),
                     n => format!("{n} transfers"),
                 };
-                status_xfer_lbl.set_text(&format!("{count} · {percent}%"));
+                let paused = if active.iter().all(|t| t.info.paused) {
+                    " · paused"
+                } else {
+                    ""
+                };
+                status_xfer_lbl.set_text(&format!("{count} · {percent}%{paused}"));
             }
         })
     };

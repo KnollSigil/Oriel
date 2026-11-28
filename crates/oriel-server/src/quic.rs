@@ -357,6 +357,8 @@ pub async fn run_server(
 
 async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<()> {
     let conn = incoming.await.context("QUIC handshake failed")?;
+    // Forget the connection's cancelled and paused files however this returns.
+    let _forget_transfers = oriel_proto::transfers::ConnectionGuard::new(conn.stable_id());
     let remote = conn.remote_address();
     info!(%remote, "QUIC peer connected");
 
@@ -1016,6 +1018,15 @@ async fn run_display_session(
                     }
                     Some(ControlMessage::LaunchApp { launch_id, name, exec }) => {
                         let _ = cmd_tx.send(CompositorCommand::LaunchApp { launch_id, name, exec });
+                    }
+                    Some(ControlMessage::PauseTransfer { offer_id, path, paused }) => {
+                        // The client's file, read through this server's transfer mount.
+                        let file = oriel_proto::transfers::TransferFile {
+                            direction: oriel_proto::transfers::TransferDirection::Incoming,
+                            offer_id,
+                            path,
+                        };
+                        oriel_proto::transfers::set_paused_file(conn.stable_id(), &file, paused);
                     }
                     Some(ControlMessage::TerminateApp { launch_id, force }) => {
                         if (launch_id & PTY_LAUNCH_ID_BASE) != 0 {

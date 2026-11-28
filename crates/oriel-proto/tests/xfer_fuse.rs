@@ -81,6 +81,7 @@ async fn files_stream_through_fuse() {
     std::fs::write(src.join("tree/sub/b.txt"), b"beta").unwrap();
 
     let (owner_conn, reader_conn) = quic_pair().await;
+    let _live = live(&owner_conn, &reader_conn);
     let owner = Arc::new(XferOwner::new());
     serve(owner_conn, Arc::clone(&owner));
 
@@ -182,6 +183,31 @@ async fn files_stream_through_fuse() {
 }
 
 /// The one transfer listed for `conn`, once it has run long enough to be listed.
+/// Keep both connections' cancels and pauses remembered, as their handlers do.
+fn live(
+    a: &quinn::Connection,
+    b: &quinn::Connection,
+) -> (transfers::ConnectionGuard, transfers::ConnectionGuard) {
+    (
+        transfers::ConnectionGuard::new(a.stable_id()),
+        transfers::ConnectionGuard::new(b.stable_id()),
+    )
+}
+
+/// Deliver the owner's queued pause requests to the reader, as `PauseTransfer` does.
+fn deliver_requests(owner_conn: &quinn::Connection, reader_conn: &quinn::Connection) -> usize {
+    let requests = transfers::take_peer_requests(owner_conn.stable_id());
+    for r in &requests {
+        let file = transfers::TransferFile {
+            direction: transfers::TransferDirection::Incoming,
+            offer_id: r.offer_id,
+            path: r.path.clone(),
+        };
+        transfers::set_paused_file(reader_conn.stable_id(), &file, r.paused);
+    }
+    requests.len()
+}
+
 async fn only_transfer(conn: &quinn::Connection) -> transfers::TransferInfo {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let listed = transfers::list(conn.stable_id());
@@ -196,6 +222,7 @@ async fn transfers_are_listed_and_can_be_cancelled() {
     std::fs::write(src.join("in.bin"), pattern(len, 1)).unwrap();
     std::fs::write(src.join("out.bin"), pattern(len, 2)).unwrap();
     let (owner_conn, reader_conn) = quic_pair().await;
+    let _live = live(&owner_conn, &reader_conn);
     let owner = Arc::new(XferOwner::new());
     serve(owner_conn.clone(), Arc::clone(&owner));
     let mnt_dir = scratch("cancel-mnt");
@@ -274,6 +301,361 @@ async fn transfers_are_listed_and_can_be_cancelled() {
         "read after the owner cancelled should fail: {res:?}"
     );
 
+    drop(mount);
+    let _ = std::fs::remove_dir_all(&mnt_dir);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_transfers_hold_reads_and_stop_the_sender() {
+    let src = scratch("pause-src");
+    let len = 64 * 1024 * 1024;
+    let data = pattern(len, 9);
+    std::fs::write(src.join("p.bin"), &data).unwrap();
+    let (owner_conn, reader_conn) = quic_pair().await;
+    let _live = live(&owner_conn, &reader_conn);
+    let owner = Arc::new(XferOwner::new());
+    serve(owner_conn.clone(), Arc::clone(&owner));
+    let mnt_dir = scratch("pause-mnt");
+    let mount = match XferMount::mount(&mnt_dir.join("xfer"), tokio::runtime::Handle::current()) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("skipping: FUSE unavailable: {err:#}");
+            return;
+        }
+    };
+    let (id, roots) = owner
+        .offer(OfferSlot::Clipboard, &[src.join("p.bin")])
+        .unwrap();
+    let path = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id, roots)[0].clone();
+    let f = tokio::task::spawn_blocking(move || {
+        let mut f = std::fs::File::open(path).unwrap();
+        let mut buf = vec![0u8; 1024 * 1024];
+        f.read_exact(&mut buf).unwrap();
+        f
+    })
+    .await
+    .unwrap();
+    let t = only_transfer(&reader_conn).await;
+    assert!(transfers::set_paused(t.id, true));
+    assert!(transfers::list(reader_conn.stable_id())[0].paused);
+
+    // A read past what is cached waits instead of failing.
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    let expect = data[40 * 1024 * 1024..40 * 1024 * 1024 + 4096].to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut f = f;
+        f.seek(SeekFrom::Start(40 * 1024 * 1024)).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let res = f.read_exact(&mut buf).map(|()| buf);
+        let _ = done_tx.send(res);
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let sent = owner_conn.stats().udp_tx.bytes;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the read must wait while paused"
+    );
+    let idle = owner_conn.stats().udp_tx.bytes - sent;
+    assert!(
+        idle < 256 * 1024,
+        "the sender kept sending while paused: {idle} bytes"
+    );
+
+    assert!(transfers::set_paused(t.id, false));
+    let got = tokio::time::timeout(Duration::from_secs(10), done_rx)
+        .await
+        .expect("the read must finish once resumed")
+        .unwrap()
+        .unwrap();
+    assert!(got == expect, "wrong data after resuming");
+
+    drop(mount);
+    let _ = std::fs::remove_dir_all(&mnt_dir);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// The owner cancels a transfer that its peer holds paused (what the launcher does for an
+/// outgoing transfer): once the peer resumes, its waiting read fails instead of hanging,
+/// and reopening the file fails too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_transfer_paused_by_the_reader_ends_its_reads() {
+    let src = scratch("pause-cancel-src");
+    let len = 64 * 1024 * 1024;
+    std::fs::write(src.join("pc.bin"), pattern(len, 11)).unwrap();
+    let (owner_conn, reader_conn) = quic_pair().await;
+    let _live = live(&owner_conn, &reader_conn);
+    let owner = Arc::new(XferOwner::new());
+    serve(owner_conn.clone(), Arc::clone(&owner));
+    let mnt_dir = scratch("pause-cancel-mnt");
+    let mount = match XferMount::mount(&mnt_dir.join("xfer"), tokio::runtime::Handle::current()) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("skipping: FUSE unavailable: {err:#}");
+            return;
+        }
+    };
+    let (id, roots) = owner
+        .offer(OfferSlot::Clipboard, &[src.join("pc.bin")])
+        .unwrap();
+    let path = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id, roots)[0].clone();
+    let reopen = path.clone();
+    let f = tokio::task::spawn_blocking(move || {
+        let mut f = std::fs::File::open(path).unwrap();
+        let mut buf = vec![0u8; 1024 * 1024];
+        f.read_exact(&mut buf).unwrap();
+        f
+    })
+    .await
+    .unwrap();
+    let outgoing = only_transfer(&owner_conn).await;
+    let incoming = only_transfer(&reader_conn).await;
+    // The owner pauses it: the reader is asked to hold its reads.
+    assert!(transfers::set_paused(outgoing.id, true));
+    assert_eq!(deliver_requests(&owner_conn, &reader_conn), 1);
+    assert!(transfers::list(reader_conn.stable_id())[0].paused);
+    assert_eq!(transfers::list(reader_conn.stable_id())[0].id, incoming.id);
+
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let mut f = f;
+        f.seek(SeekFrom::Start(40 * 1024 * 1024)).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = done_tx.send(f.read_exact(&mut buf).is_err());
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the read must wait while paused"
+    );
+
+    // The owner cancels, which asks the reader to resume.
+    assert!(transfers::cancel(outgoing.id));
+    assert_eq!(deliver_requests(&owner_conn, &reader_conn), 1);
+    let failed = tokio::time::timeout(Duration::from_secs(10), done_rx)
+        .await
+        .expect("the held read must end once resumed after the cancel")
+        .unwrap();
+    assert!(failed, "the read must fail after the cancel");
+    let reread = tokio::task::spawn_blocking(move || {
+        // Past anything the page cache holds from before the cancel.
+        let mut f = std::fs::File::open(reopen)?;
+        f.seek(SeekFrom::Start(50 * 1024 * 1024))?;
+        let mut buf = vec![0u8; 4096];
+        f.read_exact(&mut buf)
+    })
+    .await
+    .unwrap();
+    assert!(reread.is_err(), "a reopened cancelled file must not read");
+
+    drop(mount);
+    let _ = std::fs::remove_dir_all(&mnt_dir);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// A reader held by a paused transfer can be killed, and its held request then ends with
+/// the transfer; unmounting lets held reads go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_readers_can_be_killed() {
+    let src = scratch("pause-kill-src");
+    std::fs::write(src.join("k.bin"), pattern(16 * 1024 * 1024, 13)).unwrap();
+    let (owner_conn, reader_conn) = quic_pair().await;
+    let _live = live(&owner_conn, &reader_conn);
+    let owner = Arc::new(XferOwner::new());
+    serve(owner_conn.clone(), Arc::clone(&owner));
+    let mnt_dir = scratch("pause-kill-mnt");
+    let mount = match XferMount::mount(&mnt_dir.join("xfer"), tokio::runtime::Handle::current()) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("skipping: FUSE unavailable: {err:#}");
+            return;
+        }
+    };
+    let (id, roots) = owner
+        .offer(OfferSlot::Clipboard, &[src.join("k.bin")])
+        .unwrap();
+    let path = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id, roots)[0].clone();
+    // Pause the file before anything reads it, as the peer's request would.
+    let file = transfers::TransferFile {
+        direction: transfers::TransferDirection::Incoming,
+        offer_id: id,
+        path: vec!["k.bin".to_string()],
+    };
+    transfers::set_paused_file(reader_conn.stable_id(), &file, true);
+
+    let mut dd = std::process::Command::new("dd")
+        .arg(format!("if={}", path.display()))
+        .args(["of=/dev/null", "bs=1M", "count=1"])
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(dd.try_wait().unwrap().is_none(), "the read must be held");
+    dd.kill().unwrap();
+    let start = std::time::Instant::now();
+    let status = tokio::task::spawn_blocking(move || dd.wait().unwrap())
+        .await
+        .unwrap();
+    assert!(!status.success());
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "a killed reader must not wait for the resume: {:?}",
+        start.elapsed()
+    );
+    // Nor must its held request keep the transfer alive (listed, paused, forever).
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while transfers::list(reader_conn.stable_id())
+        .iter()
+        .any(|t| t.name == "k.bin")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the killed reader's transfer is still listed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The pause ended with that transfer: nothing was left listed to resume it from.
+    assert!(transfers::list(reader_conn.stable_id()).is_empty());
+    // Another held reader is let go by the unmount.
+    transfers::set_paused_file(reader_conn.stable_id(), &file, true);
+    let mut dd = std::process::Command::new("dd")
+        .arg(format!("if={}", path.display()))
+        .args(["of=/dev/null", "bs=1M", "count=1"])
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(dd.try_wait().unwrap().is_none(), "the read must be held");
+    let unmounted = tokio::task::spawn_blocking(move || drop(mount));
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || dd.wait().unwrap()),
+    )
+    .await
+    .expect("unmounting must let the held read go")
+    .unwrap();
+    assert!(!status.success());
+    tokio::time::timeout(Duration::from_secs(5), unmounted)
+        .await
+        .expect("the unmount must finish")
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&mnt_dir);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// A read held by a pause is let go when the connection closes: nobody is left to resume it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_reads_end_when_the_connection_closes() {
+    let src = scratch("pause-close-src");
+    std::fs::write(src.join("c.bin"), pattern(16 * 1024 * 1024, 17)).unwrap();
+    let (owner_conn, reader_conn) = quic_pair().await;
+    let _live = live(&owner_conn, &reader_conn);
+    let owner = Arc::new(XferOwner::new());
+    serve(owner_conn.clone(), Arc::clone(&owner));
+    let mnt_dir = scratch("pause-close-mnt");
+    let mount = match XferMount::mount(&mnt_dir.join("xfer"), tokio::runtime::Handle::current()) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("skipping: FUSE unavailable: {err:#}");
+            return;
+        }
+    };
+    let (id, roots) = owner
+        .offer(OfferSlot::Clipboard, &[src.join("c.bin")])
+        .unwrap();
+    let path = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id, roots)[0].clone();
+    let file = transfers::TransferFile {
+        direction: transfers::TransferDirection::Incoming,
+        offer_id: id,
+        path: vec!["c.bin".to_string()],
+    };
+    transfers::set_paused_file(reader_conn.stable_id(), &file, true);
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let res = std::fs::File::open(path).and_then(|mut f| {
+            let mut buf = vec![0u8; 4096];
+            f.read_exact(&mut buf)
+        });
+        let _ = done_tx.send(res.is_err());
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(done_rx.try_recv().is_err(), "the read must be held");
+    reader_conn.close(0u32.into(), b"gone");
+    let failed = tokio::time::timeout(Duration::from_secs(5), done_rx)
+        .await
+        .expect("closing the connection must let the held read go")
+        .unwrap();
+    assert!(failed);
+    drop(mount);
+    let _ = std::fs::remove_dir_all(&mnt_dir);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Reads held by paused transfers must not hold up other transfers on the same mount (the
+/// kernel limits a mount's outstanding background reads, such as readahead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_files_do_not_stall_other_reads() {
+    const PAUSED: usize = 16;
+    let src = scratch("pause-many-src");
+    for i in 0..=PAUSED {
+        std::fs::write(
+            src.join(format!("m{i}.bin")),
+            pattern(4 * 1024 * 1024, i as u8),
+        )
+        .unwrap();
+    }
+    let (owner_conn, reader_conn) = quic_pair().await;
+    let _live = live(&owner_conn, &reader_conn);
+    let owner = Arc::new(XferOwner::new());
+    serve(owner_conn.clone(), Arc::clone(&owner));
+    let mnt_dir = scratch("pause-many-mnt");
+    let mount = match XferMount::mount(&mnt_dir.join("xfer"), tokio::runtime::Handle::current()) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("skipping: FUSE unavailable: {err:#}");
+            return;
+        }
+    };
+    let files: Vec<_> = (0..=PAUSED)
+        .map(|i| src.join(format!("m{i}.bin")))
+        .collect();
+    let (id, roots) = owner.offer(OfferSlot::Clipboard, &files).unwrap();
+    let paths = mount.add_offer(reader_conn.clone(), OfferSlot::Clipboard, id, roots);
+    let mut readers = Vec::new();
+    for (i, path) in paths.iter().take(PAUSED).enumerate() {
+        let file = transfers::TransferFile {
+            direction: transfers::TransferDirection::Incoming,
+            offer_id: id,
+            path: vec![format!("m{i}.bin")],
+        };
+        transfers::set_paused_file(reader_conn.stable_id(), &file, true);
+        // Buffered sequential reads: the kernel adds readahead, sent in the background.
+        readers.push(
+            std::process::Command::new("dd")
+                .arg(format!("if={}", path.display()))
+                .args(["of=/dev/null", "bs=64K"])
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let free = paths[PAUSED].clone();
+    let expect = pattern(4 * 1024 * 1024, PAUSED as u8);
+    let got = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || std::fs::read(free).unwrap()),
+    )
+    .await
+    .expect("an unpaused file must read while others are paused")
+    .unwrap();
+    assert!(got == expect);
+    for mut r in readers {
+        let _ = r.kill();
+        let _ = r.wait();
+    }
     drop(mount);
     let _ = std::fs::remove_dir_all(&mnt_dir);
     let _ = std::fs::remove_dir_all(&src);

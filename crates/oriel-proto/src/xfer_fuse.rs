@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use fuser::{
     AccessFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyXattr, Request,
+    INodeNo, KernelConfig, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyXattr, Request,
 };
 use tracing::{debug, warn};
 
@@ -54,6 +54,8 @@ struct Shared {
     uid: u32,
     gid: u32,
     state: Mutex<State>,
+    /// Set when unmounting: reads held by a paused transfer are let go.
+    closing: tokio::sync::watch::Sender<bool>,
 }
 
 struct State {
@@ -101,6 +103,13 @@ struct ReadState {
     transfer: TransferGuard,
 }
 
+impl Drop for XferMount {
+    fn drop(&mut self) {
+        // Before the session unmounts: a held read would keep the unmount waiting.
+        self.shared.closing.send_replace(true);
+    }
+}
+
 impl XferMount {
     /// Mount an empty transfer filesystem at `mountpoint` (created if missing). A stale
     /// mount left behind by a crashed process is unmounted first.
@@ -135,6 +144,7 @@ impl XferMount {
                 offers: HashMap::new(),
                 handles: HashMap::new(),
             }),
+            closing: tokio::sync::watch::channel(false).0,
         });
         let mut config = Config::default();
         config.mount_options = vec![
@@ -167,6 +177,7 @@ impl XferMount {
 
     /// Unmount now (also done on drop). Later offers resolve to paths that don't exist.
     pub fn unmount(&self) {
+        self.shared.closing.send_replace(true);
         let session = self.session.lock().unwrap().take();
         if let Some(session) = session {
             if let Err(err) = session.umount_and_join() {
@@ -540,6 +551,85 @@ impl ReadState {
     }
 }
 
+/// The process whose thread `tid` made a request, looked up while the request is new: a
+/// thread can end before its request does (readahead, short-lived worker threads), and
+/// only its process ending says the reader is gone.
+fn requester(tid: u32) -> Option<(u32, u32)> {
+    if tid == 0 || !pids_resolvable() {
+        // Not a process's request, or one we cannot look up.
+        return None;
+    }
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    let tgid = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Tgid:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((tid, tgid))
+}
+
+/// Resolves once the process that made a request (see [`requester`]) is gone or being
+/// killed (a fatal signal is turned into SIGKILL for every thread of the process); never
+/// for an unknown requester. Checked every half second.
+async fn being_killed(requester: Option<(u32, u32)>) {
+    let Some((tid, tgid)) = requester else {
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let state = match kill_state(tid) {
+            // The thread ended; its process may live on.
+            KillState::Gone => kill_state(tgid),
+            state => state,
+        };
+        if state != KillState::Alive {
+            return;
+        }
+    }
+}
+
+/// Whether the pids FUSE reports are ours to look up in `/proc`. In a Flatpak sandbox the
+/// mount is made by the host's fusermount3 (see `packaging/flatpak/fusermount3-wrapper.sh`),
+/// so FUSE reports host pids, which the sandbox's `/proc` does not show (or shows as other
+/// processes).
+fn pids_resolvable() -> bool {
+    static RESOLVABLE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !Path::new("/.flatpak-info").exists());
+    *RESOLVABLE
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KillState {
+    Alive,
+    /// SIGKILL is pending.
+    Killed,
+    Gone,
+}
+
+/// Thread or process `id`'s state, from `/proc/<id>/status`. A status that cannot be read
+/// for another reason than its absence (a restricted `/proc`) counts as alive.
+fn kill_state(id: u32) -> KillState {
+    let status = match std::fs::read_to_string(format!("/proc/{id}/status")) {
+        Ok(status) => status,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return KillState::Gone,
+        Err(_) => return KillState::Alive,
+    };
+    let kill_bit = 1u64 << (libc::SIGKILL - 1);
+    let killed = status.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        (name == "SigPnd" || name == "ShdPnd")
+            && u64::from_str_radix(value.trim(), 16).is_ok_and(|v| v & kill_bit != 0)
+    });
+    if killed {
+        KillState::Killed
+    } else {
+        KillState::Alive
+    }
+}
+
 impl Drop for ReadState {
     fn drop(&mut self) {
         self.stop_stream();
@@ -594,7 +684,24 @@ async fn ensure_listed(shared: &Shared, ino: u64) -> Result<(), i32> {
     Ok(())
 }
 
+/// The mount's limit on outstanding background requests (readahead), 12 by default. Each
+/// file of a paused transfer keeps its readers' requests outstanding (held), and at the
+/// limit the kernel queues every other file's readahead behind them. The kernel caps it
+/// for unprivileged mounts (`max_user_bgreq`, thousands by default).
+const MAX_BACKGROUND: u16 = 1024;
+
 impl Filesystem for XferFs {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Congestion only slows the kernel's own writeback: keep the default 3/4.
+        if let Err(max) = config.set_max_background(MAX_BACKGROUND) {
+            warn!(
+                max,
+                "cannot raise the transfer mount's background request limit"
+            );
+        }
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let shared = Arc::clone(&self.shared);
         let parent = parent.0;
@@ -701,8 +808,8 @@ impl Filesystem for XferFs {
 
     fn read(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -710,20 +817,55 @@ impl Filesystem for XferFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let handle = self
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .handles
-            .get(&fh.0)
-            .cloned();
+        let (handle, conn) = {
+            let st = self.shared.state.lock().unwrap();
+            let conn = st
+                .nodes
+                .get(&ino.0)
+                .and_then(|n| st.offers.get(&n.offer_dir))
+                .map(|o| o.conn.clone());
+            (st.handles.get(&fh.0).cloned(), conn)
+        };
         let Some(handle) = handle else {
             reply.error(Errno::EBADF);
             return;
         };
+        let requester = requester(req.pid());
+        let mut closing = self.shared.closing.subscribe();
         self.shared.rt.spawn(async move {
-            let mut rs = handle.lock().await;
+            // A paused transfer holds the read here, outside the deadline: pausing must not
+            // turn into an error. Reads of the same handle queue behind this one's lock,
+            // and are held the same way. fuser ignores FUSE_INTERRUPT, so a reader killed
+            // meanwhile would leave the request (and the transfer, listed as paused) held
+            // forever: let it go once its reader is being killed or gone, when the
+            // connection closes (nobody is left to resume it), or when unmounting.
+            let acquire = async {
+                let rs = Arc::clone(&handle).lock_owned().await;
+                rs.transfer.unpaused().await;
+                rs
+            };
+            let conn_closed = async {
+                match &conn {
+                    Some(conn) => drop(conn.closed().await),
+                    None => std::future::pending().await,
+                }
+            };
+            let mut rs = tokio::select! {
+                biased;
+                rs = acquire => rs,
+                () = being_killed(requester) => {
+                    reply.error(Errno::EINTR);
+                    return;
+                }
+                () = conn_closed => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                _ = closing.wait_for(|c| *c) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
             let cancelled = rs.transfer.cancelled();
             let read = async {
                 tokio::select! {
@@ -846,6 +988,41 @@ impl Filesystem for XferFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_state_sees_live_and_gone_processes() {
+        // SAFETY: gettid has no preconditions.
+        let me = unsafe { libc::gettid() } as u32;
+        assert_eq!(kill_state(me), KillState::Alive);
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        assert_eq!(
+            kill_state(gone),
+            KillState::Gone,
+            "a reaped process is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requester_outlives_its_thread_while_its_process_lives() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            tx.send(requester(unsafe { libc::gettid() } as u32))
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        let who = rx.recv().unwrap().expect("resolvable outside a sandbox");
+        assert_eq!(who.1, std::process::id());
+        // Its thread has ended, but this process lives on.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), being_killed(Some(who)))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn cleanup_spares_young_unmounted_dirs() {

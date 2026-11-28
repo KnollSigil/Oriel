@@ -4,7 +4,7 @@
 //! A window's traffic is its video stream plus the frames of its popups (menus,
 //! tooltips), which are counted for the toplevel they belong to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use oriel_proto::WindowId;
@@ -37,9 +37,23 @@ struct State {
     /// Audio stream -> app name and media name.
     audio: HashMap<u32, (String, String)>,
     bytes: HashMap<Source, u64>,
+    /// Recently closed windows and popups, oldest first: frames still in flight for them
+    /// are not counted (they would bring the window back, unnamed).
+    closed: VecDeque<WindowId>,
+    closed_set: HashSet<WindowId>,
 }
 
+/// How many closed windows are remembered.
+const REMEMBERED_CLOSED: usize = 256;
+
 impl State {
+    /// `id` was announced again: no longer closed.
+    fn reopened(&mut self, id: WindowId) {
+        if self.closed_set.remove(&id) {
+            self.closed.retain(|c| *c != id);
+        }
+    }
+
     /// The toplevel a window or popup belongs to.
     fn toplevel(&self, mut id: WindowId) -> WindowId {
         // Bounded: a malformed parent cycle must not hang the receive loop.
@@ -63,6 +77,7 @@ impl TrafficMeter {
     /// A toplevel was announced, or its title or app id changed.
     pub fn window_named(&self, window_id: WindowId, title: &str, app_id: &str) {
         let mut st = self.state.lock().unwrap();
+        st.reopened(window_id);
         let entry = st.windows.entry(window_id).or_default();
         if !title.is_empty() {
             entry.0 = title.to_string();
@@ -73,24 +88,43 @@ impl TrafficMeter {
     }
 
     pub fn popup_created(&self, popup: WindowId, parent: WindowId) {
-        self.state
-            .lock()
-            .unwrap()
-            .popup_parent
-            .insert(popup, parent);
+        let mut st = self.state.lock().unwrap();
+        st.reopened(popup);
+        st.popup_parent.insert(popup, parent);
     }
 
-    /// A window or popup closed: forget it.
+    /// A window or popup closed: forget it and its popups, and ignore frames for them
+    /// that are still on their way.
     pub fn window_closed(&self, window_id: WindowId) {
         let mut st = self.state.lock().unwrap();
-        st.windows.remove(&window_id);
-        st.popup_parent.remove(&window_id);
-        st.bytes.remove(&Source::Window(window_id));
+        let mut gone = vec![window_id];
+        while let Some(id) = gone.pop() {
+            st.windows.remove(&id);
+            st.popup_parent.remove(&id);
+            st.bytes.remove(&Source::Window(id));
+            if st.closed_set.insert(id) {
+                st.closed.push_back(id);
+                if st.closed.len() > REMEMBERED_CLOSED {
+                    if let Some(old) = st.closed.pop_front() {
+                        st.closed_set.remove(&old);
+                    }
+                }
+            }
+            gone.extend(
+                st.popup_parent
+                    .iter()
+                    .filter(|(_, parent)| **parent == id)
+                    .map(|(popup, _)| *popup),
+            );
+        }
     }
 
     /// `n` bytes of frames for window or popup `window_id`.
     pub fn add_window(&self, window_id: WindowId, n: usize) {
         let mut st = self.state.lock().unwrap();
+        if st.closed_set.contains(&window_id) {
+            return;
+        }
         let top = st.toplevel(window_id);
         *st.bytes.entry(Source::Window(top)).or_default() += n as u64;
     }
@@ -180,6 +214,25 @@ mod tests {
             Some(("notes.txt".into(), 150))
         );
         meter.window_closed(1);
+        assert_eq!(bytes_of(&meter, Source::Window(1)), None);
+        // Frames still in flight for it, or its popups, don't bring it back.
+        meter.add_window(1, 10);
+        meter.add_window(3, 10);
+        assert!(meter.totals().is_empty());
+        assert!(meter.state.lock().unwrap().popup_parent.is_empty());
+        // An id announced again counts again.
+        meter.window_named(1, "again", "");
+        meter.add_window(1, 5);
+        assert_eq!(
+            bytes_of(&meter, Source::Window(1)),
+            Some(("again".into(), 5))
+        );
+        // Closed again, it stays closed however many others close after it.
+        meter.window_closed(1);
+        for id in 100..100 + REMEMBERED_CLOSED as WindowId - 1 {
+            meter.window_closed(id);
+        }
+        meter.add_window(1, 5);
         assert_eq!(bytes_of(&meter, Source::Window(1)), None);
     }
 

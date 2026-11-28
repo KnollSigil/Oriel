@@ -346,6 +346,8 @@ pub async fn run_client(
         initial_scale,
     )
     .await?;
+    // Forget the connection's cancelled and paused files however this returns.
+    let _forget_transfers = oriel_proto::transfers::ConnectionGuard::new(conn.stable_id());
     if let Some(tx) = &launcher_tx {
         let _ = tx.send(LauncherNetEvent::Connected);
     }
@@ -502,10 +504,13 @@ pub async fn run_client(
         let tx = tx.clone();
         let traffic = Arc::clone(&traffic);
         tokio::spawn(async move {
-            let mut prev_lost = 0u64;
+            // Count from now: what connecting sent (the handshake, the first window images)
+            // is not one second's traffic.
+            let start = stats_conn.stats();
+            let mut prev_lost = start.path.lost_packets;
             let mut prev_source_bytes =
                 std::collections::HashMap::<crate::traffic::Source, u64>::new();
-            let mut prev_bytes = (0u64, 0u64);
+            let mut prev_bytes = (start.udp_rx.bytes, start.udp_tx.bytes);
             let mut prev_moved = std::collections::HashMap::<u64, u64>::new();
             let mut prev_at = std::time::Instant::now();
             let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -530,10 +535,14 @@ pub async fn run_client(
                     oriel_proto::transfers::list(stats_conn.stable_id())
                         .into_iter()
                         .map(|info| {
-                            // A transfer listed for the first time counts from zero: it is
-                            // listed after its first second.
-                            let before = prev_moved.get(&info.id).copied().unwrap_or(0);
-                            let rate = per_sec(info.moved.saturating_sub(before));
+                            // A transfer listed for the first time has moved what it has
+                            // since it started, more than one tick ago.
+                            let rate = match prev_moved.get(&info.id) {
+                                Some(&before) => per_sec(info.moved.saturating_sub(before)),
+                                None => {
+                                    (info.moved as f64 / info.age.as_secs_f64().max(secs)) as u64
+                                }
+                            };
                             TransferStatus { info, rate }
                         })
                         .collect();
@@ -545,8 +554,9 @@ pub async fn run_client(
                 let mut sources: Vec<SourceRate> = totals
                     .iter()
                     .filter_map(|t| {
-                        // A source seen for the first time counts from zero.
-                        let before = prev_source_bytes.get(&t.source).copied().unwrap_or(0);
+                        // A source seen for the first time is listed from its second
+                        // tick: what it received before is not from one tick.
+                        let before = prev_source_bytes.get(&t.source).copied()?;
                         let rate = per_sec(t.bytes.saturating_sub(before));
                         (rate >= MIN_LISTED_RATE).then(|| SourceRate {
                             source: t.source,
@@ -584,13 +594,40 @@ pub async fn run_client(
 
     // Task: forward local input/resize/close/theme/frame-ack messages to server control stream.
     let (ctrl_closed_tx, mut ctrl_closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let conn_id = conn.stable_id();
     let writer_task = tokio::spawn(async move {
+        // Pause and resume requests for outgoing transfers (see `oriel_proto::transfers`),
+        // sent in the order they were queued.
+        let mut requests_queued = oriel_proto::transfers::peer_requests_queued();
+        let mut requests: std::collections::VecDeque<_> =
+            oriel_proto::transfers::take_peer_requests(conn_id).into();
         loop {
+            if let Some(req) = requests.pop_front() {
+                let oriel_proto::transfers::PeerRequest {
+                    offer_id,
+                    path,
+                    paused,
+                } = req;
+                let msg = ControlMessage::PauseTransfer {
+                    offer_id,
+                    path,
+                    paused,
+                };
+                if let Err(err) = write_control_message(&mut send, &msg).await {
+                    warn!(error = %err, "failed to send control message");
+                    break;
+                }
+                continue;
+            }
             let msg = tokio::select! {
                 m = ctrl_rx.recv() => match m {
                     Some(m) => m,
                     None => break,
                 },
+                Ok(()) = requests_queued.changed() => {
+                    requests.extend(oriel_proto::transfers::take_peer_requests(conn_id));
+                    continue;
+                }
                 Some(msg) = theme_rx.recv() => msg,
                 Some((window_id, pts_ns)) = frame_ack_rx.recv() => ControlMessage::FrameAck {
                     window_id,

@@ -719,8 +719,9 @@ impl SessionManager {
                 if let Some(p) = sess.programs.iter_mut().find(|p| p.launch_id == launch_id) {
                     p.claimed_window = Some(window_id);
                 }
-                // Only per-program traffic depends on it, refreshed with the next stats.
-                Changes::NONE
+                // The program's traffic rate (shown with the transfers) now comes from this
+                // window, and stats only refresh it when the rates change.
+                Changes::TRANSFERS.if_active(is_active)
             }
             LauncherNetEvent::NetStats {
                 rtt_ms,
@@ -1466,7 +1467,11 @@ mod tests {
             launch_id: 1,
             window_id: 5,
         };
-        let _ = mgr.handle_event(net("a@h", attempt, claim));
+        let changes = mgr.handle_event(net("a@h", attempt, claim));
+        assert!(
+            changes.transfers,
+            "the program's rate is redrawn for its window"
+        );
         let _ = mgr.handle_event(net(
             "a@h",
             attempt,
