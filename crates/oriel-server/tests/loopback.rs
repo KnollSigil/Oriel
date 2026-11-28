@@ -287,8 +287,9 @@ async fn stalled_connection(
 #[tokio::test(flavor = "multi_thread")]
 async fn unauthenticated_connections_time_out() {
     let server = start_server(AuthLimits {
-        timeout: Duration::from_millis(500),
+        timeout: Duration::from_secs(2),
         max_pending: 32,
+        ..AuthLimits::default()
     })
     .await;
     let (conn, _send, _recv) = stalled_connection(&server).await;
@@ -316,33 +317,30 @@ async fn oversized_auth_frames_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn too_many_unauthenticated_connections_are_refused() {
+async fn a_full_server_evicts_the_oldest_unauthenticated_peer() {
     let server = start_server(AuthLimits {
         timeout: Duration::from_secs(30),
         max_pending: 2,
+        ..AuthLimits::default()
     })
     .await;
-    let a = stalled_connection(&server).await;
-    let b = stalled_connection(&server).await;
-    let third = oriel_client::quic::connect_raw(server.addr, server.fingerprint.clone()).await;
+    // Authenticated sessions are never evicted.
+    let session = auth(&server, server.token(None)).await.unwrap();
+    let oldest = stalled_connection(&server).await;
+    let newer = stalled_connection(&server).await;
+    // The server is full; an honest client still gets in, and the oldest stalled peer
+    // makes room for it.
+    let _client = auth(&server, server.token(None))
+        .await
+        .expect("a full server refused an honest client");
+    tokio::time::timeout(Duration::from_secs(5), oldest.0.closed())
+        .await
+        .expect("the oldest unauthenticated peer was not evicted");
+    assert!(newer.0.close_reason().is_none(), "a newer peer was evicted");
     assert!(
-        third.is_err(),
-        "third unauthenticated connection was accepted"
+        session.close_reason().is_none(),
+        "an authenticated session was evicted"
     );
-    // Authenticated clients are not held up by the stalled ones once they go.
-    a.0.close(0u32.into(), b"done");
-    b.0.close(0u32.into(), b"done");
-    drop((a, b));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match auth(&server, server.token(None)).await {
-            Ok(_) => break,
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(err) => panic!("server stayed full: {err:#}"),
-        }
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -365,4 +363,233 @@ async fn version_mismatch_is_explained() {
         other => panic!("unexpected close: {other}"),
     };
     assert!(reason.contains("unsupported protocol version"), "{reason}");
+}
+
+/// Accepts any server certificate: only for the hand-built client below.
+#[derive(Debug)]
+struct AnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A connection that gives the server no flow-control credit on its streams, so nothing
+/// the server sends can be written, while keep-alives hold the connection open.
+async fn connect_without_receive_window(server: &TestServer) -> quinn::Connection {
+    connect_from(server, Ipv4Addr::LOCALHOST, |transport| {
+        transport.stream_receive_window(0u32.into());
+    })
+    .await
+}
+
+/// A connection from `source` (any 127/8 address works on Linux), with its transport
+/// adjusted by `configure`.
+async fn connect_from(
+    server: &TestServer,
+    source: Ipv4Addr,
+    configure: impl FnOnce(&mut quinn::TransportConfig),
+) -> quinn::Connection {
+    let mut tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServerCert))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"oriel/1".to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_millis(200)));
+    configure(&mut transport);
+    config.transport_config(Arc::new(transport));
+    let mut endpoint = quinn::Endpoint::client((source, 0).into()).unwrap();
+    endpoint.set_default_client_config(config);
+    endpoint
+        .connect(server.addr, "oriel.local")
+        .unwrap()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_peers_that_never_read_the_rejection_time_out() {
+    let server = start_server(AuthLimits {
+        timeout: Duration::from_secs(2),
+        max_pending: 1,
+        ..AuthLimits::default()
+    })
+    .await;
+    let conn = connect_without_receive_window(&server).await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(&PROTOCOL_MAGIC).await.unwrap();
+    send.write_u32(oriel_proto::PROTOCOL_VERSION).await.unwrap();
+    oriel_proto::write_control_message(
+        &mut send,
+        &oriel_proto::ControlMessage::AuthRequest {
+            token: "wrong".into(),
+            role: ClientRole::PtyOnly,
+            supported_codecs: Vec::new(),
+            enable_audio_bridge: false,
+            initial_scale: 1.0,
+        },
+    )
+    .await
+    .unwrap();
+    send.flush().await.unwrap();
+    // The server cannot deliver its rejection; it must still give up the peer's slot.
+    tokio::time::timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .expect("server held a rejected peer past its deadline");
+    auth(&server, server.token(None))
+        .await
+        .expect("the server stopped serving clients after the stalled rejection");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_source_cannot_take_every_unauthenticated_slot() {
+    let server = start_server(AuthLimits {
+        timeout: Duration::from_secs(30),
+        max_pending: 32,
+        max_pending_per_source: 2,
+    })
+    .await;
+    let _a = stalled_connection(&server).await;
+    let _b = stalled_connection(&server).await;
+    let third = oriel_client::quic::connect_raw(server.addr, server.fingerprint.clone()).await;
+    assert!(
+        third.is_err(),
+        "a third connection from one source was accepted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_get_more_streams_only_once_authenticated() {
+    let server = start_server(AuthLimits::default()).await;
+    let (conn, _send, _recv) = stalled_connection(&server).await;
+    // Before authenticating, the control stream is the only stream the server allows.
+    let no_stream = Duration::from_millis(500);
+    assert!(
+        tokio::time::timeout(no_stream, conn.open_uni())
+            .await
+            .is_err(),
+        "unauthenticated peer opened a unidirectional stream"
+    );
+    assert!(
+        tokio::time::timeout(no_stream, conn.open_bi())
+            .await
+            .is_err(),
+        "unauthenticated peer opened a second bidirectional stream"
+    );
+
+    let conn = auth(&server, server.token(None)).await.unwrap();
+    let streams = async {
+        let mut bi = Vec::new();
+        for _ in 0..4 {
+            bi.push(conn.open_bi().await.unwrap());
+        }
+        let mut uni = conn.open_uni().await.unwrap();
+        uni.write_all(&[0; 256 * 1024]).await.unwrap();
+        bi
+    };
+    tokio::time::timeout(Duration::from_secs(5), streams)
+        .await
+        .expect("authenticated peer was kept to the pre-auth limits");
+}
+
+/// A connection from `source` that announces an auth frame and never sends it.
+async fn stalled_connection_from(
+    server: &TestServer,
+    source: Ipv4Addr,
+) -> (quinn::Connection, quinn::SendStream) {
+    let conn = connect_from(server, source, |_| {}).await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(&PROTOCOL_MAGIC).await.unwrap();
+    send.write_u32(oriel_proto::PROTOCOL_VERSION).await.unwrap();
+    send.write_u32(1000).await.unwrap();
+    send.flush().await.unwrap();
+    (conn, send)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eviction_takes_from_the_busiest_source() {
+    let server = start_server(AuthLimits {
+        timeout: Duration::from_secs(30),
+        max_pending: 3,
+        ..AuthLimits::default()
+    })
+    .await;
+    let other = Ipv4Addr::new(127, 0, 0, 2);
+    let quiet = stalled_connection_from(&server, other).await;
+    let busy_oldest = stalled_connection_from(&server, Ipv4Addr::LOCALHOST).await;
+    let busy_newer = stalled_connection_from(&server, Ipv4Addr::LOCALHOST).await;
+    // Full: one more from the busy source pushes out that source's oldest, although the
+    // quiet source's peer is older still.
+    let _newest = stalled_connection_from(&server, Ipv4Addr::LOCALHOST).await;
+    tokio::time::timeout(Duration::from_secs(5), busy_oldest.0.closed())
+        .await
+        .expect("the busy source's oldest peer was not evicted");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        quiet.0.close_reason().is_none(),
+        "the quiet source's peer was evicted"
+    );
+    assert!(
+        busy_newer.0.close_reason().is_none(),
+        "a newer peer was evicted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sources_holding_equally_many_are_evicted_oldest_first() {
+    let server = start_server(AuthLimits {
+        timeout: Duration::from_secs(30),
+        max_pending: 3,
+        ..AuthLimits::default()
+    })
+    .await;
+    let source = |n| Ipv4Addr::new(127, 0, 0, n);
+    let oldest = stalled_connection_from(&server, source(1)).await;
+    let mut others = Vec::new();
+    for n in 2..=3 {
+        others.push(stalled_connection_from(&server, source(n)).await);
+    }
+    let _newest = stalled_connection_from(&server, source(4)).await;
+    tokio::time::timeout(Duration::from_secs(5), oldest.0.closed())
+        .await
+        .expect("the oldest peer was not evicted");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for (conn, _) in &others {
+        assert!(conn.close_reason().is_none(), "a newer peer was evicted");
+    }
 }

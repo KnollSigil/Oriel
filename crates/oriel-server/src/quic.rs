@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -183,6 +183,10 @@ pub fn generate_ephemeral_credentials(
     if let Ok(idle) = Duration::from_secs(10).try_into() {
         transport.max_idle_timeout(Some(idle));
     }
+    // Raised once the peer authenticates (see `handle_connection`).
+    transport.receive_window(PRE_AUTH_RECEIVE_WINDOW.into());
+    transport.max_concurrent_bidi_streams(PRE_AUTH_BIDI_STREAMS.into());
+    transport.max_concurrent_uni_streams(0u32.into());
     server_config.transport_config(Arc::new(transport));
 
     let mut tokens = HashMap::new();
@@ -301,9 +305,15 @@ pub struct AuthLimits {
     /// open the control stream and send its preamble and `AuthRequest`. Keep-alives would
     /// otherwise hold an idle unauthenticated connection open forever.
     pub timeout: Duration,
-    /// Most connections that may be waiting to authenticate at once; more are refused, so
-    /// unauthenticated peers cannot pile up connections (and their buffers) without limit.
+    /// Most connections that may be waiting to authenticate at once, so unauthenticated
+    /// peers cannot pile up connections (and their buffers) without limit; a new one
+    /// evicts the oldest. Once half are taken, peers must also prove they own their source
+    /// address (a QUIC Retry), so packets with forged sources cannot fill the rest.
     pub max_pending: usize,
+    /// Most of those that may come from one source (an IPv4 address or an IPv6 /64); more
+    /// are refused. Only the first from a source is admitted without a Retry, so forged
+    /// packets cannot use up another address's share.
+    pub max_pending_per_source: usize,
 }
 
 impl Default for AuthLimits {
@@ -311,28 +321,153 @@ impl Default for AuthLimits {
         Self {
             timeout: Duration::from_secs(10),
             max_pending: 32,
+            max_pending_per_source: 8,
         }
     }
 }
 
+/// Flow control for a connection until it authenticates: room for the control stream
+/// and its `AuthRequest` only, so an unauthenticated peer cannot make the server buffer
+/// data on streams it never reads.
+const PRE_AUTH_RECEIVE_WINDOW: u32 = 64 * 1024;
+const PRE_AUTH_BIDI_STREAMS: u32 = 1;
+/// What authenticated connections get: quinn's defaults.
+const RECEIVE_WINDOW: VarInt = VarInt::MAX;
+const MAX_STREAMS: u32 = 100;
+
+/// Where an unauthenticated connection comes from, for [`AuthLimits::max_pending_per_source`].
+/// An IPv6 host usually has a whole /64 to pick addresses from.
+fn auth_source(addr: SocketAddr) -> IpAddr {
+    match addr.ip().to_canonical() {
+        IpAddr::V6(ip) => {
+            let prefix = u128::from(ip) & !((1u128 << 64) - 1);
+            IpAddr::V6(prefix.into())
+        }
+        v4 => v4,
+    }
+}
+
+/// Connections waiting to authenticate, oldest first, and how many come from each source.
+#[derive(Default)]
+struct PendingCounts {
+    next_id: u64,
+    entries: std::collections::BTreeMap<u64, PendingEntry>,
+    by_source: HashMap<IpAddr, usize>,
+}
+
+struct PendingEntry {
+    source: IpAddr,
+    /// Dropped to evict the connection (see [`PendingAuth::evicted`]).
+    _evict: tokio::sync::oneshot::Sender<()>,
+}
+
+impl PendingCounts {
+    /// Forget entry `id`; it no longer counts against any limit.
+    fn remove(&mut self, id: u64) -> Option<PendingEntry> {
+        let entry = self.entries.remove(&id)?;
+        if let Some(n) = self.by_source.get_mut(&entry.source) {
+            *n -= 1;
+            if *n == 0 {
+                self.by_source.remove(&entry.source);
+            }
+        }
+        Some(entry)
+    }
+}
+
+/// What to do with a new connection, from [`PendingAuth::admit`].
+enum Admission {
+    Admit(PendingAuth),
+    /// Ask the peer to prove its address first.
+    Retry,
+    Refuse,
+}
+
 /// Counts a connection as waiting to authenticate until dropped.
-struct PendingAuth(Arc<AtomicUsize>);
+struct PendingAuth {
+    counts: Arc<std::sync::Mutex<PendingCounts>>,
+    id: u64,
+    evicted: Option<tokio::sync::oneshot::Receiver<()>>,
+}
 
 impl PendingAuth {
-    /// Count one more connection, unless `max` already are.
-    fn try_new(count: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        count
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Self(Arc::clone(count)))
+    /// When all slots are taken, the oldest connection is evicted to make room: an honest
+    /// client authenticates within a round trip or two, so keeping it out would take a
+    /// stream of new handshakes rather than a few slow ones.
+    fn admit(
+        counts: &Arc<std::sync::Mutex<PendingCounts>>,
+        limits: &AuthLimits,
+        incoming: &quinn::Incoming,
+    ) -> Admission {
+        let source = auth_source(incoming.remote_address());
+        let mut c = counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let from_source = c.by_source.get(&source).copied().unwrap_or(0);
+        // Without a Retry, the source address may be forged: such a peer could otherwise
+        // use up another address's share, or fill the slots without being reachable.
+        if !incoming.remote_address_validated()
+            && (from_source > 0 || c.entries.len() >= limits.max_pending / 2)
+        {
+            return Admission::Retry;
+        }
+        if from_source >= limits.max_pending_per_source {
+            return Admission::Refuse;
+        }
+        while c.entries.len() >= limits.max_pending.max(1) {
+            // The oldest of the sources holding the most, so that one source cannot push
+            // out an honest client from another, and many sources holding one each are
+            // evicted oldest first.
+            let Some(&most) = c.by_source.values().max() else {
+                break;
+            };
+            let Some(oldest) = c
+                .entries
+                .iter()
+                .find_map(|(&id, e)| (c.by_source.get(&e.source) == Some(&most)).then_some(id))
+            else {
+                break;
+            };
+            c.remove(oldest);
+        }
+        let id = c.next_id;
+        c.next_id += 1;
+        let (evict, evicted) = tokio::sync::oneshot::channel();
+        c.entries.insert(
+            id,
+            PendingEntry {
+                source,
+                _evict: evict,
+            },
+        );
+        *c.by_source.entry(source).or_default() += 1;
+        Admission::Admit(Self {
+            counts: Arc::clone(counts),
+            id,
+            evicted: Some(evicted),
+        })
+    }
+
+    /// Resolves when the connection is evicted to make room for a newer one.
+    fn evicted(&mut self) -> impl std::future::Future<Output = ()> + use<> {
+        let rx = self.evicted.take();
+        async move {
+            match rx {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending().await,
+            }
+        }
     }
 }
 
 impl Drop for PendingAuth {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(self.id);
     }
 }
 
@@ -340,7 +475,7 @@ impl Drop for PendingAuth {
 struct Shared {
     valid_tokens: TokenMap,
     /// Connections that have not authenticated yet (see [`PendingAuth`]).
-    pending_auth: Arc<AtomicUsize>,
+    pending_auth: Arc<std::sync::Mutex<PendingCounts>>,
     auth_limits: AuthLimits,
     cmd_tx: calloop::channel::Sender<CompositorCommand>,
     events: broadcast::Sender<CompositorEvent>,
@@ -411,12 +546,19 @@ pub async fn run_server_with_limits(
         xfer_mount,
     });
     while let Some(incoming) = endpoint.accept().await {
-        let Some(pending) =
-            PendingAuth::try_new(&shared.pending_auth, shared.auth_limits.max_pending)
-        else {
-            debug!(remote = %incoming.remote_address(), "too many unauthenticated connections; refusing");
-            incoming.refuse();
-            continue;
+        let pending = match PendingAuth::admit(&shared.pending_auth, &shared.auth_limits, &incoming)
+        {
+            Admission::Admit(pending) => pending,
+            Admission::Retry => {
+                // Validated means it answered a Retry already, so this always succeeds.
+                let _ = incoming.retry();
+                continue;
+            }
+            Admission::Refuse => {
+                debug!(remote = %incoming.remote_address(), "too many unauthenticated connections from this source; refusing");
+                incoming.refuse();
+                continue;
+            }
         };
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
@@ -429,95 +571,55 @@ pub async fn run_server_with_limits(
     Ok(())
 }
 
+/// A connection that has authenticated, from [`authenticate`].
+struct Authenticated {
+    conn: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    remote: SocketAddr,
+    /// Forgets the connection's cancelled and paused files when it goes.
+    _forget_transfers: oriel_proto::transfers::ConnectionGuard,
+    role: ClientRole,
+    supported_codecs: Vec<VideoCodec>,
+    enable_audio_bridge: bool,
+    initial_scale: f64,
+}
+
 async fn handle_connection(
     incoming: quinn::Incoming,
-    pending: PendingAuth,
+    mut pending: PendingAuth,
     shared: Arc<Shared>,
 ) -> Result<()> {
-    let timeout = shared.auth_limits.timeout;
-    let deadline = tokio::time::Instant::now() + timeout;
-    let before_deadline =
-        |what: &'static str| move |_| anyhow!("peer did not {what} within {timeout:?}");
-    let conn = tokio::time::timeout_at(deadline, incoming)
-        .await
-        .map_err(before_deadline("finish the QUIC handshake"))?
-        .context("QUIC handshake failed")?;
-    // Forget the connection's cancelled and paused files however this returns.
-    let _forget_transfers = oriel_proto::transfers::ConnectionGuard::new(conn.stable_id());
-    let remote = conn.remote_address();
-    info!(%remote, "QUIC peer connected");
-    let timed_out = |err: anyhow::Error| {
-        conn.close(VarInt::from_u32(0), b"authentication timed out");
-        err
-    };
-
-    let (mut send, mut recv) = tokio::time::timeout_at(deadline, conn.accept_bi())
-        .await
-        .map_err(before_deadline("open the control stream"))
-        .map_err(timed_out)?
-        .context("failed to accept control stream")?;
-
-    // The preamble's layout is independent of the message encoding, so a client of any
-    // version can be told about a mismatch through the QUIC close reason.
-    let preamble = tokio::time::timeout_at(deadline, read_protocol_preamble(&mut recv))
-        .await
-        .map_err(before_deadline("send the protocol preamble"))
-        .map_err(timed_out)??;
-    let mismatch = match preamble {
-        PeerProtocol::Version(PROTOCOL_VERSION) => None,
-        PeerProtocol::Version(v) => Some(format!(
-            "unsupported protocol version {v} (server speaks {PROTOCOL_VERSION})"
-        )),
-        PeerProtocol::Legacy => Some(format!(
-            "client uses a protocol older than version 9 (server speaks {PROTOCOL_VERSION}); \
-             update the client"
-        )),
-    };
-    if let Some(reason) = mismatch {
-        warn!(%remote, %reason, "rejecting client");
-        conn.close(
-            VarInt::from_u32(CLOSE_CODE_PROTOCOL_MISMATCH),
-            reason.as_bytes(),
-        );
-        return Ok(());
-    }
-
-    let auth_msg = tokio::time::timeout_at(
-        deadline,
-        read_control_message_max(&mut recv, MAX_AUTH_FRAME_BYTES),
-    )
-    .await
-    .map_err(before_deadline("authenticate"))
-    .map_err(timed_out)??
-    .context("control stream closed before AuthRequest")?;
-
-    let (token, role, supported_codecs, enable_audio_bridge, initial_scale) = match auth_msg {
-        ControlMessage::AuthRequest {
-            token,
-            role,
-            supported_codecs,
-            enable_audio_bridge,
-            initial_scale,
-        } => (
-            token,
-            role,
-            supported_codecs,
-            enable_audio_bridge,
-            initial_scale,
-        ),
-        other => {
-            warn!(?other, "unexpected initial control message");
+    let remote = incoming.remote_address();
+    let mut evicted = std::pin::pin!(pending.evicted());
+    let authenticated = tokio::select! {
+        // Once `authenticate` is done the token is spent: it wins any tie.
+        biased;
+        res = authenticate(incoming, &shared) => res?,
+        () = &mut evicted => {
+            debug!(%remote, "unauthenticated connection evicted for a newer one");
             return Ok(());
         }
     };
-
-    let client_fp = peer_cert_fingerprint(&conn);
-    if !consume_token(&shared.valid_tokens, &token, client_fp.as_deref()) {
-        reject_auth(&mut send, "invalid or expired session token".into()).await?;
+    let Some(Authenticated {
+        conn,
+        mut send,
+        recv,
+        remote,
+        _forget_transfers,
+        role,
+        supported_codecs,
+        enable_audio_bridge,
+        initial_scale,
+    }) = authenticated
+    else {
         return Ok(());
-    }
+    };
     // Authenticated: no longer counts against the limit for unauthenticated peers.
     drop(pending);
+    conn.set_receive_window(RECEIVE_WINDOW);
+    conn.set_max_concurrent_bi_streams(MAX_STREAMS.into());
+    conn.set_max_concurrent_uni_streams(MAX_STREAMS.into());
 
     let selected_codec = if supported_codecs.contains(&VideoCodec::SmartTile) {
         VideoCodec::SmartTile
@@ -568,19 +670,131 @@ async fn handle_connection(
     res
 }
 
+/// The unauthenticated part of a connection: handshake, preamble and `AuthRequest`, each
+/// within the peer's auth deadline. `None` when the peer was turned away.
+async fn authenticate(incoming: quinn::Incoming, shared: &Shared) -> Result<Option<Authenticated>> {
+    let timeout = shared.auth_limits.timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let before_deadline =
+        |what: &'static str| move |_| anyhow!("peer did not {what} within {timeout:?}");
+    let conn = tokio::time::timeout_at(deadline, incoming)
+        .await
+        .map_err(before_deadline("finish the QUIC handshake"))?
+        .context("QUIC handshake failed")?;
+    // Forget the connection's cancelled and paused files however this returns.
+    let forget_transfers = oriel_proto::transfers::ConnectionGuard::new(conn.stable_id());
+    let remote = conn.remote_address();
+    info!(%remote, "QUIC peer connected");
+    let timed_out = |err: anyhow::Error| {
+        conn.close(VarInt::from_u32(0), b"authentication timed out");
+        err
+    };
+
+    let (mut send, mut recv) = tokio::time::timeout_at(deadline, conn.accept_bi())
+        .await
+        .map_err(before_deadline("open the control stream"))
+        .map_err(timed_out)?
+        .context("failed to accept control stream")?;
+
+    // The preamble's layout is independent of the message encoding, so a client of any
+    // version can be told about a mismatch through the QUIC close reason.
+    let preamble = tokio::time::timeout_at(deadline, read_protocol_preamble(&mut recv))
+        .await
+        .map_err(before_deadline("send the protocol preamble"))
+        .map_err(timed_out)??;
+    let mismatch = match preamble {
+        PeerProtocol::Version(PROTOCOL_VERSION) => None,
+        PeerProtocol::Version(v) => Some(format!(
+            "unsupported protocol version {v} (server speaks {PROTOCOL_VERSION})"
+        )),
+        PeerProtocol::Legacy => Some(format!(
+            "client uses a protocol older than version 9 (server speaks {PROTOCOL_VERSION}); \
+             update the client"
+        )),
+    };
+    if let Some(reason) = mismatch {
+        warn!(%remote, %reason, "rejecting client");
+        conn.close(
+            VarInt::from_u32(CLOSE_CODE_PROTOCOL_MISMATCH),
+            reason.as_bytes(),
+        );
+        return Ok(None);
+    }
+
+    let auth_msg = tokio::time::timeout_at(
+        deadline,
+        read_control_message_max(&mut recv, MAX_AUTH_FRAME_BYTES),
+    )
+    .await
+    .map_err(before_deadline("authenticate"))
+    .map_err(timed_out)??
+    .context("control stream closed before AuthRequest")?;
+
+    let (token, role, supported_codecs, enable_audio_bridge, initial_scale) = match auth_msg {
+        ControlMessage::AuthRequest {
+            token,
+            role,
+            supported_codecs,
+            enable_audio_bridge,
+            initial_scale,
+        } => (
+            token,
+            role,
+            supported_codecs,
+            enable_audio_bridge,
+            initial_scale,
+        ),
+        other => {
+            warn!(?other, "unexpected initial control message");
+            return Ok(None);
+        }
+    };
+
+    let client_fp = peer_cert_fingerprint(&conn);
+    if !consume_token(&shared.valid_tokens, &token, client_fp.as_deref()) {
+        if let Err(err) = reject_auth(&mut send, "invalid or expired session token".into()).await {
+            let stalled = err.downcast_ref::<tokio::time::error::Elapsed>().is_some();
+            return Err(if stalled { timed_out(err) } else { err });
+        }
+        return Ok(None);
+    }
+    // Nothing may be awaited from here on: the token is spent, so the caller must not be
+    // able to cancel this future (see `handle_connection`) after this point.
+    Ok(Some(Authenticated {
+        conn,
+        send,
+        recv,
+        remote,
+        _forget_transfers: forget_transfers,
+        role,
+        supported_codecs,
+        enable_audio_bridge,
+        initial_scale,
+    }))
+}
+
 /// How long to wait for the client to acknowledge an authentication rejection.
 const REJECT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Each step has its own budget rather than the auth deadline, so a late but honest client
+/// still learns why; a peer that never grants flow-control credit for the rejection cannot
+/// hold its slot past it either.
 async fn reject_auth(send: &mut quinn::SendStream, reason: String) -> Result<()> {
-    write_control_message(
-        send,
-        &ControlMessage::AuthResponse {
-            accepted: false,
-            reason: Some(reason),
-            selected_codec: VideoCodec::Lz4Delta,
-        },
+    let rejection = ControlMessage::AuthResponse {
+        accepted: false,
+        reason: Some(reason),
+        selected_codec: VideoCodec::Lz4Delta,
+    };
+    tokio::time::timeout(
+        REJECT_DELIVERY_TIMEOUT,
+        write_control_message(send, &rejection),
     )
-    .await?;
+    .await
+    .map_err(|elapsed| {
+        anyhow::Error::new(elapsed).context(format!(
+            "peer did not take the rejection within {REJECT_DELIVERY_TIMEOUT:?}"
+        ))
+    })??;
     // The caller drops the connection next, which discards unacknowledged stream data;
     // wait until the client has the rejection so it can show the reason.
     let _ = send.finish();
@@ -2229,6 +2443,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unauthenticated_peers_are_counted_by_address_or_ipv6_64() {
+        let src = |s: &str| auth_source(s.parse().unwrap());
+        assert_eq!(src("192.0.2.1:1"), src("192.0.2.1:2"));
+        assert_ne!(src("192.0.2.1:1"), src("192.0.2.2:1"));
+        // Over a dual-stack socket an IPv4 peer arrives as an IPv4-mapped address.
+        assert_eq!(src("[::ffff:192.0.2.1]:1"), src("192.0.2.1:1"));
+        assert_eq!(src("[2001:db8:1:2::1]:1"), src("[2001:db8:1:2:ffff::9]:1"));
+        assert_ne!(src("[2001:db8:1:2::1]:1"), src("[2001:db8:1:3::1]:1"));
+    }
 
     fn grant(expires: Instant, client_fp: Option<&str>) -> TokenGrant {
         TokenGrant {

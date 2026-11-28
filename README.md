@@ -116,8 +116,12 @@ apps, running between connections; later `attach` calls reuse it. Its log is
 - Tokens never appear in process arguments: the client takes URIs on stdin or from
   `$ORIEL_URI`.
 - The server listens on all interfaces by default. A peer that has not authenticated must
-  do so within 10 seconds, may send at most 4 KiB before it has, and at most 32 such peers
-  are served at a time. Restrict `--listen` or firewall the port if the server should not
-  be reachable from the network.
+  do so within 10 seconds, on a single stream with a 4 KiB request, and the server buffers
+  at most 64 KiB from it until then. At most 32 such peers are served at a time, and a
+  new one evicts the oldest from the address holding the most, so slow or stalled peers
+  cannot keep honest clients out; one address (IPv6: /64) may hold at most 8. Peers must
+  first prove their source address (a QUIC Retry) once half the slots are taken, or when
+  their address already has one. Restrict `--listen` or firewall the port if the server
+  should not be reachable from the network.
 - An authenticated client can do whatever the server's user can: it launches apps and
   opens shells.
