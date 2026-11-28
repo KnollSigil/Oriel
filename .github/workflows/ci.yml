@@ -18,9 +18,17 @@ jobs:
           sudo apt-get install -y pkg-config libclang-dev libwayland-dev libxkbcommon-dev libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev libspa-0.2-dev libopus-dev \
             pipewire wireplumber pipewire-pulse
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The client and the protocol crate also build on their own, without the GPU encoder.
+      - run: cargo clippy -p oriel-client -p oriel-proto --all-targets --no-default-features -- -D warnings
       - run: cargo test --workspace
 
-  build-aarch64-client:
+  # Native aarch64: runs the NEON codec kernels against their scalar references. The
+  # server's tests need WirePlumber 0.5, which this runner's Ubuntu 24.04 lacks.
+  test-aarch64:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -29,4 +37,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libclang-dev libwayland-dev libxkbcommon-dev libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev libspa-0.2-dev libopus-dev
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p oriel-proto -p oriel-client
       - run: cargo build --release -p oriel-client
