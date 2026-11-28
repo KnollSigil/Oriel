@@ -1602,9 +1602,22 @@ impl AppState {
         let event_tx = self.event_tx.clone();
         debug!(window_id, ?mimes, "a session drag can leave the session");
         std::thread::spawn(move || {
+            let started = Instant::now();
+            let read_files = uri_list.is_some();
             let paths = uri_list
                 .and_then(|pipe| read_selection_fd_complete(pipe.into()))
                 .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body));
+            let took = started.elapsed();
+            if read_files && (paths.is_none() || took > Duration::from_millis(500)) {
+                // The client continues the drag only while its button is held, and without
+                // the files the drop gets none.
+                info!(
+                    x11 = settled.is_some(),
+                    files = paths.as_ref().map(Vec::len),
+                    took_ms = took.as_millis() as u64,
+                    "reading a drag's file list failed or was slow"
+                );
+            }
             if let Some(settled) = settled {
                 settled.store(true, Ordering::Release);
             }

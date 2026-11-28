@@ -56,7 +56,7 @@ use smithay_client_toolkit::{
     },
 };
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{
@@ -2043,10 +2043,16 @@ impl PointerHandler for ClientApp {
                 }
                 PointerEventKind::Motion { .. } => {
                     self.pointer_window_id = window_id;
-                    let resize_icon = self.windows.get(&window_id).and_then(|win| {
-                        win.border_resize_edge(event.position.0, event.position.1)
-                            .map(|(_, icon)| icon)
-                    });
+                    // With a button held (a drag in the remote app, which reports positions
+                    // outside the window too) the edges are not for resizing.
+                    let resize_icon = self
+                        .windows
+                        .get(&window_id)
+                        .filter(|_| self.pressed_buttons.is_empty())
+                        .and_then(|win| {
+                            win.border_resize_edge(event.position.0, event.position.1)
+                                .map(|(_, icon)| icon)
+                        });
                     if let Some(icon) = resize_icon {
                         self.border_resize_active = true;
                         if let Some(tp) = &self.themed_pointer {
@@ -2459,6 +2465,10 @@ impl ClientApp {
     ) {
         if !self.pressed_buttons.contains(&BTN_LEFT) {
             // Dropped (inside the session) before the file list arrived.
+            info!(
+                window_id,
+                "a remote drag's offer came after its button was released"
+            );
             return;
         }
         let origin = match (self.windows.get(&window_id), self.popups.get(&window_id)) {
