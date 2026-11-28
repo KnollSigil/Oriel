@@ -97,9 +97,17 @@ enum ServerSubcommand {
         #[arg(long, value_name = "SHA256", value_parser = parse_cert_fingerprint)]
         client_fp: Option<String>,
 
+        /// If the running server speaks a different protocol version than this binary (it
+        /// is from an older or newer install), stop it and start this version. Its apps
+        /// are closed.
+        #[arg(long)]
+        replace: bool,
+
         #[command(flatten)]
         gpu: GpuArgs,
     },
+    /// Stop this user's running server, closing its apps.
+    Stop,
     /// Print the environment for `attach`'s login-shell environment resolution.
     #[command(name = shell_env::PRINT_SUBCOMMAND, hide = true)]
     PrintShellEnv,
@@ -149,7 +157,13 @@ struct ControlSockInfo {
     port: u16,
     fp: String,
     token: String,
+    /// The daemon's [`oriel_proto::PROTOCOL_VERSION`]; older daemons do not send it.
+    #[serde(default)]
+    protocol: Option<u32>,
 }
+
+/// How long `stop` waits for a stopped daemon to clean up its session and exit.
+const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the daemon waits for `attach`'s request line.
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -190,11 +204,34 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
         host,
         no_xwayland,
         client_fp,
+        replace,
         gpu,
     }) = cli.subcommand
     {
         let request = ControlSockRequest { client_fp };
-        return run_attach(&host_runtime_dir, listen, host, no_xwayland, &gpu, &request).await;
+        return run_attach(
+            &host_runtime_dir,
+            listen,
+            host,
+            no_xwayland,
+            replace,
+            &gpu,
+            &request,
+        )
+        .await;
+    }
+    if matches!(cli.subcommand, Some(ServerSubcommand::Stop)) {
+        let sock_path = session::control_socket_path(&host_runtime_dir);
+        return match stop_daemon(&sock_path).await? {
+            Some(pid) => {
+                eprintln!("stopped the Oriel server (pid {pid})");
+                Ok(())
+            }
+            None => {
+                eprintln!("no Oriel server is running for this user");
+                Ok(())
+            }
+        };
     }
 
     tracing_subscriber::fmt()
@@ -406,6 +443,7 @@ async fn answer_control_request(
         port,
         fp: creds.cert_sha256_hex.clone(),
         token,
+        protocol: Some(oriel_proto::PROTOCOL_VERSION),
     };
     let mut json = serde_json::to_string(&info)?;
     json.push('\n');
@@ -418,11 +456,34 @@ async fn run_attach(
     listen: quic::ListenSpec,
     host: Option<String>,
     no_xwayland: bool,
+    replace: bool,
     gpu: &GpuArgs,
     request: &ControlSockRequest,
 ) -> Result<()> {
     let sock_path = session::control_socket_path(host_runtime_dir);
-    if let Ok(info) = query_control_socket(&sock_path, request).await {
+    let mut running = query_control_socket(&sock_path, request).await.ok();
+    if let Some(mismatch) = running.as_ref().and_then(protocol_mismatch) {
+        let known = running.as_ref().is_some_and(|info| info.protocol.is_some());
+        if !replace && !known {
+            // It may well speak this version; only the client can tell.
+            eprintln!(
+                "warning: {mismatch}; if the client reports a protocol version mismatch, \
+                 run `oriel-server attach --replace` to stop it (closing its apps) and \
+                 start this version"
+            );
+        } else if !replace {
+            anyhow::bail!(
+                "{mismatch}, so clients of this version cannot connect to it. Run \
+                 `oriel-server attach --replace` to stop it (closing its apps) and start \
+                 this version, or `oriel-server stop`"
+            );
+        } else {
+            eprintln!("{mismatch}; stopping it to start this version");
+            stop_daemon(&sock_path).await?;
+            running = None;
+        }
+    }
+    if let Some(info) = running {
         if let Some(range) = listen.ports.filter(|r| !r.contains(info.port)) {
             anyhow::bail!(
                 "a Oriel server is already running for this user on UDP port {}, \
@@ -558,6 +619,65 @@ fn daemon_startup_error(log_path: &Path, log_start: u64) -> Option<String> {
     (!err.is_empty()).then(|| err.to_string())
 }
 
+/// Why the daemon that sent `info` is not this binary's protocol version, if it is not.
+fn protocol_mismatch(info: &ControlSockInfo) -> Option<String> {
+    let ours = oriel_proto::PROTOCOL_VERSION;
+    match info.protocol {
+        Some(v) if v == ours => None,
+        Some(v) => Some(format!(
+            "the running Oriel server speaks protocol version {v}, this one {ours}"
+        )),
+        None => Some(format!(
+            "the running Oriel server is from an older install that does not report its \
+             protocol version (this one speaks {ours})"
+        )),
+    }
+}
+
+/// Stop the daemon that owns the control socket at `sock_path`: SIGTERM, then wait for it
+/// to clean up its session and exit. Returns its pid, or `None` if no daemon is running.
+///
+/// The daemon is found through the socket's peer credentials rather than a request, so
+/// daemons from any older install can be stopped too.
+async fn stop_daemon(sock_path: &Path) -> Result<Option<i32>> {
+    let Ok(stream) = UnixStream::connect(sock_path).await else {
+        return Ok(None);
+    };
+    let cred = stream
+        .peer_cred()
+        .context("failed to read the Oriel server's credentials from its control socket")?;
+    drop(stream);
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let pid = match cred.pid() {
+        Some(pid) if pid > 0 && cred.uid() == uid => pid,
+        _ => anyhow::bail!(
+            "the control socket {} is not owned by a server of this user",
+            sock_path.display()
+        ),
+    };
+    // SAFETY: plain syscall on a pid; a gone process gives ESRCH.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(Some(pid));
+        }
+        return Err(err).with_context(|| format!("failed to stop the Oriel server (pid {pid})"));
+    }
+    let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+    // SAFETY: signal 0 only checks that the process exists.
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the Oriel server (pid {pid}) did not exit within {}s of SIGTERM",
+                STOP_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(Some(pid))
+}
+
 async fn query_control_socket(
     path: &Path,
     request: &ControlSockRequest,
@@ -610,5 +730,26 @@ mod tests {
         assert!(t1.starts_with("oriel-"));
         assert_eq!(t1.len(), "oriel-".len() + 64);
         assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn attach_spots_daemons_of_another_protocol_version() {
+        let info = |json: &str| serde_json::from_str::<ControlSockInfo>(json).unwrap();
+        let ours = oriel_proto::PROTOCOL_VERSION;
+        let same = info(&format!(
+            r#"{{"port":1,"fp":"f","token":"t","protocol":{ours}}}"#
+        ));
+        assert_eq!(protocol_mismatch(&same), None);
+        let other = info(&format!(
+            r#"{{"port":1,"fp":"f","token":"t","protocol":{}}}"#,
+            ours + 1
+        ));
+        assert!(protocol_mismatch(&other)
+            .unwrap()
+            .contains("speaks protocol version"));
+        // Daemons from before the field existed still parse, as of unknown version.
+        let old = info(r#"{"port":1,"fp":"f","token":"t"}"#);
+        assert_eq!(old.protocol, None);
+        assert!(protocol_mismatch(&old).unwrap().contains("does not report"));
     }
 }

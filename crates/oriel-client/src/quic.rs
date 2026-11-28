@@ -250,7 +250,9 @@ fn auth_read_error(conn: &quinn::Connection, err: anyhow::Error) -> anyhow::Erro
             if close.error_code == VarInt::from_u32(CLOSE_CODE_PROTOCOL_MISMATCH) =>
         {
             anyhow::anyhow!(
-                "server rejected the connection: {}",
+                "server rejected the connection: {}. If the server is still running an \
+                 older or newer install, run `oriel-server attach --replace` there to \
+                 restart it with the installed version (this closes its apps)",
                 String::from_utf8_lossy(&close.reason)
             )
         }
