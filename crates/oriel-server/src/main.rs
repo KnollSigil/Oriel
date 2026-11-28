@@ -652,8 +652,7 @@ async fn stop_daemon(sock_path: &Path) -> Result<Option<i32>> {
         return Err(err).with_context(|| format!("failed to stop the Oriel server (pid {pid})"));
     }
     let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
-    // SAFETY: signal 0 only checks that the process exists.
-    while unsafe { libc::kill(pid, 0) } == 0 {
+    while process_running(pid) {
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "the Oriel server (pid {pid}) did not exit within {}s of SIGTERM",
@@ -663,6 +662,23 @@ async fn stop_daemon(sock_path: &Path) -> Result<Option<i32>> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok(Some(pid))
+}
+
+/// Whether `pid` is still running. A process that has exited but not been reaped (its
+/// parent does not wait for it) still exists as a zombie, and counts as stopped.
+fn process_running(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    // The state follows the parenthesized command name, which may itself contain ") ".
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, rest) = stat.rsplit_once(')')?;
+            rest.trim_start().chars().next()
+        })
+        .is_none_or(|state| state != 'Z' && state != 'X')
 }
 
 async fn query_control_socket(
@@ -717,6 +733,22 @@ mod tests {
         assert!(t1.starts_with("oriel-"));
         assert_eq!(t1.len(), "oriel-".len() + 64);
         assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn exited_processes_count_as_stopped_before_they_are_reaped() {
+        assert!(process_running(std::process::id() as i32));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Until it is waited for, the exited child is a zombie that signal 0 still finds.
+        while process_running(pid) {
+            assert!(std::time::Instant::now() < deadline, "child still running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "child was reaped early");
+        child.wait().unwrap();
+        assert!(!process_running(pid));
     }
 
     #[test]

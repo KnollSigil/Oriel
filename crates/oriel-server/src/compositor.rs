@@ -5244,7 +5244,8 @@ delegate_viewporter!(AppState);
 delegate_output!(AppState);
 delegate_xwayland_shell!(AppState);
 
-/// Resolves once the compositor thread has stopped, by returning an error or panicking.
+/// Resolves once the compositor thread has stopped, however it stopped: returning (on an
+/// error) or panicking, or failing to start.
 /// The session cannot go on without it: its apps have lost their display.
 pub type CompositorExited = tokio::sync::oneshot::Receiver<()>;
 
