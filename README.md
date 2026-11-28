@@ -38,9 +38,12 @@ sudo apt install libgtk-4-dev libadwaita-1-dev
 # Build all crates
 cargo build --workspace
 
-# Run protocol tests
-cargo test -p oriel-proto
+# Run all tests, including the loopback client/server tests in crates/oriel-server/tests
+cargo test --workspace
 ```
+
+`oriel-proto` builds the SmartTile encoder's GPU compute paths (wgpu, Vulkan) only with its
+`gpu-encoder` feature, which the server enables; the client is built without them.
 
 ### Cross-compiling for `aarch64-unknown-linux-gnu`
 
@@ -65,3 +68,54 @@ The client ships as the `dev.knoll.Oriel` Flatpak on the GNOME 51 runtime, via
 # Install the GNOME runtime/SDK and Rust/LLVM extensions once, then build and install
 ./scripts/build-flatpak.sh --install-deps --install
 ```
+
+## Usage
+
+Install `oriel-server` on the machine whose apps you want to use, and `oriel-client`
+(or the Flatpak) where you sit. The client reaches the server over SSH once, to get a
+connection URI, and then talks to it directly over QUIC (UDP).
+
+```bash
+# GUI launcher: add the host (an SSH target such as user@host) and connect
+oriel-client
+
+# From a terminal, optionally launching an app right away
+oriel-client connect user@host -- gnome-text-editor
+
+# A remote shell, without Wayland or audio
+oriel-client connect --terminal user@host
+
+# Without the client's SSH support: get a URI yourself and pass it on stdin
+ssh user@host oriel-server attach --host host | oriel-client --uri -
+```
+
+### The server daemon
+
+`oriel-server attach` starts a per-user server daemon on first use and keeps it, with its
+apps, running between connections; later `attach` calls reuse it. Its log is
+`$XDG_RUNTIME_DIR/oriel-server.log` on the server.
+
+- `oriel-server stop` stops the daemon and closes its apps.
+- After upgrading, a daemon from the old install may speak another protocol version than
+  the new client. `attach` refuses to hand out a URI for a daemon that reports another
+  version (daemons from before this check only get a warning, since they can't say);
+  `oriel-server attach --replace` stops it and starts the installed version.
+- `--listen IP[:PORT[-END]]` on `attach` (or `oriel-client connect --port`) picks the
+  address and UDP port(s) a new daemon listens on; by default it is any free UDP port on
+  all interfaces.
+
+### Security model
+
+- Every connection needs a single-use token that `attach` mints over SSH. Tokens expire
+  after 60 seconds and, when the client asks for it (the launcher and `connect` always
+  do), only work from the client's TLS certificate.
+- The client pins the server's ephemeral certificate by the SHA-256 fingerprint in the
+  URI, so it only ever talks to the server that SSH vouched for.
+- Tokens never appear in process arguments: the client takes URIs on stdin or from
+  `$ORIEL_URI`.
+- The server listens on all interfaces by default. A peer that has not authenticated must
+  do so within 10 seconds, may send at most 4 KiB before it has, and at most 32 such peers
+  are served at a time. Restrict `--listen` or firewall the port if the server should not
+  be reachable from the network.
+- An authenticated client can do whatever the server's user can: it launches apps and
+  opens shells.
