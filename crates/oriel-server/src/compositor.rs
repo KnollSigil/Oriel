@@ -1284,6 +1284,280 @@ impl AppState {
         }
     }
 
+    /// Apply the client's size, scale and state for a window: configure an `xdg_toplevel`, or move
+    /// and restack an X11 window, and rescale its surfaces when the scale changed.
+    fn configure_window(
+        &mut self,
+        serial: Serial,
+        window_id: WindowId,
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+        maximized: bool,
+        fullscreen: bool,
+        activated: bool,
+        tiled: bool,
+    ) {
+        let scale = sanitize_scale(scale_factor);
+        let mut scale_updated = false;
+        let mut toplevel_surface: Option<WlSurface> = None;
+        if let Some(tracked) = self.windows.get_mut(&window_id) {
+            if (tracked.scale_factor - scale).abs() > 0.005 {
+                tracked.scale_factor = scale;
+                scale_updated = true;
+            }
+            if let Some(toplevel) = tracked.window.toplevel() {
+                toplevel_surface = Some(toplevel.wl_surface().clone());
+                debug!(
+                    window_id,
+                    width,
+                    height,
+                    scale,
+                    maximized,
+                    fullscreen,
+                    activated,
+                    tiled,
+                    "ConfigureWindow -> remote toplevel"
+                );
+                toplevel.with_pending_state(|state| {
+                    state.size = Some((width as i32, height as i32).into());
+                    if maximized {
+                        state.states.set(xdg_toplevel::State::Maximized);
+                    } else {
+                        state.states.unset(xdg_toplevel::State::Maximized);
+                    }
+                    if fullscreen {
+                        state.states.set(xdg_toplevel::State::Fullscreen);
+                    } else {
+                        state.states.unset(xdg_toplevel::State::Fullscreen);
+                    }
+                    if activated {
+                        state.states.set(xdg_toplevel::State::Activated);
+                    } else {
+                        state.states.unset(xdg_toplevel::State::Activated);
+                    }
+                    for edge in [
+                        xdg_toplevel::State::TiledLeft,
+                        xdg_toplevel::State::TiledRight,
+                        xdg_toplevel::State::TiledTop,
+                        xdg_toplevel::State::TiledBottom,
+                    ] {
+                        if tiled {
+                            state.states.set(edge);
+                        } else {
+                            state.states.unset(edge);
+                        }
+                    }
+                });
+                toplevel.send_pending_configure();
+            }
+        } else if let Some(xwin) = self.x11_windows.get_mut(&window_id) {
+            let w = width.max(1) as i32;
+            let h = height.max(1) as i32;
+            let mut geo = xwin.geo;
+            geo.size = (w, h).into();
+            let min_w = geo.loc.x + geo.size.w + 64;
+            let min_h = geo.loc.y + geo.size.h + 64;
+            xwin.geo = geo;
+            let surf = xwin.surface.clone();
+            let has_child_popup = self.x11_popups.values().any(|p| p.parent_id == window_id);
+            let _ = surf.set_maximized(maximized);
+            let _ = surf.set_fullscreen(fullscreen);
+            if activated || !has_child_popup {
+                let _ = surf.set_activated(activated);
+            }
+            let _ = surf.configure(geo);
+            if activated && !has_child_popup {
+                if let Some(xwm) = self.xwm.as_mut() {
+                    let _ = xwm.raise_window(&surf);
+                }
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    let target = KeyboardFocusTarget::X11(surf.clone());
+                    if keyboard.current_focus().as_ref() != Some(&target) {
+                        keyboard.set_focus(self, Some(target), serial);
+                    }
+                }
+            }
+            self.ensure_virtual_output_size(min_w, min_h);
+        }
+        if scale_updated {
+            if let Some(root) = toplevel_surface {
+                Self::apply_surface_tree_scale(&root, scale);
+            }
+            let child_popups: Vec<WlSurface> = self
+                .popup_windows
+                .values()
+                .filter(|p| p.parent_id == window_id)
+                .map(|p| p.surface.wl_surface().clone())
+                .collect();
+            for pop_surf in child_popups {
+                Self::apply_surface_tree_scale(&pop_surf, scale);
+            }
+            if self.focused_window_id == window_id {
+                if let Some(cs) = self.cursor_surface.clone() {
+                    Self::apply_surface_tree_scale(&cs, scale);
+                }
+            }
+            self.update_output_and_xwayland_scale();
+        }
+    }
+
+    /// Press or release `button` over `window_id`; a press focuses and raises the window.
+    fn pointer_button(
+        &mut self,
+        serial: Serial,
+        time_ms: u32,
+        window_id: WindowId,
+        button: u32,
+        pressed: bool,
+    ) {
+        self.focused_window_id = window_id;
+        if pressed {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                if let Some(tracked) = self.windows.get(&window_id) {
+                    if let Some(toplevel) = tracked.window.toplevel() {
+                        let root_surface = toplevel.wl_surface().clone();
+                        let target = KeyboardFocusTarget::Wayland(root_surface.clone());
+                        if keyboard.current_focus().as_ref() != Some(&target) {
+                            keyboard.set_focus(self, Some(target), serial);
+                        }
+                        for (popup, _) in PopupManager::popups_for_surface(&root_surface) {
+                            let _ = PopupManager::dismiss_popup(&root_surface, &popup);
+                        }
+                    }
+                } else if let Some(xw) = self.x11_windows.get(&window_id) {
+                    self.last_focused_x11_window_id = Some(window_id);
+                    let x11_surf = xw.surface.clone();
+                    let has_child_popup =
+                        self.x11_popups.values().any(|p| p.parent_id == window_id);
+                    let target = KeyboardFocusTarget::X11(x11_surf.clone());
+                    if keyboard.current_focus().as_ref() != Some(&target) {
+                        keyboard.set_focus(self, Some(target), serial);
+                    }
+                    if !x11_surf.is_activated() {
+                        let _ = x11_surf.set_activated(true);
+                        if !has_child_popup {
+                            if let Some(xwm) = self.xwm.as_mut() {
+                                let _ = xwm.raise_window(&x11_surf);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if pressed {
+            self.pressed_buttons.insert(button);
+        } else {
+            self.pressed_buttons.remove(&button);
+        }
+        if let Some(pointer) = self.seat.get_pointer() {
+            let state = if pressed {
+                smithay::backend::input::ButtonState::Pressed
+            } else {
+                smithay::backend::input::ButtonState::Released
+            };
+            pointer.button(
+                self,
+                &ButtonEvent {
+                    button,
+                    state,
+                    serial,
+                    time: time_ms,
+                },
+            );
+            pointer.frame(self);
+        }
+    }
+
+    /// Start `exec` in the session and announce it as launching (or as failed). A `launch_id`
+    /// of 0 gets the next server-assigned id.
+    fn launch_app(&mut self, launch_id: u64, name: Option<String>, exec: String) {
+        let id = if launch_id == 0 {
+            let v = self.next_server_launch_id;
+            self.next_server_launch_id += 1;
+            v
+        } else {
+            launch_id
+        };
+        let display_name = name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| derive_exec_display_name(&exec));
+        match spawn_gui_shell(&self.socket_name, &exec, id, self.cmd_tx.clone()) {
+            Ok(pgid) => {
+                self.launched_apps.insert(
+                    id,
+                    LaunchedApp {
+                        launch_id: id,
+                        name: display_name.clone(),
+                        pgid,
+                        state: LaunchState::Launching,
+                        linked_window_id: None,
+                    },
+                );
+                let _ = self.event_tx.send(CompositorEvent::AppState {
+                    launch_id: id,
+                    name: display_name,
+                    state: LaunchState::Launching,
+                });
+            }
+            Err(err) => {
+                error!(error = %err, exec, "failed to launch remote application");
+                let _ = self.event_tx.send(CompositorEvent::AppState {
+                    launch_id: id,
+                    name: display_name,
+                    state: LaunchState::Exited(1),
+                });
+            }
+        }
+    }
+
+    /// Announce that a launched app exited, and give the window it opened, if any, an entry of
+    /// its own.
+    fn app_exited(&mut self, launch_id: u64, code: i32) {
+        if let Some(app) = self.launched_apps.remove(&launch_id) {
+            let _ = self.event_tx.send(CompositorEvent::AppState {
+                launch_id,
+                name: app.name.clone(),
+                state: LaunchState::Exited(code),
+            });
+            if let Some(wid) = app.linked_window_id {
+                if let Some(tracked) = self.windows.get_mut(&wid) {
+                    if !tracked.has_window_entry {
+                        tracked.has_window_entry = true;
+                        let win_name = if !app.name.is_empty() {
+                            app.name
+                        } else if !tracked.last_title.is_empty() {
+                            tracked.last_title.clone()
+                        } else {
+                            tracked.last_app_id.clone()
+                        };
+                        let _ = self.event_tx.send(CompositorEvent::AppState {
+                            launch_id: WINDOW_LAUNCH_ID_BASE | wid,
+                            name: win_name,
+                            state: LaunchState::Running,
+                        });
+                    }
+                } else if let Some(xwin) = self.x11_windows.get_mut(&wid) {
+                    if !xwin.has_window_entry {
+                        xwin.has_window_entry = true;
+                        let win_name = if !app.name.is_empty() {
+                            app.name
+                        } else if !xwin.last_title.is_empty() {
+                            xwin.last_title.clone()
+                        } else {
+                            xwin.last_app_id.clone()
+                        };
+                        let _ = self.event_tx.send(CompositorEvent::AppState {
+                            launch_id: WINDOW_LAUNCH_ID_BASE | wid,
+                            name: win_name,
+                            state: LaunchState::Running,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_command(&mut self, cmd: CompositorCommand) {
         let serial = SERIAL_COUNTER.next_serial();
         let time_ms = self.start_time.elapsed().as_millis() as u32;
@@ -1297,111 +1571,17 @@ impl AppState {
                 fullscreen,
                 activated,
                 tiled,
-            } => {
-                let scale = sanitize_scale(scale_factor);
-                let mut scale_updated = false;
-                let mut toplevel_surface: Option<WlSurface> = None;
-                if let Some(tracked) = self.windows.get_mut(&window_id) {
-                    if (tracked.scale_factor - scale).abs() > 0.005 {
-                        tracked.scale_factor = scale;
-                        scale_updated = true;
-                    }
-                    if let Some(toplevel) = tracked.window.toplevel() {
-                        toplevel_surface = Some(toplevel.wl_surface().clone());
-                        debug!(
-                            window_id,
-                            width,
-                            height,
-                            scale,
-                            maximized,
-                            fullscreen,
-                            activated,
-                            tiled,
-                            "ConfigureWindow -> remote toplevel"
-                        );
-                        toplevel.with_pending_state(|state| {
-                            state.size = Some((width as i32, height as i32).into());
-                            if maximized {
-                                state.states.set(xdg_toplevel::State::Maximized);
-                            } else {
-                                state.states.unset(xdg_toplevel::State::Maximized);
-                            }
-                            if fullscreen {
-                                state.states.set(xdg_toplevel::State::Fullscreen);
-                            } else {
-                                state.states.unset(xdg_toplevel::State::Fullscreen);
-                            }
-                            if activated {
-                                state.states.set(xdg_toplevel::State::Activated);
-                            } else {
-                                state.states.unset(xdg_toplevel::State::Activated);
-                            }
-                            for edge in [
-                                xdg_toplevel::State::TiledLeft,
-                                xdg_toplevel::State::TiledRight,
-                                xdg_toplevel::State::TiledTop,
-                                xdg_toplevel::State::TiledBottom,
-                            ] {
-                                if tiled {
-                                    state.states.set(edge);
-                                } else {
-                                    state.states.unset(edge);
-                                }
-                            }
-                        });
-                        toplevel.send_pending_configure();
-                    }
-                } else if let Some(xwin) = self.x11_windows.get_mut(&window_id) {
-                    let w = width.max(1) as i32;
-                    let h = height.max(1) as i32;
-                    let mut geo = xwin.geo;
-                    geo.size = (w, h).into();
-                    let min_w = geo.loc.x + geo.size.w + 64;
-                    let min_h = geo.loc.y + geo.size.h + 64;
-                    xwin.geo = geo;
-                    let surf = xwin.surface.clone();
-                    let has_child_popup =
-                        self.x11_popups.values().any(|p| p.parent_id == window_id);
-                    let _ = surf.set_maximized(maximized);
-                    let _ = surf.set_fullscreen(fullscreen);
-                    if activated || !has_child_popup {
-                        let _ = surf.set_activated(activated);
-                    }
-                    let _ = surf.configure(geo);
-                    if activated && !has_child_popup {
-                        if let Some(xwm) = self.xwm.as_mut() {
-                            let _ = xwm.raise_window(&surf);
-                        }
-                        if let Some(keyboard) = self.seat.get_keyboard() {
-                            let target = KeyboardFocusTarget::X11(surf.clone());
-                            if keyboard.current_focus().as_ref() != Some(&target) {
-                                keyboard.set_focus(self, Some(target), serial);
-                            }
-                        }
-                    }
-                    self.ensure_virtual_output_size(min_w, min_h);
-                }
-                if scale_updated {
-                    if let Some(root) = toplevel_surface {
-                        Self::apply_surface_tree_scale(&root, scale);
-                    }
-                    let child_popups: Vec<WlSurface> = self
-                        .popup_windows
-                        .values()
-                        .filter(|p| p.parent_id == window_id)
-                        .map(|p| p.surface.wl_surface().clone())
-                        .collect();
-                    for pop_surf in child_popups {
-                        Self::apply_surface_tree_scale(&pop_surf, scale);
-                    }
-                    if self.focused_window_id == window_id {
-                        if let Some(cs) = self.cursor_surface.clone() {
-                            Self::apply_surface_tree_scale(&cs, scale);
-                        }
-                    }
-                    self.update_output_and_xwayland_scale();
-                }
-            }
+            } => self.configure_window(
+                serial,
+                window_id,
+                width,
+                height,
+                scale_factor,
+                maximized,
+                fullscreen,
+                activated,
+                tiled,
+            ),
             CompositorCommand::SessionReady => {
                 self.initial_session_ready = true;
                 self.maybe_launch_initial_command();
@@ -1558,64 +1738,7 @@ impl AppState {
                 window_id,
                 button,
                 pressed,
-            } => {
-                self.focused_window_id = window_id;
-                if pressed {
-                    if let Some(keyboard) = self.seat.get_keyboard() {
-                        if let Some(tracked) = self.windows.get(&window_id) {
-                            if let Some(toplevel) = tracked.window.toplevel() {
-                                let root_surface = toplevel.wl_surface().clone();
-                                let target = KeyboardFocusTarget::Wayland(root_surface.clone());
-                                if keyboard.current_focus().as_ref() != Some(&target) {
-                                    keyboard.set_focus(self, Some(target), serial);
-                                }
-                                for (popup, _) in PopupManager::popups_for_surface(&root_surface) {
-                                    let _ = PopupManager::dismiss_popup(&root_surface, &popup);
-                                }
-                            }
-                        } else if let Some(xw) = self.x11_windows.get(&window_id) {
-                            self.last_focused_x11_window_id = Some(window_id);
-                            let x11_surf = xw.surface.clone();
-                            let has_child_popup =
-                                self.x11_popups.values().any(|p| p.parent_id == window_id);
-                            let target = KeyboardFocusTarget::X11(x11_surf.clone());
-                            if keyboard.current_focus().as_ref() != Some(&target) {
-                                keyboard.set_focus(self, Some(target), serial);
-                            }
-                            if !x11_surf.is_activated() {
-                                let _ = x11_surf.set_activated(true);
-                                if !has_child_popup {
-                                    if let Some(xwm) = self.xwm.as_mut() {
-                                        let _ = xwm.raise_window(&x11_surf);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if pressed {
-                    self.pressed_buttons.insert(button);
-                } else {
-                    self.pressed_buttons.remove(&button);
-                }
-                if let Some(pointer) = self.seat.get_pointer() {
-                    let state = if pressed {
-                        smithay::backend::input::ButtonState::Pressed
-                    } else {
-                        smithay::backend::input::ButtonState::Released
-                    };
-                    pointer.button(
-                        self,
-                        &ButtonEvent {
-                            button,
-                            state,
-                            serial,
-                            time: time_ms,
-                        },
-                    );
-                    pointer.frame(self);
-                }
-            }
+            } => self.pointer_button(serial, time_ms, window_id, button, pressed),
             CompositorCommand::PointerAxis { window_id, dx, dy } => {
                 self.focused_window_id = window_id;
                 if let Some(pointer) = self.seat.get_pointer() {
@@ -1738,45 +1861,7 @@ impl AppState {
                 launch_id,
                 name,
                 exec,
-            } => {
-                let id = if launch_id == 0 {
-                    let v = self.next_server_launch_id;
-                    self.next_server_launch_id += 1;
-                    v
-                } else {
-                    launch_id
-                };
-                let display_name = name
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| derive_exec_display_name(&exec));
-                match spawn_gui_shell(&self.socket_name, &exec, id, self.cmd_tx.clone()) {
-                    Ok(pgid) => {
-                        self.launched_apps.insert(
-                            id,
-                            LaunchedApp {
-                                launch_id: id,
-                                name: display_name.clone(),
-                                pgid,
-                                state: LaunchState::Launching,
-                                linked_window_id: None,
-                            },
-                        );
-                        let _ = self.event_tx.send(CompositorEvent::AppState {
-                            launch_id: id,
-                            name: display_name,
-                            state: LaunchState::Launching,
-                        });
-                    }
-                    Err(err) => {
-                        error!(error = %err, exec, "failed to launch remote application");
-                        let _ = self.event_tx.send(CompositorEvent::AppState {
-                            launch_id: id,
-                            name: display_name,
-                            state: LaunchState::Exited(1),
-                        });
-                    }
-                }
-            }
+            } => self.launch_app(launch_id, name, exec),
             CompositorCommand::TerminateApp { launch_id, force } => {
                 if launch_id >= WINDOW_LAUNCH_ID_BASE {
                     let wid = launch_id & !WINDOW_LAUNCH_ID_BASE;
@@ -1796,50 +1881,7 @@ impl AppState {
                     }
                 }
             }
-            CompositorCommand::AppExited { launch_id, code } => {
-                if let Some(app) = self.launched_apps.remove(&launch_id) {
-                    let _ = self.event_tx.send(CompositorEvent::AppState {
-                        launch_id,
-                        name: app.name.clone(),
-                        state: LaunchState::Exited(code),
-                    });
-                    if let Some(wid) = app.linked_window_id {
-                        if let Some(tracked) = self.windows.get_mut(&wid) {
-                            if !tracked.has_window_entry {
-                                tracked.has_window_entry = true;
-                                let win_name = if !app.name.is_empty() {
-                                    app.name
-                                } else if !tracked.last_title.is_empty() {
-                                    tracked.last_title.clone()
-                                } else {
-                                    tracked.last_app_id.clone()
-                                };
-                                let _ = self.event_tx.send(CompositorEvent::AppState {
-                                    launch_id: WINDOW_LAUNCH_ID_BASE | wid,
-                                    name: win_name,
-                                    state: LaunchState::Running,
-                                });
-                            }
-                        } else if let Some(xwin) = self.x11_windows.get_mut(&wid) {
-                            if !xwin.has_window_entry {
-                                xwin.has_window_entry = true;
-                                let win_name = if !app.name.is_empty() {
-                                    app.name
-                                } else if !xwin.last_title.is_empty() {
-                                    xwin.last_title.clone()
-                                } else {
-                                    xwin.last_app_id.clone()
-                                };
-                                let _ = self.event_tx.send(CompositorEvent::AppState {
-                                    launch_id: WINDOW_LAUNCH_ID_BASE | wid,
-                                    name: win_name,
-                                    state: LaunchState::Running,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+            CompositorCommand::AppExited { launch_id, code } => self.app_exited(launch_id, code),
             CompositorCommand::Snapshot { sync_id, reply } => {
                 // The marker goes out on the shared event stream at the exact point the
                 // snapshot is taken, so the requesting connection can tell which streamed

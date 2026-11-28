@@ -769,6 +769,93 @@ fn request_snapshot(
     Ok(PendingSnapshot { sync_id, reply })
 }
 
+/// Start the display client's audio bridge: each app's playback goes to the client on a
+/// stream of its own, and microphone streams from the client are injected into the
+/// session's virtual source. Returns when the session wants the microphone, and the guard
+/// that keeps playback capture running.
+fn start_audio_bridge(
+    conn: &quinn::Connection,
+) -> (
+    Option<mpsc::UnboundedReceiver<bool>>,
+    Option<crate::audio::PlaybackBridgeGuard>,
+) {
+    let (mic_rx, guard) = match start_per_app_playback_capture() {
+        Ok(bridge) => {
+            let mut streams = bridge.streams;
+            let playback_conn = conn.clone();
+            tokio::spawn(async move {
+                while let Some(mut app_stream) = streams.recv().await {
+                    let conn = playback_conn.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut stream) = conn.open_uni().await else {
+                            warn!(
+                                stream_id = app_stream.stream_id,
+                                app_name = %app_stream.app_name,
+                                "failed to open AudioPlaybackApp uni stream"
+                            );
+                            return;
+                        };
+                        let header = StreamHeader::AudioPlaybackApp {
+                            stream_id: app_stream.stream_id,
+                            app_name: app_stream.app_name.clone(),
+                            media_name: app_stream.media_name.clone(),
+                            icon_name: app_stream.icon_name.clone(),
+                            media_role: app_stream.media_role.clone(),
+                        };
+                        if let Err(err) = write_stream_header(&mut stream, &header).await {
+                            warn!(error = %err, "failed to write AudioPlaybackApp stream header");
+                            return;
+                        }
+                        while let Some(pkt) = app_stream.packets.recv().await {
+                            let hdr = AudioPacketHeader {
+                                pts_ns: pkt.pts_ns,
+                                payload_len: pkt.data.len() as u32,
+                            };
+                            if let Err(err) = write_audio_packet(&mut stream, &hdr, &pkt.data).await
+                            {
+                                warn!(error = %err, "AudioPlaybackApp stream write error");
+                                break;
+                            }
+                        }
+                        let _ = stream.finish();
+                    });
+                }
+            });
+            (Some(bridge.mic_active), Some(bridge.guard))
+        }
+        Err(err) => {
+            warn!(error = %err, "server audio capture unavailable");
+            (None, None)
+        }
+    };
+
+    let mic_conn = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(mut recv_uni) = mic_conn.accept_uni().await {
+            tokio::spawn(async move {
+                match read_stream_header(&mut recv_uni).await {
+                    Ok(StreamHeader::AudioCapture) => match AudioMicInjector::new() {
+                        Ok(injector) => {
+                            while let Ok(Some((hdr, payload))) =
+                                read_audio_packet(&mut recv_uni).await
+                            {
+                                if let Err(err) = injector.push_audio(hdr.pts_ns, &payload) {
+                                    warn!(error = %err, "server mic push error");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(err) => warn!(error = %err, "server mic injector unavailable"),
+                    },
+                    Ok(other) => warn!(?other, "unexpected uni stream from client"),
+                    Err(err) => warn!(error = %err, "failed to read client uni stream header"),
+                }
+            });
+        }
+    });
+    (mic_rx, guard)
+}
+
 async fn run_display_session(
     conn: &quinn::Connection,
     mut send: quinn::SendStream,
@@ -814,82 +901,7 @@ async fn run_display_session(
 
     // Start bidirectional PipeWire <-> Opus audio bridge if requested.
     let (mut mic_active_rx, audio_bridge_guard) = if enable_audio_bridge {
-        let (mic_rx, guard) = match start_per_app_playback_capture() {
-            Ok(bridge) => {
-                let mut streams = bridge.streams;
-                let playback_conn = conn.clone();
-                tokio::spawn(async move {
-                    while let Some(mut app_stream) = streams.recv().await {
-                        let conn = playback_conn.clone();
-                        tokio::spawn(async move {
-                            let Ok(mut stream) = conn.open_uni().await else {
-                                warn!(
-                                    stream_id = app_stream.stream_id,
-                                    app_name = %app_stream.app_name,
-                                    "failed to open AudioPlaybackApp uni stream"
-                                );
-                                return;
-                            };
-                            let header = StreamHeader::AudioPlaybackApp {
-                                stream_id: app_stream.stream_id,
-                                app_name: app_stream.app_name.clone(),
-                                media_name: app_stream.media_name.clone(),
-                                icon_name: app_stream.icon_name.clone(),
-                                media_role: app_stream.media_role.clone(),
-                            };
-                            if let Err(err) = write_stream_header(&mut stream, &header).await {
-                                warn!(error = %err, "failed to write AudioPlaybackApp stream header");
-                                return;
-                            }
-                            while let Some(pkt) = app_stream.packets.recv().await {
-                                let hdr = AudioPacketHeader {
-                                    pts_ns: pkt.pts_ns,
-                                    payload_len: pkt.data.len() as u32,
-                                };
-                                if let Err(err) =
-                                    write_audio_packet(&mut stream, &hdr, &pkt.data).await
-                                {
-                                    warn!(error = %err, "AudioPlaybackApp stream write error");
-                                    break;
-                                }
-                            }
-                            let _ = stream.finish();
-                        });
-                    }
-                });
-                (Some(bridge.mic_active), Some(bridge.guard))
-            }
-            Err(err) => {
-                warn!(error = %err, "server audio capture unavailable");
-                (None, None)
-            }
-        };
-
-        let mic_conn = conn.clone();
-        tokio::spawn(async move {
-            while let Ok(mut recv_uni) = mic_conn.accept_uni().await {
-                tokio::spawn(async move {
-                    match read_stream_header(&mut recv_uni).await {
-                        Ok(StreamHeader::AudioCapture) => match AudioMicInjector::new() {
-                            Ok(injector) => {
-                                while let Ok(Some((hdr, payload))) =
-                                    read_audio_packet(&mut recv_uni).await
-                                {
-                                    if let Err(err) = injector.push_audio(hdr.pts_ns, &payload) {
-                                        warn!(error = %err, "server mic push error");
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(err) => warn!(error = %err, "server mic injector unavailable"),
-                        },
-                        Ok(other) => warn!(?other, "unexpected uni stream from client"),
-                        Err(err) => warn!(error = %err, "failed to read client uni stream header"),
-                    }
-                });
-            }
-        });
-        (mic_rx, guard)
+        start_audio_bridge(conn)
     } else {
         (None, None)
     };

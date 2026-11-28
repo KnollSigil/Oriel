@@ -338,6 +338,333 @@ pub struct TransferStatus {
     pub rate: u64,
 }
 
+/// Listen on the local 0600 Unix socket `sock_path` and tunnel each `oriel-client pty-attach
+/// --socket` connection over its own QUIC bidirectional stream on `conn`.
+fn spawn_pty_tunnel(
+    conn: &quinn::Connection,
+    sock_path: PathBuf,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let _ = fs::remove_file(&sock_path);
+    match tokio::net::UnixListener::bind(&sock_path) {
+        Ok(listener) => {
+            if let Err(err) = fs::set_permissions(&sock_path, Permissions::from_mode(0o600)) {
+                warn!(path = %sock_path.display(), error = %err, "failed to chmod 0600 PTY tunnel socket");
+            }
+            info!(path = %sock_path.display(), "local PTY Unix tunnel listening (mode 0600)");
+            let tunnel_conn = conn.clone();
+            Some(tokio::spawn(async move {
+                let mut streams = tokio::task::JoinSet::new();
+                while let Ok((unix_stream, _)) = listener.accept().await {
+                    while streams.try_join_next().is_some() {}
+                    let c = tunnel_conn.clone();
+                    streams.spawn(async move {
+                        let Ok((mut quic_send, mut quic_recv)) = c.open_bi().await else {
+                            warn!("failed to open QUIC bidi stream for tunneled PTY");
+                            return;
+                        };
+                        let (mut unix_read, mut unix_write) = unix_stream.into_split();
+                        let up = async {
+                            let _ = tokio::io::copy(&mut unix_read, &mut quic_send).await;
+                            let _ = quic_send.finish();
+                        };
+                        let down = async {
+                            let _ = tokio::io::copy(&mut quic_recv, &mut unix_write).await;
+                        };
+                        tokio::join!(up, down);
+                    });
+                }
+            }))
+        }
+        Err(err) => {
+            warn!(path = %sock_path.display(), error = %err, "failed to bind local PTY tunnel socket");
+            None
+        }
+    }
+}
+
+/// Apply clipboard and drag offers from the server in order: a file offer takes a moment to
+/// set up (the first one mounts the transfer filesystem), and text copied after it must not
+/// be overtaken. Returns where to send the offers.
+fn spawn_clipboard_applier(
+    conn: quinn::Connection,
+    ui_tx: UiSender,
+) -> (
+    mpsc::UnboundedSender<ControlMessage>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    let task = tokio::spawn(async move {
+        while let Some(msg) = clipboard_rx.recv().await {
+            match msg {
+                ControlMessage::ClipboardOffer {
+                    offer_id,
+                    mimes,
+                    text,
+                    files,
+                } => {
+                    let files =
+                        receive_files(&conn, oriel_proto::xfer::OfferSlot::Clipboard, files).await;
+                    if files.is_none() && text.is_none() && mimes.is_empty() {
+                        continue;
+                    }
+                    let clip = oriel_proto::selection::ReceivedClipboard {
+                        offer_id,
+                        mimes,
+                        text,
+                        files,
+                    };
+                    let fetch = crate::xfer::SelectionFetcher {
+                        conn: conn.clone(),
+                        rt: tokio::runtime::Handle::current(),
+                    };
+                    let _ = ui_tx.send(ClientUiEvent::ClipboardOffer { clip, fetch });
+                }
+                ControlMessage::RemoteDragStart {
+                    window_id,
+                    offer_id,
+                    mimes,
+                    files,
+                } => {
+                    let files =
+                        receive_files(&conn, oriel_proto::xfer::OfferSlot::Drag, files).await;
+                    if files.is_none() && mimes.is_empty() {
+                        continue;
+                    }
+                    let clip = oriel_proto::selection::ReceivedClipboard {
+                        offer_id,
+                        mimes,
+                        text: None,
+                        files,
+                    };
+                    let fetch = crate::xfer::SelectionFetcher {
+                        conn: conn.clone(),
+                        rt: tokio::runtime::Handle::current(),
+                    };
+                    let _ = ui_tx.send(ClientUiEvent::RemoteDragStart {
+                        window_id,
+                        clip,
+                        fetch,
+                    });
+                }
+                _ => {}
+            }
+        }
+    });
+    (clipboard_tx, task)
+}
+
+/// Present the files of a server offer through the transfer mount; `None` when there are
+/// none or none could be presented.
+async fn receive_files(
+    conn: &quinn::Connection,
+    slot: oriel_proto::xfer::OfferSlot,
+    files: Option<oriel_proto::xfer::FileOffer>,
+) -> Option<Vec<PathBuf>> {
+    let f = files?;
+    let conn = conn.clone();
+    let paths = tokio::task::spawn_blocking(move || {
+        crate::xfer::receive_offer(conn, slot, f.offer_id, f.roots)
+    })
+    .await
+    .unwrap_or_default();
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Report the connection's round trip, loss, rates, file transfers and busiest traffic
+/// sources to the launcher once a second, until it goes away.
+fn spawn_stats_reporter(
+    stats_conn: quinn::Connection,
+    tx: mpsc::UnboundedSender<LauncherNetEvent>,
+    traffic: Arc<crate::traffic::TrafficMeter>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Count from now: what connecting sent (the handshake, the first window images)
+        // is not one second's traffic.
+        let start = stats_conn.stats();
+        let mut prev_lost = start.path.lost_packets;
+        let mut prev_source_bytes = std::collections::HashMap::<crate::traffic::Source, u64>::new();
+        let mut prev_bytes = (start.udp_rx.bytes, start.udp_tx.bytes);
+        let mut prev_moved = std::collections::HashMap::<u64, u64>::new();
+        let mut prev_at = std::time::Instant::now();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let secs = prev_at.elapsed().as_secs_f64().max(0.001);
+            prev_at = std::time::Instant::now();
+            let per_sec = |delta: u64| (delta as f64 / secs) as u64;
+            let rtt_ms = stats_conn.rtt().as_millis() as u32;
+            let stats = stats_conn.stats();
+            let lost = stats.path.lost_packets;
+            let loss_delta = lost.saturating_sub(prev_lost);
+            prev_lost = lost;
+            let congested = rtt_ms > 150 || loss_delta > 5;
+            let bytes = (stats.udp_rx.bytes, stats.udp_tx.bytes);
+            let rx_rate = per_sec(bytes.0.saturating_sub(prev_bytes.0));
+            let tx_rate = per_sec(bytes.1.saturating_sub(prev_bytes.1));
+            prev_bytes = bytes;
+            let transfers: Vec<TransferStatus> =
+                oriel_proto::transfers::list(stats_conn.stable_id())
+                    .into_iter()
+                    .map(|info| {
+                        // A transfer listed for the first time has moved what it has
+                        // since it started, more than one tick ago.
+                        let rate = match prev_moved.get(&info.id) {
+                            Some(&before) => per_sec(info.moved.saturating_sub(before)),
+                            None => (info.moved as f64 / info.age.as_secs_f64().max(secs)) as u64,
+                        };
+                        TransferStatus { info, rate }
+                    })
+                    .collect();
+            prev_moved = transfers
+                .iter()
+                .map(|t| (t.info.id, t.info.moved))
+                .collect();
+            let totals = traffic.totals();
+            let mut sources: Vec<SourceRate> = totals
+                .iter()
+                .filter_map(|t| {
+                    // A source seen for the first time is listed from its second
+                    // tick: what it received before is not from one tick.
+                    let before = prev_source_bytes.get(&t.source).copied()?;
+                    let rate = per_sec(t.bytes.saturating_sub(before));
+                    (rate >= MIN_LISTED_RATE).then(|| SourceRate {
+                        source: t.source,
+                        name: t.name.clone(),
+                        detail: t.detail.clone(),
+                        rate,
+                    })
+                })
+                .collect();
+            prev_source_bytes = totals.iter().map(|t| (t.source, t.bytes)).collect();
+            sources.sort_by(|a, b| b.rate.cmp(&a.rate).then_with(|| a.name.cmp(&b.name)));
+            sources.truncate(MAX_LISTED_SOURCES);
+            let event = LauncherNetEvent::NetStats {
+                rtt_ms,
+                congested,
+                rx_rate,
+                tx_rate,
+                transfers,
+                sources,
+            };
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Accept the server's unidirectional streams (window video, audio playback) and serve
+/// each in a task of its own until the connection closes.
+fn spawn_uni_stream_acceptor(
+    conn: quinn::Connection,
+    ui_tx: UiSender,
+    frame_ack_tx: mpsc::UnboundedSender<(WindowId, u64)>,
+    traffic: Arc<crate::traffic::TrafficMeter>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut streams = tokio::task::JoinSet::new();
+        while let Ok(recv_uni) = conn.accept_uni().await {
+            while streams.try_join_next().is_some() {}
+            streams.spawn(serve_uni_stream(
+                recv_uni,
+                ui_tx.clone(),
+                frame_ack_tx.clone(),
+                Arc::clone(&traffic),
+            ));
+        }
+    })
+}
+
+/// Serve one unidirectional stream from the server by its [`StreamHeader`]: decode and show a
+/// window's video, or play an audio stream.
+async fn serve_uni_stream(
+    mut recv_uni: quinn::RecvStream,
+    tx: UiSender,
+    ack_tx: mpsc::UnboundedSender<(WindowId, u64)>,
+    traffic: Arc<crate::traffic::TrafficMeter>,
+) {
+    match read_stream_header(&mut recv_uni).await {
+        Ok(StreamHeader::Video { window_id, codec }) => {
+            let mut decoder = Some(WindowVideoDecoder::new(codec));
+            while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
+                traffic.add_window(window_id, payload.len());
+                let mut dec = decoder.take().unwrap();
+                let decode_res = tokio::task::spawn_blocking(move || {
+                    let res = dec.decode(hdr.width, hdr.height, hdr.is_keyframe, &payload);
+                    (dec, res)
+                })
+                .await;
+                let (dec, frame_res) = match decode_res {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        warn!(window_id, error = %err, "video decoder task panicked");
+                        break;
+                    }
+                };
+                decoder = Some(dec);
+                match frame_res {
+                    Ok(frame) => {
+                        tx.push_frame(
+                            window_id,
+                            frame.width,
+                            frame.height,
+                            hdr.logical_width,
+                            hdr.logical_height,
+                            hdr.geometry,
+                            hdr.input_bounds,
+                            frame.bgra,
+                            frame.damage,
+                        );
+                        let _ = ack_tx.send((window_id, hdr.pts_ns));
+                    }
+                    Err(err) => warn!(window_id, error = %err, "video decode error"),
+                }
+            }
+        }
+        Ok(StreamHeader::AudioPlayback) => match AudioPlaybackSink::new() {
+            Ok(sink) => {
+                while let Ok(Some((hdr, payload))) = read_audio_packet(&mut recv_uni).await {
+                    if let Err(err) = sink.push_audio(hdr.pts_ns, &payload) {
+                        warn!(error = %err, "audio playback push error");
+                        break;
+                    }
+                }
+            }
+            Err(err) => warn!(error = %err, "client audio playback unavailable"),
+        },
+        Ok(StreamHeader::AudioPlaybackApp {
+            stream_id,
+            app_name,
+            media_name,
+            icon_name,
+            media_role,
+        }) => match AudioPlaybackSink::new_for_app(&app_name, &media_name, &icon_name, &media_role)
+        {
+            Ok(sink) => {
+                info!(stream_id, %app_name, %media_name, "opened per-app host audio stream");
+                traffic.audio_opened(stream_id, &app_name, &media_name);
+                while let Ok(Some((hdr, payload))) = read_audio_packet(&mut recv_uni).await {
+                    traffic.add_audio(stream_id, payload.len());
+                    if let Err(err) = sink.push_audio(hdr.pts_ns, &payload) {
+                        warn!(stream_id, error = %err, "audio playback push error");
+                        break;
+                    }
+                }
+                traffic.audio_closed(stream_id);
+            }
+            Err(err) => {
+                warn!(stream_id, %app_name, error = %err, "client per-app audio playback unavailable")
+            }
+        },
+        Ok(other) => {
+            info!(?other, "received unexpected uni stream");
+        }
+        Err(err) => warn!(error = %err, "failed to read StreamHeader"),
+    }
+}
+
 /// Connect to the Oriel server, verify its TLS fingerprint, and run the session loops.
 pub async fn run_client(
     server_addr: SocketAddr,
@@ -371,46 +698,9 @@ pub async fn run_client(
 
     // Optional local 0600 Unix socket that tunnels `oriel-client pty-attach --socket <path>`
     // directly over multiplexed QUIC bidirectional streams on this authenticated connection.
-    let pty_tunnel_task = if let Some(sock_path) = pty_socket_path.clone() {
-        let _ = fs::remove_file(&sock_path);
-        match tokio::net::UnixListener::bind(&sock_path) {
-            Ok(listener) => {
-                if let Err(err) = fs::set_permissions(&sock_path, Permissions::from_mode(0o600)) {
-                    warn!(path = %sock_path.display(), error = %err, "failed to chmod 0600 PTY tunnel socket");
-                }
-                info!(path = %sock_path.display(), "local PTY Unix tunnel listening (mode 0600)");
-                let tunnel_conn = conn.clone();
-                Some(tokio::spawn(async move {
-                    let mut streams = tokio::task::JoinSet::new();
-                    while let Ok((unix_stream, _)) = listener.accept().await {
-                        while streams.try_join_next().is_some() {}
-                        let c = tunnel_conn.clone();
-                        streams.spawn(async move {
-                            let Ok((mut quic_send, mut quic_recv)) = c.open_bi().await else {
-                                warn!("failed to open QUIC bidi stream for tunneled PTY");
-                                return;
-                            };
-                            let (mut unix_read, mut unix_write) = unix_stream.into_split();
-                            let up = async {
-                                let _ = tokio::io::copy(&mut unix_read, &mut quic_send).await;
-                                let _ = quic_send.finish();
-                            };
-                            let down = async {
-                                let _ = tokio::io::copy(&mut quic_recv, &mut unix_write).await;
-                            };
-                            tokio::join!(up, down);
-                        });
-                    }
-                }))
-            }
-            Err(err) => {
-                warn!(path = %sock_path.display(), error = %err, "failed to bind local PTY tunnel socket");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let pty_tunnel_task = pty_socket_path
+        .clone()
+        .and_then(|sock_path| spawn_pty_tunnel(&conn, sock_path));
 
     // Serves the server's reads of files this client put on the clipboard.
     let xfer_task = crate::xfer::spawn_stream_acceptor(conn.clone());
@@ -418,184 +708,12 @@ pub async fn run_client(
     // Clipboard updates from the server, applied in order: a file offer takes a moment to
     // set up (the first one mounts the transfer filesystem), and text copied after it must
     // not be overtaken.
-    let (clipboard_tx, mut clipboard_rx) = mpsc::unbounded_channel::<ControlMessage>();
-    let clipboard_task = {
-        let conn = conn.clone();
-        let ui_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = clipboard_rx.recv().await {
-                match msg {
-                    ControlMessage::ClipboardOffer {
-                        offer_id,
-                        mimes,
-                        text,
-                        files,
-                    } => {
-                        let files = match files {
-                            Some(f) => {
-                                let conn = conn.clone();
-                                let paths = tokio::task::spawn_blocking(move || {
-                                    crate::xfer::receive_offer(
-                                        conn,
-                                        oriel_proto::xfer::OfferSlot::Clipboard,
-                                        f.offer_id,
-                                        f.roots,
-                                    )
-                                })
-                                .await
-                                .unwrap_or_default();
-                                (!paths.is_empty()).then_some(paths)
-                            }
-                            None => None,
-                        };
-                        if files.is_none() && text.is_none() && mimes.is_empty() {
-                            continue;
-                        }
-                        let clip = oriel_proto::selection::ReceivedClipboard {
-                            offer_id,
-                            mimes,
-                            text,
-                            files,
-                        };
-                        let fetch = crate::xfer::SelectionFetcher {
-                            conn: conn.clone(),
-                            rt: tokio::runtime::Handle::current(),
-                        };
-                        let _ = ui_tx.send(ClientUiEvent::ClipboardOffer { clip, fetch });
-                    }
-                    ControlMessage::RemoteDragStart {
-                        window_id,
-                        offer_id,
-                        mimes,
-                        files,
-                    } => {
-                        let files = match files {
-                            Some(f) => {
-                                let conn = conn.clone();
-                                let paths = tokio::task::spawn_blocking(move || {
-                                    crate::xfer::receive_offer(
-                                        conn,
-                                        oriel_proto::xfer::OfferSlot::Drag,
-                                        f.offer_id,
-                                        f.roots,
-                                    )
-                                })
-                                .await
-                                .unwrap_or_default();
-                                (!paths.is_empty()).then_some(paths)
-                            }
-                            None => None,
-                        };
-                        if files.is_none() && mimes.is_empty() {
-                            continue;
-                        }
-                        let clip = oriel_proto::selection::ReceivedClipboard {
-                            offer_id,
-                            mimes,
-                            text: None,
-                            files,
-                        };
-                        let fetch = crate::xfer::SelectionFetcher {
-                            conn: conn.clone(),
-                            rt: tokio::runtime::Handle::current(),
-                        };
-                        let _ = ui_tx.send(ClientUiEvent::RemoteDragStart {
-                            window_id,
-                            clip,
-                            fetch,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        })
-    };
+    let (clipboard_tx, clipboard_task) = spawn_clipboard_applier(conn.clone(), ui_tx.clone());
 
     let traffic = Arc::new(crate::traffic::TrafficMeter::default());
-    let stats_task = launcher_tx.as_ref().map(|tx| {
-        let stats_conn = conn.clone();
-        let tx = tx.clone();
-        let traffic = Arc::clone(&traffic);
-        tokio::spawn(async move {
-            // Count from now: what connecting sent (the handshake, the first window images)
-            // is not one second's traffic.
-            let start = stats_conn.stats();
-            let mut prev_lost = start.path.lost_packets;
-            let mut prev_source_bytes =
-                std::collections::HashMap::<crate::traffic::Source, u64>::new();
-            let mut prev_bytes = (start.udp_rx.bytes, start.udp_tx.bytes);
-            let mut prev_moved = std::collections::HashMap::<u64, u64>::new();
-            let mut prev_at = std::time::Instant::now();
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let secs = prev_at.elapsed().as_secs_f64().max(0.001);
-                prev_at = std::time::Instant::now();
-                let per_sec = |delta: u64| (delta as f64 / secs) as u64;
-                let rtt_ms = stats_conn.rtt().as_millis() as u32;
-                let stats = stats_conn.stats();
-                let lost = stats.path.lost_packets;
-                let loss_delta = lost.saturating_sub(prev_lost);
-                prev_lost = lost;
-                let congested = rtt_ms > 150 || loss_delta > 5;
-                let bytes = (stats.udp_rx.bytes, stats.udp_tx.bytes);
-                let rx_rate = per_sec(bytes.0.saturating_sub(prev_bytes.0));
-                let tx_rate = per_sec(bytes.1.saturating_sub(prev_bytes.1));
-                prev_bytes = bytes;
-                let transfers: Vec<TransferStatus> =
-                    oriel_proto::transfers::list(stats_conn.stable_id())
-                        .into_iter()
-                        .map(|info| {
-                            // A transfer listed for the first time has moved what it has
-                            // since it started, more than one tick ago.
-                            let rate = match prev_moved.get(&info.id) {
-                                Some(&before) => per_sec(info.moved.saturating_sub(before)),
-                                None => {
-                                    (info.moved as f64 / info.age.as_secs_f64().max(secs)) as u64
-                                }
-                            };
-                            TransferStatus { info, rate }
-                        })
-                        .collect();
-                prev_moved = transfers
-                    .iter()
-                    .map(|t| (t.info.id, t.info.moved))
-                    .collect();
-                let totals = traffic.totals();
-                let mut sources: Vec<SourceRate> = totals
-                    .iter()
-                    .filter_map(|t| {
-                        // A source seen for the first time is listed from its second
-                        // tick: what it received before is not from one tick.
-                        let before = prev_source_bytes.get(&t.source).copied()?;
-                        let rate = per_sec(t.bytes.saturating_sub(before));
-                        (rate >= MIN_LISTED_RATE).then(|| SourceRate {
-                            source: t.source,
-                            name: t.name.clone(),
-                            detail: t.detail.clone(),
-                            rate,
-                        })
-                    })
-                    .collect();
-                prev_source_bytes = totals.iter().map(|t| (t.source, t.bytes)).collect();
-                sources.sort_by(|a, b| b.rate.cmp(&a.rate).then_with(|| a.name.cmp(&b.name)));
-                sources.truncate(MAX_LISTED_SOURCES);
-                let event = LauncherNetEvent::NetStats {
-                    rtt_ms,
-                    congested,
-                    rx_rate,
-                    tx_rate,
-                    transfers,
-                    sources,
-                };
-                if tx.send(event).is_err() {
-                    break;
-                }
-            }
-        })
-    });
+    let stats_task = launcher_tx
+        .as_ref()
+        .map(|tx| spawn_stats_reporter(conn.clone(), tx.clone(), Arc::clone(&traffic)));
 
     // Task: query and monitor local desktop settings (`color-scheme`, titlebar `button-layout`)
     // and forward changes to the server.
@@ -660,108 +778,12 @@ pub async fn run_client(
         None;
 
     // Task: accept per-window video and audio playback unidirectional streams.
-    let uni_conn = conn.clone();
-    let uni_tx = ui_tx.clone();
-    let uni_ack_tx = frame_ack_tx.clone();
-    let uni_traffic = Arc::clone(&traffic);
-    let uni_task = tokio::spawn(async move {
-        let mut streams = tokio::task::JoinSet::new();
-        while let Ok(mut recv_uni) = uni_conn.accept_uni().await {
-            while streams.try_join_next().is_some() {}
-            let tx = uni_tx.clone();
-            let ack_tx = uni_ack_tx.clone();
-            let traffic = Arc::clone(&uni_traffic);
-            streams.spawn(async move {
-                match read_stream_header(&mut recv_uni).await {
-                    Ok(StreamHeader::Video { window_id, codec }) => {
-                        let mut decoder = Some(WindowVideoDecoder::new(codec));
-                        while let Ok(Some((hdr, payload))) = read_video_frame(&mut recv_uni).await {
-                            traffic.add_window(window_id, payload.len());
-                            let mut dec = decoder.take().unwrap();
-                            let decode_res = tokio::task::spawn_blocking(move || {
-                                let res =
-                                    dec.decode(hdr.width, hdr.height, hdr.is_keyframe, &payload);
-                                (dec, res)
-                            })
-                            .await;
-                            let (dec, frame_res) = match decode_res {
-                                Ok(pair) => pair,
-                                Err(err) => {
-                                    warn!(window_id, error = %err, "video decoder task panicked");
-                                    break;
-                                }
-                            };
-                            decoder = Some(dec);
-                            match frame_res {
-                                Ok(frame) => {
-                                    tx.push_frame(
-                                        window_id,
-                                        frame.width,
-                                        frame.height,
-                                        hdr.logical_width,
-                                        hdr.logical_height,
-                                        hdr.geometry,
-                                        hdr.input_bounds,
-                                        frame.bgra,
-                                        frame.damage,
-                                    );
-                                    let _ = ack_tx.send((window_id, hdr.pts_ns));
-                                }
-                                Err(err) => warn!(window_id, error = %err, "video decode error"),
-                            }
-                        }
-                    }
-                    Ok(StreamHeader::AudioPlayback) => match AudioPlaybackSink::new() {
-                        Ok(sink) => {
-                            while let Ok(Some((hdr, payload))) =
-                                read_audio_packet(&mut recv_uni).await
-                            {
-                                if let Err(err) = sink.push_audio(hdr.pts_ns, &payload) {
-                                    warn!(error = %err, "audio playback push error");
-                                    break;
-                                }
-                            }
-                        }
-                        Err(err) => warn!(error = %err, "client audio playback unavailable"),
-                    },
-                    Ok(StreamHeader::AudioPlaybackApp {
-                        stream_id,
-                        app_name,
-                        media_name,
-                        icon_name,
-                        media_role,
-                    }) => match AudioPlaybackSink::new_for_app(
-                        &app_name,
-                        &media_name,
-                        &icon_name,
-                        &media_role,
-                    ) {
-                        Ok(sink) => {
-                            info!(stream_id, %app_name, %media_name, "opened per-app host audio stream");
-                            traffic.audio_opened(stream_id, &app_name, &media_name);
-                            while let Ok(Some((hdr, payload))) =
-                                read_audio_packet(&mut recv_uni).await
-                            {
-                                traffic.add_audio(stream_id, payload.len());
-                                if let Err(err) = sink.push_audio(hdr.pts_ns, &payload) {
-                                    warn!(stream_id, error = %err, "audio playback push error");
-                                    break;
-                                }
-                            }
-                            traffic.audio_closed(stream_id);
-                        }
-                        Err(err) => {
-                            warn!(stream_id, %app_name, error = %err, "client per-app audio playback unavailable")
-                        }
-                    },
-                    Ok(other) => {
-                        info!(?other, "received unexpected uni stream");
-                    }
-                    Err(err) => warn!(error = %err, "failed to read StreamHeader"),
-                }
-            });
-        }
-    });
+    let uni_task = spawn_uni_stream_acceptor(
+        conn.clone(),
+        ui_tx.clone(),
+        frame_ack_tx.clone(),
+        Arc::clone(&traffic),
+    );
 
     // Read server control events and dispatch to Wayland UI thread.
     let mut popup_decoders: std::collections::HashMap<WindowId, WindowVideoDecoder> =
