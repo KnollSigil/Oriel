@@ -3111,6 +3111,59 @@ pub fn create_ui_channel() -> (UiSender, UiReceiver) {
     )
 }
 
+/// The latest decoded frame of each window, as a [`UiReceiver`] would present it.
+#[derive(Clone)]
+pub struct LatestFrames(LatestFrameMap);
+
+impl LatestFrames {
+    /// `(width, height, bgra)` of `window_id`'s latest frame, taking it.
+    pub fn take(&self, window_id: WindowId) -> Option<(u32, u32, Arc<Vec<u8>>)> {
+        let frame = self.0.lock().unwrap().remove(&window_id)?;
+        Some((frame.width, frame.height, frame.bgra))
+    }
+}
+
+impl UiReceiver {
+    /// Deliver the events to a plain channel instead of a Wayland event loop, from a
+    /// thread of their own, for running a client without a display (integration tests).
+    pub fn into_headless(self) -> (std::sync::mpsc::Receiver<ClientUiEvent>, LatestFrames) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let frames = LatestFrames(Arc::clone(&self.latest_frames));
+        let ui_rx = self.rx;
+        std::thread::Builder::new()
+            .name("oriel-ui-headless".into())
+            .spawn(move || {
+                let Ok(mut event_loop) = EventLoop::<bool>::try_new() else {
+                    return;
+                };
+                let inserted = event_loop
+                    .handle()
+                    .insert_source(ui_rx, move |event, _, closed| match event {
+                        channel::Event::Msg(event) => {
+                            if tx.send(event).is_err() {
+                                *closed = true;
+                            }
+                        }
+                        channel::Event::Closed => *closed = true,
+                    });
+                if inserted.is_err() {
+                    return;
+                }
+                let mut closed = false;
+                while !closed {
+                    if event_loop
+                        .dispatch(Some(Duration::from_millis(100)), &mut closed)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn the headless UI thread");
+        (rx, frames)
+    }
+}
+
 /// Run the native `smithay-client-toolkit` Wayland event loop on the current thread.
 pub fn run_event_loop(
     ui_rx: UiReceiver,

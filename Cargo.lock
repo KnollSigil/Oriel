@@ -2142,6 +2142,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "opus",
+ "oriel-client",
  "oriel-proto",
  "pipewire",
  "quinn",

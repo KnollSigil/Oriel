@@ -147,22 +147,13 @@ fn closed_as_superseded(conn: &quinn::Connection) -> bool {
     )
 }
 
-/// Establish a pinned QUIC connection and perform the `AuthRequest`/`AuthResponse` handshake.
-/// A [`ClientRole::Display`] connection takes over the server's session from any other
-/// display client; a [`ClientRole::PtyOnly`] one coexists with it.
-pub async fn connect_and_auth(
+/// Establish a QUIC connection to `server_addr`, presenting this process's client
+/// certificate and accepting only a server certificate with SHA-256 `fingerprint_sha256`.
+/// Nothing is sent yet; [`connect_and_auth`] also authenticates.
+pub async fn connect_raw(
     server_addr: SocketAddr,
     fingerprint_sha256: String,
-    token: String,
-    role: ClientRole,
-    enable_audio_bridge: bool,
-    initial_scale: f64,
-) -> Result<(
-    quinn::Connection,
-    quinn::SendStream,
-    quinn::RecvStream,
-    VideoCodec,
-)> {
+) -> Result<quinn::Connection> {
     let verifier = Arc::new(PinnedCertVerifier::new(fingerprint_sha256));
     let identity = client_identity()?;
     let mut rustls_config = rustls::ClientConfig::builder()
@@ -194,6 +185,26 @@ pub async fn connect_and_auth(
         .await
         .with_context(|| format!("failed to connect to {server_addr}"))?;
     info!(%server_addr, "QUIC connection established");
+    Ok(conn)
+}
+
+/// Establish a pinned QUIC connection and perform the `AuthRequest`/`AuthResponse` handshake.
+/// A [`ClientRole::Display`] connection takes over the server's session from any other
+/// display client; a [`ClientRole::PtyOnly`] one coexists with it.
+pub async fn connect_and_auth(
+    server_addr: SocketAddr,
+    fingerprint_sha256: String,
+    token: String,
+    role: ClientRole,
+    enable_audio_bridge: bool,
+    initial_scale: f64,
+) -> Result<(
+    quinn::Connection,
+    quinn::SendStream,
+    quinn::RecvStream,
+    VideoCodec,
+)> {
+    let conn = connect_raw(server_addr, fingerprint_sha256).await?;
 
     let (mut send, mut recv) = conn
         .open_bi()

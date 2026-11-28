@@ -27,5 +27,9 @@ zbus.workspace = true
 # Same version smithay uses; see x11_selection.rs.
 x11rb = "0.13"
 
+[dev-dependencies]
+# The real client, without its GTK launcher, drives the server in tests/loopback.rs.
+oriel-client = { path = "../oriel-client", default-features = false }
+
 [lints]
 workspace = true
