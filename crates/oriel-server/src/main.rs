@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// TTL for single-use tokens minted via `attach` / control socket.
@@ -275,7 +275,7 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
         }
     };
 
-    let (comp_handle, event_rx) =
+    let (comp_handle, event_rx, comp_exited) =
         compositor::start_compositor(cli.command, !cli.no_xwayland, cli.gpu.mode())?;
     info!(
         socket = ?comp_handle.socket_name,
@@ -324,6 +324,12 @@ async fn run(cli: Cli, startup_env: Option<shell_env::StartupOutcome>) -> Result
         _ = sighup.recv() => {
             info!("received SIGHUP; shutting down isolated session");
             Ok(())
+        }
+        _ = comp_exited => {
+            // Keeping the server up would leave `attach` handing out URIs for a session
+            // that can show nothing; shut down so the next `attach` starts a fresh one.
+            error!("headless compositor stopped; shutting down isolated session");
+            Err(anyhow::anyhow!("headless compositor stopped"))
         }
     };
 

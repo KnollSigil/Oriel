@@ -5202,14 +5202,24 @@ delegate_viewporter!(AppState);
 delegate_output!(AppState);
 delegate_xwayland_shell!(AppState);
 
+/// Resolves once the compositor thread has stopped, by returning an error or panicking.
+/// The session cannot go on without it: its apps have lost their display.
+pub type CompositorExited = tokio::sync::oneshot::Receiver<()>;
+
 /// Start the headless Smithay Wayland compositor on a background OS thread
 /// and optionally launch `command` inside the isolated session.
 pub fn start_compositor(
     command: Vec<String>,
     enable_xwayland: bool,
     gpu_mode: GpuMode,
-) -> Result<(CompositorHandle, mpsc::UnboundedReceiver<CompositorEvent>)> {
+) -> Result<(
+    CompositorHandle,
+    mpsc::UnboundedReceiver<CompositorEvent>,
+    CompositorExited,
+)> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    // Dropped when the thread ends, also by unwinding from a panic.
+    let (alive_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
     let (cmd_tx, cmd_rx): (CalloopSender<CompositorCommand>, Channel<CompositorCommand>) =
         channel::channel();
 
@@ -5219,6 +5229,7 @@ pub fn start_compositor(
     std::thread::Builder::new()
         .name("oriel-comp".into())
         .spawn(move || {
+            let _alive = alive_tx;
             if let Err(err) = run_compositor_loop(
                 event_tx,
                 cmd_rx,
@@ -5244,6 +5255,7 @@ pub fn start_compositor(
             cmd_tx,
         },
         event_rx,
+        exited_rx,
     ))
 }
 
