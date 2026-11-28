@@ -14,7 +14,7 @@ opus.workspace = true
 pipewire.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
-oriel-proto.workspace = true
+oriel-proto = { workspace = true, features = ["gpu-encoder"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

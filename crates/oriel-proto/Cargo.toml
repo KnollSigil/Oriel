@@ -4,21 +4,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["gpu-encoder"]
+# The SmartTile encoder's GPU compute and zero-copy VRAM paths (wgpu, Vulkan). Only the
+# server encodes; the client builds without it.
+gpu-encoder = ["dep:ash", "dep:bytemuck", "dep:pollster", "dep:wgpu"]
+
 [dependencies]
 anyhow.workspace = true
-ash.workspace = true
-bytemuck.workspace = true
+ash = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 bytes.workspace = true
 fuser.workspace = true
 libc.workspace = true
 lz4_flex.workspace = true
-pollster.workspace = true
+pollster = { workspace = true, optional = true }
 postcard.workspace = true
 quinn.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-wgpu.workspace = true
+wgpu = { workspace = true, optional = true }
 zbus.workspace = true
 
 [lints]

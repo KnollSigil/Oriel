@@ -18,9 +18,11 @@ use anyhow::{bail, Context, Result};
 #[path = "smart_tile_simd.rs"]
 pub mod simd;
 
+#[cfg(feature = "gpu-encoder")]
 #[path = "smart_tile_gpu.rs"]
 pub mod gpu;
 
+#[cfg(feature = "gpu-encoder")]
 #[path = "smart_tile_vram.rs"]
 pub mod vram;
 
@@ -69,6 +71,7 @@ fn use_simd() -> bool {
 }
 
 #[inline]
+#[cfg(feature = "gpu-encoder")]
 fn use_gpu() -> bool {
     #[cfg(test)]
     {
@@ -988,6 +991,7 @@ fn encode_plane_qblocks(
 /// per block, two `i16` coefficients per word in natural order) and emits identical bytes.
 /// Blocks without AC coefficients, the common case on UI content, skip unpacking and the
 /// zigzag scan.
+#[cfg(any(feature = "gpu-encoder", test))]
 fn encode_plane_packed(words: &[i32], blocks_x: usize, blocks_y: usize, out: &mut Vec<u8>) {
     let count = blocks_x * blocks_y;
     let mut dcs = [0i32; 64];
@@ -1988,6 +1992,7 @@ pub struct SmartTileEncoder {
     /// Most recent lossless source framebuffer (used for automatic idle lossless refinement when CPU-resident).
     source_bgra: Vec<u8>,
     /// Persistent VRAM buffers when encoding zero-copy GPU `Dmabuf` textures.
+    #[cfg(feature = "gpu-encoder")]
     vram_state: Option<Box<vram::VramWindowState>>,
     /// True when `ref_bgra` and `source_bgra` reside in `vram_state` on the GPU rather than CPU RAM.
     vram_resident: bool,
@@ -2085,6 +2090,7 @@ impl SmartTileEncoder {
         let total_tiles = cols * rows;
         let now = Instant::now();
 
+        #[cfg(feature = "gpu-encoder")]
         if self.vram_resident && width == self.width && height == self.height {
             if let Some(vs) = self.vram_state.as_ref() {
                 if let Some(dl_ref) = vs.download_ref_bgra() {
@@ -2266,7 +2272,11 @@ impl SmartTileEncoder {
         };
 
         // Attempt unified hardware GPU compute shader batching when encoding a large batch of full-res tiles.
+        #[cfg_attr(not(feature = "gpu-encoder"), allow(unused_mut))]
         let mut source_copied_during_gpu = false;
+        #[cfg(not(feature = "gpu-encoder"))]
+        let gpu_encoded: Option<(bool, bool)> = None;
+        #[cfg(feature = "gpu-encoder")]
         let gpu_encoded = if use_gpu()
             && !is_keyframe
             && !prefer_half_res
@@ -2496,6 +2506,7 @@ impl SmartTileEncoder {
         }
     }
 
+    #[cfg(feature = "gpu-encoder")]
     /// Encode a GPU-resident `GpuTextureFrame` (`Dmabuf` window) directly in VRAM without copying
     /// full window framebuffers to CPU memory. Falls back to `read_to_cpu_bgra` only if GPU
     /// compute is disabled (`FORCE_DISABLE_GPU`) or VRAM allocation fails.
@@ -3059,6 +3070,7 @@ impl SmartTileEncoder {
         let cols = self.width.div_ceil(TILE_SIZE) as usize;
         let rows = self.height.div_ceil(TILE_SIZE) as usize;
 
+        #[cfg(feature = "gpu-encoder")]
         if self.vram_resident {
             let vram_state = self.vram_state.as_mut()?;
             let mut candidates = Vec::with_capacity(tile_limit);
@@ -3266,6 +3278,7 @@ impl SmartTileEncoder {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "gpu-encoder")]
 fn encode_tiles_with_gpu(
     engine: &gpu::SmartTileGpuEngine,
     ref_bgra: &mut [u8],
@@ -4922,6 +4935,7 @@ fn write_lossless_tile(
     }
 }
 
+#[cfg(feature = "gpu-encoder")]
 fn write_lossless_tile_extracted(
     cur_tile_64: &[u8],
     ref_tile_64: &[u8],
@@ -6825,6 +6839,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-encoder")]
     #[test]
     fn simd_kernels_match_scalar_bit_for_bit() {
         let mut rng = 0x853c_49e6_748f_ea9bu64;
@@ -7500,6 +7515,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-encoder")]
     #[test]
     fn gpu_compute_shaders_match_cpu_bit_for_bit() {
         let Some(engine) = gpu::SmartTileGpuEngine::try_new_any() else {
@@ -7861,6 +7877,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-encoder")]
     #[test]
     fn vram_static_ui_tile_beside_playing_video_settles_without_idle() {
         let Some(engine) = gpu::SmartTileGpuEngine::try_new_any().map(Arc::new) else {
@@ -7993,6 +8010,7 @@ mod tests {
         assert!(*dec.bgra == src, "VRAM stream must converge losslessly");
     }
 
+    #[cfg(feature = "gpu-encoder")]
     #[test]
     fn vram_resident_gpu_texture_encoding_is_bit_exact_and_zero_cpu_buffer() {
         let Some(engine) = gpu::SmartTileGpuEngine::try_new_any().map(Arc::new) else {
