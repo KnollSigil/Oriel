@@ -833,6 +833,11 @@ impl DndFocus<AppState> for PointerFocusTarget {
         serial: &Serial,
     ) -> Option<PointerOfferData<S>> {
         data.note_drag_source(&source);
+        if data.x11_drag_settling.is_some() && matches!(self, Self::X11(_)) {
+            // Entering an X11 window would unmap smithay's XDND proxy; see
+            // `AppState::settle_x11_drag`. The drag enters it once the file list is read.
+            return None;
+        }
         match self {
             Self::Wayland(s) => DndFocus::enter(s, data, dh, source, seat, location, serial)
                 .map(PointerOfferData::Wayland),
@@ -959,6 +964,11 @@ struct AppState {
     /// The source of the drag in the session that `note_drag_source` last looked at (its
     /// address), so each drag is looked at once.
     seen_drag_source: Option<usize>,
+    /// An X11 app's drag whose file list is being read: set once read (see
+    /// `settle_x11_drag`).
+    x11_drag_settling: Option<Arc<AtomicBool>>,
+    /// The client's last pointer move (window, surface-local position).
+    last_pointer_motion: Option<(WindowId, f64, f64)>,
     /// The embedded XWayland, for reading X11 selections `xwm` cannot convert.
     x11_display: Option<crate::x11_selection::X11Display>,
     xwayland_client: Option<Client>,
@@ -1332,6 +1342,65 @@ impl AppState {
         }
     }
 
+    /// Hold an X11 app's drag still while its file list is read (the first read of its data),
+    /// and resume it after; returns the flag to set once read.
+    ///
+    /// Qt answers a read of its drag's data only when the read carries the time of the
+    /// latest XdndPosition it sent. That changes on every pointer move, and once the drag
+    /// is over Qt's own window its positions never leave the app, so no time we could use
+    /// is known. Until the list is read, the drag does not enter X11 windows (which would
+    /// unmap smithay's XDND proxy), so the proxy stays the app's target and smithay sees each
+    /// position, and the client's pointer moves are held back, so the app sends no new one.
+    fn settle_x11_drag(&mut self) -> Arc<AtomicBool> {
+        let settled = Arc::new(AtomicBool::new(false));
+        self.x11_drag_settling = Some(Arc::clone(&settled));
+        let flag = Arc::clone(&settled);
+        let deadline = Instant::now() + X11_DRAG_SETTLE_MAX;
+        let inserted = self.loop_handle.insert_source(
+            Timer::from_duration(X11_DRAG_SETTLE_POLL),
+            move |_, _, state| {
+                let current = state
+                    .x11_drag_settling
+                    .as_ref()
+                    .is_some_and(|f| Arc::ptr_eq(f, &flag));
+                if !current {
+                    return TimeoutAction::Drop;
+                }
+                if !flag.load(Ordering::Acquire) && Instant::now() < deadline {
+                    return TimeoutAction::ToDuration(X11_DRAG_SETTLE_POLL);
+                }
+                state.x11_drag_settling = None;
+                state.resume_x11_drag();
+                TimeoutAction::Drop
+            },
+        );
+        if let Err(err) = inserted {
+            warn!(error = %err, "cannot hold an X11 drag while reading its files");
+            self.x11_drag_settling = None;
+        }
+        settled
+    }
+
+    /// Let a drag held by `settle_x11_drag` go on: enter the window under the pointer
+    /// again (now through smithay's X11 handling) at the client's latest position.
+    fn resume_x11_drag(&mut self) {
+        let Some((window_id, x, y)) = self.last_pointer_motion else {
+            return;
+        };
+        if self
+            .outgoing_drag
+            .as_ref()
+            .is_some_and(|d| d.outside || d.ending)
+        {
+            return;
+        }
+        let serial = SERIAL_COUNTER.next_serial();
+        let time_ms = self.start_time.elapsed().as_millis() as u32;
+        self.pointer_to_nowhere(serial, time_ms);
+        self.handle_command(CompositorCommand::PointerMotion { window_id, x, y });
+        let _ = self.display_handle.flush_clients();
+    }
+
     /// The client's continuation of a session app's drag left the remote windows: move the
     /// session's drag off every surface.
     ///
@@ -1497,7 +1566,11 @@ impl AppState {
             .is_some_and(|xwm| source.is_client_local(&xwm.id()));
         let source: Arc<dyn Source> = source.clone();
         let uri_pipe = std::io::pipe().ok().filter(|_| has_uri_list);
+        let mut settled = None;
         let (data, uri_list) = if x11 {
+            if has_uri_list {
+                settled = Some(self.settle_x11_drag());
+            }
             let (requests, queue) = std::sync::mpsc::channel();
             let x11_source = Arc::clone(&source);
             std::thread::spawn(move || serve_x11_drag(x11_source, queue));
@@ -1532,6 +1605,9 @@ impl AppState {
             let paths = uri_list
                 .and_then(|pipe| read_selection_fd_complete(pipe.into()))
                 .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body));
+            if let Some(settled) = settled {
+                settled.store(true, Ordering::Release);
+            }
             let _ = event_tx.send(CompositorEvent::DragOffer {
                 window_id,
                 offer_id,
@@ -2027,8 +2103,16 @@ impl AppState {
             | CompositorCommand::PointerButton { .. }
             | CompositorCommand::PointerAxis { .. }
                 if self.outgoing_drag_ending() => {}
+            CompositorCommand::PointerMotion { window_id, x, y }
+                if self.x11_drag_settling.is_some() =>
+            {
+                // See `settle_x11_drag`; replayed by `resume_x11_drag`.
+                self.focused_window_id = window_id;
+                self.last_pointer_motion = Some((window_id, x, y));
+            }
             CompositorCommand::PointerMotion { window_id, x, y } => {
                 self.focused_window_id = window_id;
+                self.last_pointer_motion = Some((window_id, x, y));
                 if let Some(drag) = self.outgoing_drag.as_mut() {
                     // Back over a remote window.
                     drag.outside = false;
@@ -4186,6 +4270,14 @@ enum DragData {
     X11(std::sync::mpsc::Sender<(String, OwnedFd)>),
 }
 
+/// How often a drag held by `AppState::settle_x11_drag` checks whether it can go on.
+const X11_DRAG_SETTLE_POLL: Duration = Duration::from_millis(10);
+/// The longest a drag is held by `AppState::settle_x11_drag`.
+const X11_DRAG_SETTLE_MAX: Duration = Duration::from_secs(3);
+/// How long an X11 app's drag is left alone before its first read, for smithay to see the
+/// position the app sent for the last pointer move (see `AppState::settle_x11_drag`).
+const X11_DRAG_QUIET: Duration = Duration::from_millis(50);
+
 /// How long a read of an X11 app's drag may go without data before it is given up.
 const X11_DRAG_READ_IDLE: Duration = Duration::from_secs(15);
 
@@ -4198,6 +4290,7 @@ const X11_DRAG_READ_IDLE: Duration = Duration::from_secs(15);
 /// because Qt only answers a conversion stamped with the time of its latest XdndPosition,
 /// which only the drag's target (smithay's proxy) sees.
 fn serve_x11_drag(source: Arc<dyn Source>, queue: std::sync::mpsc::Receiver<(String, OwnedFd)>) {
+    std::thread::sleep(X11_DRAG_QUIET);
     for (mime, fd) in queue {
         let Ok((read_pipe, write_pipe)) = std::io::pipe() else {
             continue;
@@ -5656,6 +5749,7 @@ impl AppState {
     fn end_session_drag(&mut self) {
         self.outgoing_drag = None;
         self.seen_drag_source = None;
+        self.x11_drag_settling = None;
         if !self.host_drag_active() {
             self.host_drag = None;
         }
@@ -6114,6 +6208,8 @@ fn run_compositor_loop(
         host_drag: None,
         outgoing_drag: None,
         seen_drag_source: None,
+        x11_drag_settling: None,
+        last_pointer_motion: None,
         x11_display: None,
         xwayland_client,
         output,
