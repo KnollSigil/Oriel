@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,12 +12,12 @@ use oriel_proto::selection::ReceivedClipboard;
 use oriel_proto::xfer::{self, FileOffer, OfferSlot, XferOwner};
 use oriel_proto::xfer_fuse::XferMount;
 use oriel_proto::{
-    read_audio_packet, read_bidi_stream_header, read_control_message, read_protocol_preamble,
-    read_stream_header, write_audio_packet, write_control_message, write_stream_header,
-    write_video_frame, AudioPacketHeader, BidiStreamHeader, ClientRole, ControlMessage, FrameRect,
-    LaunchState, PeerProtocol, PortRange, StreamHeader, VideoCodec, VideoFrameHeader, WindowId,
-    CLOSE_CODE_PROTOCOL_MISMATCH, CLOSE_CODE_SUPERSEDED, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION,
-    PTY_LAUNCH_ID_BASE,
+    read_audio_packet, read_bidi_stream_header, read_control_message, read_control_message_max,
+    read_protocol_preamble, read_stream_header, write_audio_packet, write_control_message,
+    write_stream_header, write_video_frame, AudioPacketHeader, BidiStreamHeader, ClientRole,
+    ControlMessage, FrameRect, LaunchState, PeerProtocol, PortRange, StreamHeader, VideoCodec,
+    VideoFrameHeader, WindowId, CLOSE_CODE_PROTOCOL_MISMATCH, CLOSE_CODE_SUPERSEDED,
+    MAX_AUTH_FRAME_BYTES, MAX_VIDEO_FRAME_BYTES, PROTOCOL_VERSION, PTY_LAUNCH_ID_BASE,
 };
 use quinn::{Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -294,9 +294,54 @@ pub fn bind_endpoint(server_config: ServerConfig, listen: ListenSpec) -> Result<
 /// down (release input, stop its audio bridge) before starting anyway.
 const TAKEOVER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Limits on peers that have not authenticated yet.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthLimits {
+    /// How long a peer has, from accepting its connection, to finish the QUIC handshake,
+    /// open the control stream and send its preamble and `AuthRequest`. Keep-alives would
+    /// otherwise hold an idle unauthenticated connection open forever.
+    pub timeout: Duration,
+    /// Most connections that may be waiting to authenticate at once; more are refused, so
+    /// unauthenticated peers cannot pile up connections (and their buffers) without limit.
+    pub max_pending: usize,
+}
+
+impl Default for AuthLimits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+            max_pending: 32,
+        }
+    }
+}
+
+/// Counts a connection as waiting to authenticate until dropped.
+struct PendingAuth(Arc<AtomicUsize>);
+
+impl PendingAuth {
+    /// Count one more connection, unless `max` already are.
+    fn try_new(count: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(count)))
+    }
+}
+
+impl Drop for PendingAuth {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// State shared by every connection to this server.
 struct Shared {
     valid_tokens: TokenMap,
+    /// Connections that have not authenticated yet (see [`PendingAuth`]).
+    pending_auth: Arc<AtomicUsize>,
+    auth_limits: AuthLimits,
     cmd_tx: calloop::channel::Sender<CompositorCommand>,
     events: broadcast::Sender<CompositorEvent>,
     pty_mgr: Arc<crate::pty::PtyManager>,
@@ -314,8 +359,28 @@ pub async fn run_server(
     endpoint: Endpoint,
     creds: EphemeralCredentials,
     comp_handle: CompositorHandle,
+    event_rx: mpsc::UnboundedReceiver<CompositorEvent>,
+    xfer_mount: Option<Arc<XferMount>>,
+) -> Result<()> {
+    run_server_with_limits(
+        endpoint,
+        creds,
+        comp_handle,
+        event_rx,
+        xfer_mount,
+        AuthLimits::default(),
+    )
+    .await
+}
+
+/// [`run_server`] with the given limits on unauthenticated peers.
+pub async fn run_server_with_limits(
+    endpoint: Endpoint,
+    creds: EphemeralCredentials,
+    comp_handle: CompositorHandle,
     mut event_rx: mpsc::UnboundedReceiver<CompositorEvent>,
     xfer_mount: Option<Arc<XferMount>>,
+    auth_limits: AuthLimits,
 ) -> Result<()> {
     let actual_addr = endpoint
         .local_addr()
@@ -335,6 +400,8 @@ pub async fn run_server(
 
     let shared = Arc::new(Shared {
         valid_tokens: Arc::clone(&creds.valid_tokens),
+        pending_auth: Arc::default(),
+        auth_limits,
         cmd_tx: comp_handle.cmd_tx.clone(),
         pty_mgr: crate::pty::PtyManager::new(bcast_tx.clone()),
         events: bcast_tx,
@@ -344,9 +411,16 @@ pub async fn run_server(
         xfer_mount,
     });
     while let Some(incoming) = endpoint.accept().await {
+        let Some(pending) =
+            PendingAuth::try_new(&shared.pending_auth, shared.auth_limits.max_pending)
+        else {
+            debug!(remote = %incoming.remote_address(), "too many unauthenticated connections; refusing");
+            incoming.refuse();
+            continue;
+        };
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(incoming, shared).await {
+            if let Err(err) = handle_connection(incoming, pending, shared).await {
                 warn!(error = %err, "client connection ended with error");
             }
         });
@@ -355,21 +429,41 @@ pub async fn run_server(
     Ok(())
 }
 
-async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Result<()> {
-    let conn = incoming.await.context("QUIC handshake failed")?;
+async fn handle_connection(
+    incoming: quinn::Incoming,
+    pending: PendingAuth,
+    shared: Arc<Shared>,
+) -> Result<()> {
+    let timeout = shared.auth_limits.timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let before_deadline =
+        |what: &'static str| move |_| anyhow!("peer did not {what} within {timeout:?}");
+    let conn = tokio::time::timeout_at(deadline, incoming)
+        .await
+        .map_err(before_deadline("finish the QUIC handshake"))?
+        .context("QUIC handshake failed")?;
     // Forget the connection's cancelled and paused files however this returns.
     let _forget_transfers = oriel_proto::transfers::ConnectionGuard::new(conn.stable_id());
     let remote = conn.remote_address();
     info!(%remote, "QUIC peer connected");
+    let timed_out = |err: anyhow::Error| {
+        conn.close(VarInt::from_u32(0), b"authentication timed out");
+        err
+    };
 
-    let (mut send, mut recv) = conn
-        .accept_bi()
+    let (mut send, mut recv) = tokio::time::timeout_at(deadline, conn.accept_bi())
         .await
+        .map_err(before_deadline("open the control stream"))
+        .map_err(timed_out)?
         .context("failed to accept control stream")?;
 
     // The preamble's layout is independent of the message encoding, so a client of any
     // version can be told about a mismatch through the QUIC close reason.
-    let mismatch = match read_protocol_preamble(&mut recv).await? {
+    let preamble = tokio::time::timeout_at(deadline, read_protocol_preamble(&mut recv))
+        .await
+        .map_err(before_deadline("send the protocol preamble"))
+        .map_err(timed_out)??;
+    let mismatch = match preamble {
         PeerProtocol::Version(PROTOCOL_VERSION) => None,
         PeerProtocol::Version(v) => Some(format!(
             "unsupported protocol version {v} (server speaks {PROTOCOL_VERSION})"
@@ -388,9 +482,14 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         return Ok(());
     }
 
-    let auth_msg = read_control_message(&mut recv)
-        .await?
-        .context("control stream closed before AuthRequest")?;
+    let auth_msg = tokio::time::timeout_at(
+        deadline,
+        read_control_message_max(&mut recv, MAX_AUTH_FRAME_BYTES),
+    )
+    .await
+    .map_err(before_deadline("authenticate"))
+    .map_err(timed_out)??
+    .context("control stream closed before AuthRequest")?;
 
     let (token, role, supported_codecs, enable_audio_bridge, initial_scale) = match auth_msg {
         ControlMessage::AuthRequest {
@@ -417,6 +516,8 @@ async fn handle_connection(incoming: quinn::Incoming, shared: Arc<Shared>) -> Re
         reject_auth(&mut send, "invalid or expired session token".into()).await?;
         return Ok(());
     }
+    // Authenticated: no longer counts against the limit for unauthenticated peers.
+    drop(pending);
 
     let selected_codec = if supported_codecs.contains(&VideoCodec::SmartTile) {
         VideoCodec::SmartTile

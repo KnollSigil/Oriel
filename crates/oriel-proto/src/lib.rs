@@ -143,6 +143,11 @@ impl<'de> Deserialize<'de> for PortRange {
 /// Maximum allowed control frame size (16 MiB) to prevent unbounded allocations.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
+/// Largest control frame accepted before the peer has authenticated: an
+/// [`ControlMessage::AuthRequest`] is a token and a few small fields, so an unauthenticated
+/// peer cannot make the server allocate [`MAX_CONTROL_FRAME_BYTES`].
+pub const MAX_AUTH_FRAME_BYTES: usize = 4096;
+
 /// Maximum allowed encoded video frame payload size (64 MiB) to accommodate 4K/5K HiDPI frames.
 pub const MAX_VIDEO_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -763,13 +768,22 @@ pub async fn write_control_message<W: AsyncWrite + Unpin>(
 pub async fn read_control_message<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<ControlMessage>> {
+    read_control_message_max(reader, MAX_CONTROL_FRAME_BYTES).await
+}
+
+/// [`read_control_message`] with a frame limit of `max` bytes, for a peer that is not yet
+/// trusted with [`MAX_CONTROL_FRAME_BYTES`] (see [`MAX_AUTH_FRAME_BYTES`]).
+pub async fn read_control_message_max<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> Result<Option<ControlMessage>> {
     let len = match reader.read_u32().await {
         Ok(len) => len as usize,
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    if len > MAX_CONTROL_FRAME_BYTES {
-        bail!("incoming control message exceeds max frame size: {len}");
+    if len > max {
+        bail!("incoming control message exceeds max frame size: {len} (max {max})");
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
