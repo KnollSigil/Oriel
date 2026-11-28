@@ -1312,8 +1312,13 @@ impl AppState {
     /// Move the pointer off every surface, keeping its location (during a drag grab
     /// `PointerLeave` cannot tell which window the pointer is in).
     fn pointer_to_nowhere(&mut self, serial: Serial, time_ms: u32) {
+        self.pointer_to_nowhere_moved(serial, time_ms, (0.0, 0.0));
+    }
+
+    /// `pointer_to_nowhere`, moving the pointer by `delta` as well.
+    fn pointer_to_nowhere_moved(&mut self, serial: Serial, time_ms: u32, delta: (f64, f64)) {
         if let Some(pointer) = self.seat.get_pointer() {
-            let location = pointer.current_location();
+            let location = pointer.current_location() + Point::from(delta);
             pointer.motion(
                 self,
                 None,
@@ -1324,6 +1329,89 @@ impl AppState {
                 },
             );
             pointer.frame(self);
+        }
+    }
+
+    /// The client's continuation of a session app's drag left the remote windows: move the
+    /// session's drag off every surface.
+    ///
+    /// An X11 app's drag (XDND) picks its target itself, on pointer moves: it still has the
+    /// window the drag left as its target, which `end_outgoing_drag` would drop on. Leaving
+    /// the app's surfaces maps smithay's XDND proxy over everything; once XWayland has
+    /// mapped it, a small move makes the app pick the proxy, which refuses drops.
+    fn outgoing_drag_left(&mut self, serial: Serial, time_ms: u32) {
+        let Some(drag) = self.outgoing_drag.as_mut() else {
+            return;
+        };
+        drag.outside = true;
+        let offer_id = drag.offer_id;
+        self.pointer_to_nowhere(serial, time_ms);
+        self.after_xdnd_retarget(offer_id, |state, serial, time_ms| {
+            if state.outgoing_drag.as_ref().is_some_and(|d| d.outside) {
+                state.pointer_to_nowhere_moved(serial, time_ms, (1.0, 0.0));
+            }
+        });
+    }
+
+    /// The client's continuation of a session app's drag ended outside the remote windows:
+    /// release the button over no surface, which ends the session's drag without a drop.
+    ///
+    /// For an X11 app, first move the pointer again (see `outgoing_drag_left`) and release
+    /// only after a delay: ending the grab unmaps smithay's XDND proxy over its own X11
+    /// connection, which XWayland can handle before the move, and an app that never saw
+    /// the proxy as its target drops on its own window.
+    fn end_outgoing_drag(&mut self, serial: Serial, time_ms: u32) {
+        let Some(offer_id) = self.outgoing_drag.as_ref().map(|d| d.offer_id) else {
+            return;
+        };
+        self.pointer_to_nowhere_moved(serial, time_ms, (-1.0, 0.0));
+        self.after_xdnd_retarget(offer_id, |state, serial, time_ms| {
+            state.pressed_buttons.remove(&BTN_LEFT);
+            if let Some(pointer) = state.seat.get_pointer() {
+                pointer.button(
+                    state,
+                    &ButtonEvent {
+                        serial,
+                        time: InputTime::from_millis(time_ms),
+                        button: BTN_LEFT,
+                        state: ButtonState::Released,
+                    },
+                );
+                pointer.frame(state);
+            }
+        });
+    }
+
+    /// Run `step` after [`XDND_RETARGET_DELAY`], if the outgoing drag `offer_id` is still
+    /// in progress then.
+    fn after_xdnd_retarget(
+        &mut self,
+        offer_id: u64,
+        step: impl FnOnce(&mut Self, Serial, u32) + 'static,
+    ) {
+        let step = Rc::new(Cell::new(Some(step)));
+        let timed_step = Rc::clone(&step);
+        let inserted = self.loop_handle.insert_source(
+            Timer::from_duration(XDND_RETARGET_DELAY),
+            move |_, _, state| {
+                let current = state
+                    .outgoing_drag
+                    .as_ref()
+                    .is_some_and(|d| d.offer_id == offer_id);
+                if let Some(step) = timed_step.take().filter(|_| current) {
+                    let time_ms = state.start_time.elapsed().as_millis() as u32;
+                    step(state, SERIAL_COUNTER.next_serial(), time_ms);
+                    let _ = state.display_handle.flush_clients();
+                }
+                TimeoutAction::Drop
+            },
+        );
+        if let Err(err) = inserted {
+            warn!(error = %err, "cannot delay ending a drag; ending it now");
+            if let Some(step) = step.take() {
+                let time_ms = self.start_time.elapsed().as_millis() as u32;
+                step(self, SERIAL_COUNTER.next_serial(), time_ms);
+            }
         }
     }
 
@@ -1395,7 +1483,11 @@ impl AppState {
         let _ = self.display_handle.flush_clients();
         let offer_id = oriel_proto::xfer::random_u64();
         let source: Arc<dyn Source> = source.clone();
-        self.outgoing_drag = Some(OutgoingDrag { offer_id, source });
+        self.outgoing_drag = Some(OutgoingDrag {
+            offer_id,
+            source,
+            outside: false,
+        });
         let window_id = self.focused_window_id;
         let mimes = oriel_proto::selection::proxyable_mimes(&mime_types);
         let event_tx = self.event_tx.clone();
@@ -1897,6 +1989,10 @@ impl AppState {
             }
             CompositorCommand::PointerMotion { window_id, x, y } => {
                 self.focused_window_id = window_id;
+                if let Some(drag) = self.outgoing_drag.as_mut() {
+                    // Back over a remote window.
+                    drag.outside = false;
+                }
                 if let Some(pointer) = self.seat.get_pointer() {
                     let (focus, location) = self.pointer_target(window_id, x, y);
                     pointer.motion(
@@ -1939,30 +2035,8 @@ impl AppState {
                 }
             }
             CompositorCommand::DragLeave => self.cancel_host_drag(serial, time_ms),
-            CompositorCommand::OutgoingDragLeave => {
-                if self.outgoing_drag.is_some() {
-                    self.pointer_to_nowhere(serial, time_ms);
-                }
-            }
-            CompositorCommand::OutgoingDragEnd => {
-                if self.outgoing_drag.is_some() {
-                    // Over no surface, releasing the button ends the drag without a drop.
-                    self.pointer_to_nowhere(serial, time_ms);
-                    self.pressed_buttons.remove(&BTN_LEFT);
-                    if let Some(pointer) = self.seat.get_pointer() {
-                        pointer.button(
-                            self,
-                            &ButtonEvent {
-                                serial,
-                                time: InputTime::from_millis(time_ms),
-                                button: BTN_LEFT,
-                                state: ButtonState::Released,
-                            },
-                        );
-                        pointer.frame(self);
-                    }
-                }
-            }
+            CompositorCommand::OutgoingDragLeave => self.outgoing_drag_left(serial, time_ms),
+            CompositorCommand::OutgoingDragEnd => self.end_outgoing_drag(serial, time_ms),
             CompositorCommand::DragDrop => {
                 if self.host_drag_active() {
                     if let Some(pointer) = self.seat.get_pointer() {
@@ -4051,7 +4125,13 @@ pub(crate) const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 struct OutgoingDrag {
     offer_id: u64,
     source: Arc<dyn Source>,
+    /// The client's drag is outside the remote windows (`OutgoingDragLeave`).
+    outside: bool,
 }
+
+/// How long an X11 app gets to see a pointer move, and pick smithay's XDND proxy as its
+/// drag's target, before the next step of ending the drag (see `end_outgoing_drag`).
+const XDND_RETARGET_DELAY: Duration = Duration::from_millis(150);
 
 /// What the client is dragging over the session's apps: the source of a compositor-side
 /// drag (`AppState::start_host_drag`).
@@ -4997,6 +5077,12 @@ impl XwmHandler for AppState {
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
         let x11_win = window.window_id();
         if self.x11_id_by_win.contains_key(&x11_win) {
+            return;
+        }
+        if window.window_type() == Some(WmWindowType::Dnd) {
+            // A drag icon that follows the pointer. Shown as a popup it would be under the
+            // client's pointer and take its focus (ending the drag continued there); Wayland
+            // drag icons are not shown either.
             return;
         }
         let geo = window.last_configure();
