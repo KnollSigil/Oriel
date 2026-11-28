@@ -882,7 +882,7 @@ fn allocate_zero_copy_slot(
         Modifier::Linear,
         DmabufFlags::empty(),
     );
-    if !builder.add_plane(fd, 0, exported.offset, exported.stride) {
+    if !builder.add_plane(fd, exported.offset, exported.stride) {
         return None;
     }
     builder.set_node(node);

@@ -37,7 +37,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
-smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "desktop", "xwayland", "backend_drm", "backend_egl", "renderer_gl"] }
+smithay = { git = "https://github.com/Smithay/smithay", rev = "46643d204d61eef18bfb17faa814559af70504ed", default-features = false, features = ["wayland_frontend", "desktop", "xwayland", "backend_drm", "backend_egl", "renderer_gl"] }
 smithay-client-toolkit = "0.21"
 tokio = { version = "1.40", features = ["full"] }
 tracing = "0.1"

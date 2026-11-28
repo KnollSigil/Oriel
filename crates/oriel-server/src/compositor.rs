@@ -33,13 +33,11 @@ use smithay::input::keyboard::{
     FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
 use oriel_proto::selection::{ReceivedClipboard, Serve};
-use smithay::backend::input::ButtonState;
+use smithay::backend::input::{ButtonState, InputTime};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, GrabStartData as PointerGrabStartData,
     MotionEvent,
 };
-use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction;
-use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
@@ -80,9 +78,19 @@ use smithay::wayland::viewporter::{ViewportCachedState, ViewporterState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::{
     request_data_device_client_selection, set_data_device_focus, set_data_device_selection,
-    start_dnd, with_source_metadata, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+};
+use smithay::input::dnd::{
+    DnDGrab, DndAction, DndFocus, DndGrabHandler, DndTarget, GrabType, OfferData, Source,
     SourceMetadata,
 };
+use smithay::input::pointer::{
+    GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
+    GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
+    GestureSwipeUpdateEvent, Focus, PointerTarget, RelativeMotionEvent,
+};
+use smithay::wayland::selection::data_device::WlOfferData;
+use smithay::xwayland::xwm::XwmOfferData;
 use smithay::wayland::selection::primary_selection::{
     request_primary_client_selection, set_primary_focus, set_primary_selection,
     PrimarySelectionHandler, PrimarySelectionState,
@@ -96,21 +104,16 @@ use smithay::wayland::shell::xdg::{
 };
 use smithay::wayland::shm::{with_buffer_contents, ShmHandler, ShmState};
 use smithay::wayland::socket::ListeningSocketSource;
-use smithay::wayland::tablet_manager::TabletSeatHandler;
-use smithay::wayland::shell::xdg::dialog::{XdgDialogHandler, XdgDialogState};
+use smithay::input::tablet::TabletSeatHandler;
+use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
+use smithay::wayland::shell::xdg::dialog::{ToplevelDialogHint, XdgDialogHandler, XdgDialogState};
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{
     Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, WmWindowType, X11Window, XwmId,
 };
 use smithay::xwayland::{X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler};
 use smithay::{
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
-    delegate_drm_syncobj,
-    delegate_fractional_scale,
-    delegate_kde_decoration, delegate_output, delegate_primary_selection, delegate_seat,
-    delegate_shm, delegate_viewporter, delegate_xdg_decoration, delegate_xdg_dialog,
-    delegate_xdg_shell,
-    delegate_xwayland_shell,
+    delegate_dispatch2,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -579,6 +582,8 @@ struct TrackedX11Popup {
 /// Using `X11Surface` as a `KeyboardTarget` ensures Smithay sends `XSetInputFocus` and
 /// `WM_TAKE_FOCUS` to X11 clients (required for X11 menus/popups in Chromium, GTK, etc.).
 #[derive(Debug, Clone, PartialEq)]
+// Short-lived values; boxing `X11Surface` would allocate on every focus change.
+#[allow(clippy::large_enum_variant)]
 enum KeyboardFocusTarget {
     Wayland(WlSurface),
     X11(X11Surface),
@@ -630,7 +635,7 @@ impl KeyboardTarget<AppState> for KeyboardFocusTarget {
         key: KeysymHandle<'_>,
         state: KeyState,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         match self {
             Self::Wayland(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
@@ -648,6 +653,250 @@ impl KeyboardTarget<AppState> for KeyboardFocusTarget {
         match self {
             Self::Wayland(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
             Self::X11(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
+        }
+    }
+}
+
+/// Pointer focus target: a native Wayland surface or an XWayland window. Drags reach X11
+/// windows only through `X11Surface`, whose drag target smithay's window manager turns into
+/// XDND.
+#[derive(Debug, Clone, PartialEq)]
+// Short-lived values; boxing `X11Surface` would allocate on every pointer move.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PointerFocusTarget {
+    Wayland(WlSurface),
+    X11(X11Surface),
+}
+
+impl PointerFocusTarget {
+    fn inner(&self) -> &dyn PointerTarget<AppState> {
+        match self {
+            Self::Wayland(s) => s,
+            Self::X11(s) => s,
+        }
+    }
+}
+
+impl IsAlive for PointerFocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Wayland(s) => s.alive(),
+            Self::X11(s) => s.alive(),
+        }
+    }
+}
+
+impl WaylandFocus for PointerFocusTarget {
+    fn wl_surface(&self) -> Option<std::borrow::Cow<'_, WlSurface>> {
+        match self {
+            Self::Wayland(s) => Some(std::borrow::Cow::Borrowed(s)),
+            Self::X11(s) => s.wl_surface().map(std::borrow::Cow::Owned),
+        }
+    }
+}
+
+impl PointerTarget<AppState> for PointerFocusTarget {
+    fn enter(&self, seat: &Seat<AppState>, data: &mut AppState, event: &MotionEvent) {
+        self.inner().enter(seat, data, event)
+    }
+    fn motion(&self, seat: &Seat<AppState>, data: &mut AppState, event: &MotionEvent) {
+        self.inner().motion(seat, data, event)
+    }
+    fn relative_motion(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &RelativeMotionEvent,
+    ) {
+        self.inner().relative_motion(seat, data, event)
+    }
+    fn button(&self, seat: &Seat<AppState>, data: &mut AppState, event: &ButtonEvent) {
+        self.inner().button(seat, data, event)
+    }
+    fn axis(&self, seat: &Seat<AppState>, data: &mut AppState, frame: AxisFrame) {
+        self.inner().axis(seat, data, frame)
+    }
+    fn frame(&self, seat: &Seat<AppState>, data: &mut AppState) {
+        self.inner().frame(seat, data)
+    }
+    fn gesture_swipe_begin(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GestureSwipeBeginEvent,
+    ) {
+        self.inner().gesture_swipe_begin(seat, data, event)
+    }
+    fn gesture_swipe_update(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GestureSwipeUpdateEvent,
+    ) {
+        self.inner().gesture_swipe_update(seat, data, event)
+    }
+    fn gesture_swipe_end(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GestureSwipeEndEvent,
+    ) {
+        self.inner().gesture_swipe_end(seat, data, event)
+    }
+    fn gesture_pinch_begin(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GesturePinchBeginEvent,
+    ) {
+        self.inner().gesture_pinch_begin(seat, data, event)
+    }
+    fn gesture_pinch_update(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GesturePinchUpdateEvent,
+    ) {
+        self.inner().gesture_pinch_update(seat, data, event)
+    }
+    fn gesture_pinch_end(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GesturePinchEndEvent,
+    ) {
+        self.inner().gesture_pinch_end(seat, data, event)
+    }
+    fn gesture_hold_begin(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GestureHoldBeginEvent,
+    ) {
+        self.inner().gesture_hold_begin(seat, data, event)
+    }
+    fn gesture_hold_end(
+        &self,
+        seat: &Seat<AppState>,
+        data: &mut AppState,
+        event: &GestureHoldEndEvent,
+    ) {
+        self.inner().gesture_hold_end(seat, data, event)
+    }
+    fn leave(&self, seat: &Seat<AppState>, data: &mut AppState, serial: Serial, time: InputTime) {
+        self.inner().leave(seat, data, serial, time)
+    }
+}
+
+/// A drag's offer to a [`PointerFocusTarget`].
+pub(crate) enum PointerOfferData<S: Source> {
+    Wayland(WlOfferData<S>),
+    X11(XwmOfferData<S>),
+}
+
+impl<S: Source> OfferData for PointerOfferData<S> {
+    fn disable(&self) {
+        match self {
+            Self::Wayland(o) => o.disable(),
+            Self::X11(o) => o.disable(),
+        }
+    }
+
+    fn drop(&self) {
+        match self {
+            Self::Wayland(o) => o.drop(),
+            Self::X11(o) => o.drop(),
+        }
+    }
+
+    fn validated(&self) -> bool {
+        match self {
+            Self::Wayland(o) => o.validated(),
+            Self::X11(o) => o.validated(),
+        }
+    }
+}
+
+impl DndFocus<AppState> for PointerFocusTarget {
+    type OfferData<S>
+        = PointerOfferData<S>
+    where
+        S: Source;
+
+    fn enter<S: Source>(
+        &self,
+        data: &mut AppState,
+        dh: &DisplayHandle,
+        source: Arc<S>,
+        seat: &Seat<AppState>,
+        location: Point<f64, Logical>,
+        serial: &Serial,
+    ) -> Option<PointerOfferData<S>> {
+        data.note_drag_source(&source);
+        match self {
+            Self::Wayland(s) => DndFocus::enter(s, data, dh, source, seat, location, serial)
+                .map(PointerOfferData::Wayland),
+            Self::X11(s) => DndFocus::enter(s, data, dh, source, seat, location, serial)
+                .map(PointerOfferData::X11),
+        }
+    }
+
+    fn motion<S: Source>(
+        &self,
+        data: &mut AppState,
+        offer: Option<&mut PointerOfferData<S>>,
+        seat: &Seat<AppState>,
+        location: Point<f64, Logical>,
+        time: InputTime,
+    ) {
+        match (self, offer) {
+            (Self::Wayland(s), Some(PointerOfferData::Wayland(o))) => {
+                DndFocus::motion(s, data, Some(o), seat, location, time)
+            }
+            (Self::Wayland(s), None) => DndFocus::motion::<S>(s, data, None, seat, location, time),
+            (Self::X11(s), Some(PointerOfferData::X11(o))) => {
+                DndFocus::motion(s, data, Some(o), seat, location, time)
+            }
+            (Self::X11(s), None) => DndFocus::motion::<S>(s, data, None, seat, location, time),
+            _ => {}
+        }
+    }
+
+    fn leave<S: Source>(
+        &self,
+        data: &mut AppState,
+        offer: Option<&mut PointerOfferData<S>>,
+        seat: &Seat<AppState>,
+    ) {
+        match (self, offer) {
+            (Self::Wayland(s), Some(PointerOfferData::Wayland(o))) => {
+                DndFocus::leave(s, data, Some(o), seat)
+            }
+            (Self::Wayland(s), None) => DndFocus::leave::<S>(s, data, None, seat),
+            (Self::X11(s), Some(PointerOfferData::X11(o))) => {
+                DndFocus::leave(s, data, Some(o), seat)
+            }
+            (Self::X11(s), None) => DndFocus::leave::<S>(s, data, None, seat),
+            _ => {}
+        }
+    }
+
+    fn drop<S: Source>(
+        &self,
+        data: &mut AppState,
+        offer: Option<&mut PointerOfferData<S>>,
+        seat: &Seat<AppState>,
+    ) {
+        match (self, offer) {
+            (Self::Wayland(s), Some(PointerOfferData::Wayland(o))) => {
+                DndFocus::drop(s, data, Some(o), seat)
+            }
+            (Self::Wayland(s), None) => DndFocus::drop::<S>(s, data, None, seat),
+            (Self::X11(s), Some(PointerOfferData::X11(o))) => {
+                DndFocus::drop(s, data, Some(o), seat)
+            }
+            (Self::X11(s), None) => DndFocus::drop::<S>(s, data, None, seat),
+            _ => {}
         }
     }
 }
@@ -703,10 +952,13 @@ struct AppState {
     xwayland_shell_state: XWaylandShellState,
     xwm: Option<X11Wm>,
     /// The client's drag in progress over the session's apps, see `start_host_drag`.
-    host_drag: Option<HostDrag>,
+    host_drag: Option<Arc<HostDragState>>,
     /// A session app's drag continued on the client's desktop: our id for its data and the
     /// app's source, which the client reads from (see `CompositorCommand::ReadSelection`).
-    outgoing_drag: Option<(u64, WlDataSource)>,
+    outgoing_drag: Option<OutgoingDrag>,
+    /// The source of the drag in the session that `note_drag_source` last looked at (its
+    /// address), so each drag is looked at once.
+    seen_drag_source: Option<usize>,
     /// The embedded XWayland, for reading X11 selections `xwm` cannot convert.
     x11_display: Option<crate::x11_selection::X11Display>,
     xwayland_client: Option<Client>,
@@ -968,21 +1220,24 @@ impl AppState {
         x: f64,
         y: f64,
     ) -> (
-        Option<(WlSurface, Point<f64, Logical>)>,
+        Option<(PointerFocusTarget, Point<f64, Logical>)>,
         Point<f64, Logical>,
     ) {
+        let wayland = |(s, origin, loc)| (PointerFocusTarget::Wayland(s), origin, loc);
         let focus_and_loc = if let Some(tw) = self.windows.get(&window_id) {
             tw.window
                 .toplevel()
                 .and_then(|t| self.hit_test_tree(t.wl_surface(), (0, 0), x, y))
+                .map(wayland)
         } else if let Some(tp) = self.popup_windows.get(&window_id) {
             self.hit_test_tree(tp.surface.wl_surface(), (0, 0), x, y)
+                .map(wayland)
         } else if let Some(xw) = self.x11_windows.get(&window_id) {
             let ox = xw.geo.loc.x as f64;
             let oy = xw.geo.loc.y as f64;
-            xw.surface.wl_surface().map(|s| {
+            xw.surface.wl_surface().map(|_| {
                 (
-                    s,
+                    PointerFocusTarget::X11(xw.surface.clone()),
                     Point::<f64, Logical>::from((ox, oy)),
                     Point::<f64, Logical>::from((ox + x, oy + y)),
                 )
@@ -990,9 +1245,9 @@ impl AppState {
         } else if let Some(xp) = self.x11_popups.get(&window_id) {
             let ox = xp.geo.loc.x as f64;
             let oy = xp.geo.loc.y as f64;
-            xp.surface.wl_surface().map(|s| {
+            xp.surface.wl_surface().map(|_| {
                 (
-                    s,
+                    PointerFocusTarget::X11(xp.surface.clone()),
                     Point::<f64, Logical>::from((ox, oy)),
                     Point::<f64, Logical>::from((ox + x, oy + y)),
                 )
@@ -1014,59 +1269,32 @@ impl AppState {
         window_id: WindowId,
         x: f64,
         y: f64,
-        drag: HostDrag,
+        source: HostDragSource,
         serial: Serial,
         time_ms: u32,
     ) {
-        // Smithay's drag callbacks do not say which drag they are for, so a drop whose
-        // target is still reading keeps the drag slot for a while: refuse the new drag
-        // (telling its client right away) rather than serve the old drop the new data.
-        if let Some(old) = self.host_drag.as_ref().filter(|d| !d.active) {
-            let reading = old
-                .dropped_at
-                .is_some_and(|t| t.elapsed() < DROPPED_DRAG_GRACE);
-            if reading {
-                debug!("refusing a drag while the previous drop is still being read");
-                let _ = self.event_tx.send(CompositorEvent::DragFinished {
-                    offer_id: drag.clip.offer_id,
-                });
-                return;
-            }
-            let _ = self.event_tx.send(CompositorEvent::DragFinished {
-                offer_id: old.clip.offer_id,
-            });
-            self.host_drag = None;
-        }
         self.cancel_host_drag(serial, time_ms);
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         if pointer.is_grabbed() {
-            // A drag or other grab inside the session is in progress.
+            // A drag or other grab inside the session is in progress. Dropping the source
+            // tells the client the drag is over.
             return;
         }
         let (focus, location) = self.pointer_target(window_id, x, y);
-        let mime_types = drag.clip.mime_types();
-        self.host_drag = Some(drag);
-        let dh = self.display_handle.clone();
-        let seat = self.seat.clone();
-        start_dnd(
-            &dh,
-            &seat,
-            self,
-            serial,
-            Some(PointerGrabStartData {
+        self.host_drag = Some(source.state.clone());
+        let grab = DnDGrab::new_pointer(
+            &self.display_handle,
+            PointerGrabStartData {
                 focus: None,
                 button: BTN_LEFT,
                 location,
-            }),
-            None,
-            SourceMetadata {
-                mime_types,
-                // Never a move: the source would delete what was dragged once dropped.
-                dnd_action: DndAction::Copy,
             },
+            source,
+            self.seat.clone(),
         );
+        pointer.set_grab(self, grab, serial, Focus::Keep);
         // Enter the surface under the pointer.
         pointer.motion(
             self,
@@ -1074,7 +1302,7 @@ impl AppState {
             &MotionEvent {
                 location,
                 serial,
-                time: time_ms,
+                time: InputTime::from_millis(time_ms),
             },
         );
         pointer.frame(self);
@@ -1092,31 +1320,25 @@ impl AppState {
                 &MotionEvent {
                     location,
                     serial,
-                    time: time_ms,
+                    time: InputTime::from_millis(time_ms),
                 },
             );
             pointer.frame(self);
         }
     }
 
-    /// The host drag is over: tell its client, which can end the local drag. Smithay's
-    /// `finished`/`cancelled` callbacks come only after a drop (smithay reports `dropped`
-    /// first, even for a cancel), so one arriving while the drag is still active belongs
-    /// to an older drag and is ignored.
-    fn end_host_drag(&mut self) {
-        if self.host_drag.as_ref().is_some_and(|d| d.active) {
-            return;
-        }
-        if let Some(drag) = self.host_drag.take() {
-            let _ = self.event_tx.send(CompositorEvent::DragFinished {
-                offer_id: drag.clip.offer_id,
-            });
-        }
+    /// Whether the client's drag over the session's apps is in progress (not yet dropped
+    /// or cancelled).
+    fn host_drag_active(&self) -> bool {
+        self.host_drag
+            .as_ref()
+            .is_some_and(|d| d.active.load(Ordering::Acquire))
     }
 
     /// End an active host drag without dropping (it left the window).
     fn cancel_host_drag(&mut self, serial: Serial, time_ms: u32) {
-        if !self.host_drag.as_ref().is_some_and(|d| d.active) {
+        if !self.host_drag_active() {
+            self.host_drag = None;
             return;
         }
         if let Some(pointer) = self.seat.get_pointer() {
@@ -1128,13 +1350,67 @@ impl AppState {
                 &MotionEvent {
                     location,
                     serial,
-                    time: time_ms,
+                    time: InputTime::from_millis(time_ms),
                 },
             );
-            pointer.unset_grab(self, serial, time_ms);
+            pointer.unset_grab(self, serial, InputTime::from_millis(time_ms));
             pointer.frame(self);
         }
         self.host_drag = None;
+    }
+
+    /// A drag in the session met its first target (`DndFocus::enter`): if a session app
+    /// started it with data other apps understand, offer it to the client, which continues
+    /// it on its desktop when it leaves the remote windows. Drags of app-internal types stay
+    /// in the session. Works for Wayland and X11 (XDND) sources alike.
+    fn note_drag_source<S: Source>(&mut self, source: &Arc<S>) {
+        if std::any::TypeId::of::<S>() == std::any::TypeId::of::<HostDragSource>() {
+            // The client's own drag.
+            return;
+        }
+        let addr = Arc::as_ptr(source) as *const () as usize;
+        if self.seen_drag_source == Some(addr) {
+            return;
+        }
+        self.seen_drag_source = Some(addr);
+        self.outgoing_drag = None;
+        let mime_types = source
+            .metadata()
+            .map(|meta| meta.mime_types)
+            .unwrap_or_default();
+        if !oriel_proto::selection::has_interchange_mime(&mime_types) {
+            return;
+        }
+        let uri_pipe = if mime_types
+            .iter()
+            .any(|m| m == oriel_proto::xfer::URI_LIST_MIME)
+        {
+            std::io::pipe().ok().map(|(read_pipe, write_pipe)| {
+                source.send(oriel_proto::xfer::URI_LIST_MIME, write_pipe.into());
+                read_pipe
+            })
+        } else {
+            None
+        };
+        let _ = self.display_handle.flush_clients();
+        let offer_id = oriel_proto::xfer::random_u64();
+        let source: Arc<dyn Source> = source.clone();
+        self.outgoing_drag = Some(OutgoingDrag { offer_id, source });
+        let window_id = self.focused_window_id;
+        let mimes = oriel_proto::selection::proxyable_mimes(&mime_types);
+        let event_tx = self.event_tx.clone();
+        debug!(window_id, ?mimes, "a session drag can leave the session");
+        std::thread::spawn(move || {
+            let paths = uri_pipe
+                .and_then(|pipe| read_selection_fd_complete(pipe.into()))
+                .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body));
+            let _ = event_tx.send(CompositorEvent::DragOffer {
+                window_id,
+                offer_id,
+                mimes,
+                paths,
+            });
+        });
     }
 
     fn cleanup_xwayland_state(&mut self) {
@@ -1462,7 +1738,7 @@ impl AppState {
                     button,
                     state,
                     serial,
-                    time: time_ms,
+                    time: InputTime::from_millis(time_ms),
                 },
             );
             pointer.frame(self);
@@ -1629,7 +1905,7 @@ impl AppState {
                         &MotionEvent {
                             location,
                             serial,
-                            time: time_ms,
+                            time: InputTime::from_millis(time_ms),
                         },
                     );
                     pointer.frame(self);
@@ -1641,21 +1917,12 @@ impl AppState {
                 y,
                 clip,
                 fetch,
-            } => self.start_host_drag(
-                window_id,
-                x,
-                y,
-                HostDrag {
-                    clip,
-                    fetch,
-                    active: true,
-                    dropped_at: None,
-                },
-                serial,
-                time_ms,
-            ),
+            } => {
+                let source = HostDragSource::new(clip, fetch, self.event_tx.clone());
+                self.start_host_drag(window_id, x, y, source, serial, time_ms);
+            }
             CompositorCommand::DragMotion { window_id, x, y } => {
-                if self.host_drag.as_ref().is_some_and(|d| d.active) {
+                if self.host_drag_active() {
                     if let Some(pointer) = self.seat.get_pointer() {
                         let (focus, location) = self.pointer_target(window_id, x, y);
                         pointer.motion(
@@ -1664,7 +1931,7 @@ impl AppState {
                             &MotionEvent {
                                 location,
                                 serial,
-                                time: time_ms,
+                                time: InputTime::from_millis(time_ms),
                             },
                         );
                         pointer.frame(self);
@@ -1687,7 +1954,7 @@ impl AppState {
                             self,
                             &ButtonEvent {
                                 serial,
-                                time: time_ms,
+                                time: InputTime::from_millis(time_ms),
                                 button: BTN_LEFT,
                                 state: ButtonState::Released,
                             },
@@ -1697,14 +1964,14 @@ impl AppState {
                 }
             }
             CompositorCommand::DragDrop => {
-                if self.host_drag.as_ref().is_some_and(|d| d.active) {
+                if self.host_drag_active() {
                     if let Some(pointer) = self.seat.get_pointer() {
                         // The drag grab drops once no button is held.
                         pointer.button(
                             self,
                             &ButtonEvent {
                                 serial,
-                                time: time_ms,
+                                time: InputTime::from_millis(time_ms),
                                 button: BTN_LEFT,
                                 state: ButtonState::Released,
                             },
@@ -1718,7 +1985,7 @@ impl AppState {
                     // Ignore a stale leave if the pointer already entered another window.
                     let owner = pointer
                         .current_focus()
-                        .and_then(|s| self.window_for_surface(&s));
+                        .and_then(|f| self.window_for_surface(&*f.wl_surface()?));
                     if owner == Some(window_id) {
                         let location = pointer.current_location();
                         pointer.motion(
@@ -1727,7 +1994,7 @@ impl AppState {
                             &MotionEvent {
                                 location,
                                 serial,
-                                time: time_ms,
+                                time: InputTime::from_millis(time_ms),
                             },
                         );
                         pointer.frame(self);
@@ -1743,11 +2010,12 @@ impl AppState {
                 self.focused_window_id = window_id;
                 if let Some(pointer) = self.seat.get_pointer() {
                     let is_wheel = dx.abs() >= 10.0 || dy.abs() >= 10.0;
-                    let mut frame = AxisFrame::new(time_ms).source(if is_wheel {
-                        AxisSource::Wheel
-                    } else {
-                        AxisSource::Continuous
-                    });
+                    let mut frame =
+                        AxisFrame::new(InputTime::from_millis(time_ms)).source(if is_wheel {
+                            AxisSource::Wheel
+                        } else {
+                            AxisSource::Continuous
+                        });
                     if dx != 0.0 {
                         frame = frame.value(Axis::Horizontal, dx);
                         if is_wheel {
@@ -1791,7 +2059,7 @@ impl AppState {
                         xkb_keycode,
                         state,
                         serial,
-                        time_ms,
+                        InputTime::from_millis(time_ms),
                         |_, _, _| FilterResult::Forward,
                     );
                 }
@@ -1831,13 +2099,13 @@ impl AppState {
                 if self.owned_clipboard_offer == Some(offer_id) {
                     let _ = found.send(true);
                     self.request_owned_clipboard(mime, fd);
-                } else if let Some((_, source)) = self
+                } else if let Some(drag) = self
                     .outgoing_drag
                     .as_ref()
-                    .filter(|(id, _)| *id == offer_id)
+                    .filter(|d| d.offer_id == offer_id)
                 {
                     let _ = found.send(true);
-                    source.send(mime, std::os::fd::AsFd::as_fd(&fd));
+                    drag.source.send(&mime, fd);
                     let _ = self.display_handle.flush_clients();
                 } else {
                     let _ = found.send(false);
@@ -1902,7 +2170,7 @@ impl AppState {
                                 button,
                                 state: smithay::backend::input::ButtonState::Released,
                                 serial,
-                                time: time_ms,
+                                time: InputTime::from_millis(time_ms),
                             },
                         );
                     }
@@ -2106,7 +2374,7 @@ impl AppState {
                     .data_map
                     .get::<XdgToplevelSurfaceData>()
                     .and_then(|d| d.lock().ok())
-                    .is_some_and(|d| d.modal)
+                    .is_some_and(|d| d.dialog_hint == ToplevelDialogHint::Modal)
             });
             DialogOf { parent_id, modal }
         } else {
@@ -2698,7 +2966,7 @@ impl AppState {
                 .data_map
                 .get::<XdgPopupSurfaceData>()
                 .and_then(|d| d.lock().ok())
-                .map(|attr| attr.last_acked.unwrap_or(attr.current).geometry)
+                .and_then(|attr| attr.last_acked.as_ref().map(|c| c.state.geometry))
         });
 
         let xdg_geo = with_states(&root_surface, |states| {
@@ -3716,7 +3984,7 @@ impl XdgShellHandler for AppState {
 
 impl SeatHandler for AppState {
     type KeyboardFocus = KeyboardFocusTarget;
-    type PointerFocus = WlSurface;
+    type PointerFocus = PointerFocusTarget;
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
@@ -3777,18 +4045,110 @@ impl SeatHandler for AppState {
 /// Linux evdev code of the left mouse button, which host drags are held with.
 const BTN_LEFT: u32 = 0x110;
 
-/// How long a dropped client drag keeps the drag slot while its target reads the data.
-const DROPPED_DRAG_GRACE: Duration = Duration::from_secs(10);
-
 pub(crate) const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// What the client is dragging over the session's apps.
-struct HostDrag {
+/// A session app's drag continued on the client's desktop, see `AppState::note_drag_source`.
+struct OutgoingDrag {
+    offer_id: u64,
+    source: Arc<dyn Source>,
+}
+
+/// What the client is dragging over the session's apps: the source of a compositor-side
+/// drag (`AppState::start_host_drag`).
+struct HostDragSource {
     clip: ReceivedClipboard,
     fetch: SelectionFetcher,
+    state: Arc<HostDragState>,
+}
+
+/// The progress of a [`HostDragSource`], shared with `AppState::host_drag`.
+struct HostDragState {
+    offer_id: u64,
     /// Not yet dropped or cancelled. After a drop the target may still read the data.
-    active: bool,
-    dropped_at: Option<Instant>,
+    active: AtomicBool,
+    /// The client was told the drag is over (`CompositorEvent::DragFinished`).
+    finished: AtomicBool,
+    event_tx: mpsc::UnboundedSender<CompositorEvent>,
+}
+
+impl HostDragState {
+    /// Tell the client the drag is over (once), so it can end its local drag.
+    fn finish(&self) {
+        self.active.store(false, Ordering::Release);
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            debug!(offer_id = self.offer_id, "the client's drag is over");
+            let _ = self.event_tx.send(CompositorEvent::DragFinished {
+                offer_id: self.offer_id,
+            });
+        }
+    }
+}
+
+impl HostDragSource {
+    fn new(
+        clip: ReceivedClipboard,
+        fetch: SelectionFetcher,
+        event_tx: mpsc::UnboundedSender<CompositorEvent>,
+    ) -> Self {
+        let state = Arc::new(HostDragState {
+            offer_id: clip.offer_id,
+            active: AtomicBool::new(true),
+            finished: AtomicBool::new(false),
+            event_tx,
+        });
+        Self { clip, fetch, state }
+    }
+}
+
+impl Drop for HostDragSource {
+    /// Smithay drops the source once no target can read from it any more (a target that
+    /// never finishes, for one): the drag is over then too.
+    fn drop(&mut self) {
+        self.state.finish();
+    }
+}
+
+impl IsAlive for HostDragSource {
+    fn alive(&self) -> bool {
+        !self.state.finished.load(Ordering::Acquire)
+    }
+}
+
+impl Source for HostDragSource {
+    fn metadata(&self) -> Option<SourceMetadata> {
+        let mut meta = SourceMetadata {
+            mime_types: self.clip.mime_types(),
+            ..Default::default()
+        };
+        // Never a move: the client's source would delete what was dragged once dropped.
+        meta.dnd_actions.push(DndAction::Copy);
+        Some(meta)
+    }
+
+    fn choose_action(&self, _action: DndAction) {}
+
+    fn send(&self, mime_type: &str, fd: OwnedFd) {
+        match self.clip.serve(mime_type) {
+            Serve::Bytes(bytes) => {
+                std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
+            }
+            Serve::Fetch(mime) => (self.fetch.0)(self.clip.offer_id, mime, fd),
+            Serve::PortalFiles(paths) => write_portal_key(paths, fd),
+            Serve::Nothing => {}
+        }
+    }
+
+    fn drop_performed(&self) {
+        self.state.active.store(false, Ordering::Release);
+    }
+
+    fn cancel(&self) {
+        self.state.finish();
+    }
+
+    fn finished(&self) {
+        self.state.finish();
+    }
 }
 
 /// The client's clipboard, as the session's selection.
@@ -4109,9 +4469,7 @@ impl SelectionHandler for AppState {
             }
             SelectionOwner::X11Client => {
                 if let Some(xwm) = self.xwm.as_mut() {
-                    if let Err(err) =
-                        xwm.send_selection(ty, mime_type, fd, self.loop_handle.clone())
-                    {
+                    if let Err(err) = xwm.send_selection(ty, mime_type, fd) {
                         debug!(error = ?err, ?ty, "X11Wm::send_selection failed for Wayland client");
                     }
                 }
@@ -4432,8 +4790,8 @@ impl AppState {
 }
 
 impl PrimarySelectionHandler for AppState {
-    fn primary_selection_state(&self) -> &PrimarySelectionState {
-        &self.primary_selection_state
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection_state
     }
 }
 
@@ -4505,7 +4863,7 @@ impl XwmHandler for AppState {
             let _ = window.set_mapped(true);
             return;
         }
-        let mut geo = window.geometry();
+        let mut geo = window.last_configure();
         let is_popup_type = matches!(
             window.window_type(),
             Some(
@@ -4641,7 +4999,7 @@ impl XwmHandler for AppState {
         if self.x11_id_by_win.contains_key(&x11_win) {
             return;
         }
-        let geo = window.geometry();
+        let geo = window.last_configure();
         let window_id = self.alloc_window_id();
         let wl_opt = window.wl_surface();
         if let Some(ref wl) = wl_opt {
@@ -4724,7 +5082,7 @@ impl XwmHandler for AppState {
         h: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
-        let mut geo = window.geometry();
+        let mut geo = window.last_configure();
         if let Some(x) = x {
             geo.loc.x = x;
         }
@@ -4990,10 +5348,7 @@ impl XwmHandler for AppState {
             if let Ok((read_pipe, write_pipe)) = std::io::pipe() {
                 let write_fd: OwnedFd = write_pipe.into();
                 if let Some(xwm) = self.xwm.as_mut() {
-                    if xwm
-                        .send_selection(selection, mime, write_fd, self.loop_handle.clone())
-                        .is_ok()
-                    {
+                    if xwm.send_selection(selection, mime, write_fd).is_ok() {
                         let event_tx = self.event_tx.clone();
                         let read_fd: OwnedFd = read_pipe.into();
                         std::thread::spawn(move || {
@@ -5030,98 +5385,77 @@ impl XwmHandler for AppState {
 }
 
 impl DataDeviceHandler for AppState {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device_state
     }
 }
 
-impl ClientDndGrabHandler for AppState {
-    fn started(
+impl WaylandDndGrabHandler for AppState {
+    fn dnd_requested<S: Source>(
         &mut self,
-        source: Option<WlDataSource>,
+        source: S,
         _icon: Option<WlSurface>,
-        _seat: Seat<Self>,
+        seat: Seat<Self>,
+        serial: Serial,
+        type_: GrabType,
     ) {
-        // A drag carrying data other apps understand can leave the session: the client
-        // continues it on its desktop. Drags of app-internal types stay in the session.
-        let Some(source) = source else {
-            return;
-        };
-        let mime_types =
-            with_source_metadata(&source, |meta| meta.mime_types.clone()).unwrap_or_default();
-        if !oriel_proto::selection::has_interchange_mime(&mime_types) {
-            return;
+        match type_ {
+            GrabType::Pointer => {
+                let Some(pointer) = seat.get_pointer() else {
+                    return source.cancel();
+                };
+                let Some(start_data) = pointer.grab_start_data() else {
+                    return source.cancel();
+                };
+                let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
+                pointer.set_grab(self, grab, serial, Focus::Keep);
+            }
+            GrabType::Touch => {
+                let Some(touch) = seat.get_touch() else {
+                    return source.cancel();
+                };
+                let Some(start_data) = touch.grab_start_data() else {
+                    return source.cancel();
+                };
+                let grab = DnDGrab::new_touch(&self.display_handle, start_data, source, seat);
+                touch.set_grab(self, grab, serial);
+            }
         }
-        let uri_pipe = if mime_types
-            .iter()
-            .any(|m| m == oriel_proto::xfer::URI_LIST_MIME)
-        {
-            std::io::pipe().ok().map(|(read_pipe, write_pipe)| {
-                source.send(
-                    oriel_proto::xfer::URI_LIST_MIME.to_string(),
-                    std::os::fd::AsFd::as_fd(&write_pipe),
-                );
-                read_pipe
-            })
-        } else {
-            None
-        };
-        let _ = self.display_handle.flush_clients();
-        let offer_id = oriel_proto::xfer::random_u64();
-        self.outgoing_drag = Some((offer_id, source));
-        let window_id = self.focused_window_id;
-        let mimes = oriel_proto::selection::proxyable_mimes(&mime_types);
-        let event_tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let paths = uri_pipe
-                .and_then(|pipe| read_selection_fd_complete(pipe.into()))
-                .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body));
-            let _ = event_tx.send(CompositorEvent::DragOffer {
-                window_id,
-                offer_id,
-                mimes,
-                paths,
-            });
-        });
-    }
-
-    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
-        self.outgoing_drag = None;
     }
 }
-impl ServerDndGrabHandler for AppState {
-    fn send(&mut self, mime_type: String, fd: OwnedFd, _seat: Seat<Self>) {
-        let Some(drag) = &self.host_drag else {
-            return;
-        };
-        match drag.clip.serve(&mime_type) {
-            Serve::Bytes(bytes) => {
-                std::thread::spawn(move || write_selection_fd_timeout(fd, &bytes));
-            }
-            Serve::Fetch(mime) => (drag.fetch.0)(drag.clip.offer_id, mime, fd),
-            Serve::PortalFiles(paths) => write_portal_key(paths, fd),
-            Serve::Nothing => {}
+
+impl DndGrabHandler for AppState {
+    fn dropped(
+        &mut self,
+        _target: Option<DndTarget<'_, Self>>,
+        _validated: bool,
+        _seat: Seat<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        self.end_session_drag();
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
+        self.end_session_drag();
+    }
+}
+
+impl AppState {
+    /// A drag grab in the session ended (dropped or cancelled).
+    fn end_session_drag(&mut self) {
+        self.outgoing_drag = None;
+        self.seen_drag_source = None;
+        if !self.host_drag_active() {
+            self.host_drag = None;
         }
-    }
-
-    fn dropped(&mut self, _seat: Seat<Self>) {
-        if let Some(drag) = &mut self.host_drag {
-            drag.active = false;
-            drag.dropped_at = Some(Instant::now());
-        }
-    }
-
-    fn cancelled(&mut self, _seat: Seat<Self>) {
-        self.end_host_drag();
-    }
-
-    fn finished(&mut self, _seat: Seat<Self>) {
-        self.end_host_drag();
     }
 }
 
 impl OutputHandler for AppState {}
-impl TabletSeatHandler for AppState {}
+impl TabletSeatHandler for AppState {
+    type ToolFocus = WlSurface;
+}
+impl PointerConstraintsHandler for AppState {}
 
 impl AppState {
     fn update_window_decoration_mode(
@@ -5177,6 +5511,11 @@ impl XdgDecorationHandler for AppState {
         toplevel.send_pending_configure();
         self.update_window_decoration_mode(toplevel.wl_surface(), false, false);
     }
+
+    fn decoration_destroyed(&mut self, toplevel: ToplevelSurface) {
+        // Smithay already reset the mode; the toplevel draws its own decorations again.
+        self.update_window_decoration_mode(toplevel.wl_surface(), false, false);
+    }
 }
 
 impl KdeDecorationHandler for AppState {
@@ -5219,30 +5558,15 @@ impl FractionalScaleHandler for AppState {
     }
 }
 
-delegate_compositor!(AppState);
-delegate_shm!(AppState);
-delegate_dmabuf!(AppState);
-delegate_drm_syncobj!(AppState);
-delegate_xdg_shell!(AppState);
-delegate_xdg_dialog!(AppState);
-
 impl XdgDialogHandler for AppState {
-    fn modal_changed(&mut self, toplevel: ToplevelSurface, _is_modal: bool) {
+    fn dialog_hint_changed(&mut self, toplevel: ToplevelSurface, _hint: ToplevelDialogHint) {
         if let Some(&window_id) = self.surface_to_window.get(&toplevel.wl_surface().id()) {
             self.sync_dialog_of(window_id);
         }
     }
 }
-delegate_xdg_decoration!(AppState);
-delegate_kde_decoration!(AppState);
-delegate_seat!(AppState);
-delegate_data_device!(AppState);
-delegate_primary_selection!(AppState);
-delegate_cursor_shape!(AppState);
-delegate_fractional_scale!(AppState);
-delegate_viewporter!(AppState);
-delegate_output!(AppState);
-delegate_xwayland_shell!(AppState);
+
+delegate_dispatch2!(AppState);
 
 /// Resolves once the compositor thread has stopped, however it stopped: returning (on an
 /// error) or panicking, or failing to start.
@@ -5341,6 +5665,7 @@ fn spawn_xwayland_with_auth(
             dh,
             Some(display_num),
             envs,
+            std::iter::empty::<OsString>(),
             false, // disable abstract Unix sockets for multi-user isolation
             Stdio::null(),
             Stdio::null(),
@@ -5453,6 +5778,7 @@ fn run_compositor_loop(
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
             make: "Oriel".into(),
+            serial_number: String::new(),
             model: "Headless".into(),
         },
     );
@@ -5480,6 +5806,7 @@ fn run_compositor_loop(
                 xwayland_spawned = true;
                 xwayland_client = Some(client.clone());
                 let xwm_loop_handle = loop_handle.clone();
+                let xwm_dh = dh.clone();
                 if let Err(err) = loop_handle.insert_source(xwayland, move |event, _, state| {
                     match event {
                         XWaylandEvent::Ready {
@@ -5493,6 +5820,7 @@ fn run_compositor_loop(
                             crate::session::set_x11_env(disp.clone(), xauth_path.clone());
                             match X11Wm::start_wm(
                                 xwm_loop_handle.clone(),
+                                &xwm_dh,
                                 x11_socket,
                                 client.clone(),
                             ) {
@@ -5574,6 +5902,7 @@ fn run_compositor_loop(
         xwm: None,
         host_drag: None,
         outgoing_drag: None,
+        seen_drag_source: None,
         x11_display: None,
         xwayland_client,
         output,
@@ -5912,14 +6241,19 @@ fn sync_keyboard_enter<D: SeatHandler + 'static>(
                 *kc,
                 KeyState::Released,
                 serial,
-                time_ms,
+                InputTime::from_millis(time_ms),
                 |_, _, _| FilterResult::Forward,
             );
         }
         for kc in desired_keys.difference(&current_keys) {
-            keyboard.input::<(), _>(state, *kc, KeyState::Pressed, serial, time_ms, |_, _, _| {
-                FilterResult::Forward
-            });
+            keyboard.input::<(), _>(
+                state,
+                *kc,
+                KeyState::Pressed,
+                serial,
+                InputTime::from_millis(time_ms),
+                |_, _, _| FilterResult::Forward,
+            );
         }
     }
 
@@ -5939,9 +6273,14 @@ fn clear_keyboard_focus_and_keys<D: SeatHandler + 'static>(
     keyboard.set_focus(state, None, serial);
     let held: Vec<Keycode> = keyboard.pressed_keys().into_iter().collect();
     for kc in held {
-        keyboard.input::<(), _>(state, kc, KeyState::Released, serial, time_ms, |_, _, _| {
-            FilterResult::Forward
-        });
+        keyboard.input::<(), _>(
+            state,
+            kc,
+            KeyState::Released,
+            serial,
+            InputTime::from_millis(time_ms),
+            |_, _, _| FilterResult::Forward,
+        );
     }
 }
 
@@ -6526,6 +6865,18 @@ mod tests {
         }
     }
 
+    // Needed for `WlSurface` as the pointer focus; these tests never touch a surface.
+    impl PointerConstraintsHandler for MockSeatState {}
+    impl CompositorHandler for MockSeatState {
+        fn compositor_state(&mut self) -> &mut CompositorState {
+            unimplemented!()
+        }
+        fn client_compositor_state<'a>(&self, _client: &'a Client) -> &'a CompositorClientState {
+            unimplemented!()
+        }
+        fn commit(&mut self, _surface: &WlSurface) {}
+    }
+
     impl KeyboardTarget<MockSeatState> for MockKeyboardTarget {
         fn enter(
             &self,
@@ -6550,7 +6901,7 @@ mod tests {
             key: KeysymHandle<'_>,
             state: KeyState,
             _serial: Serial,
-            _time: u32,
+            _time: InputTime,
         ) {
             data.events.push(RecordedKeyboardEvent::Key(
                 self.0,
@@ -6618,7 +6969,7 @@ mod tests {
             Keycode::from(KEY_LEFTCTRL + 8),
             KeyState::Released,
             SERIAL_COUNTER.next_serial(),
-            20,
+            InputTime::from_millis(20),
             |_, _, _| FilterResult::Forward,
         );
         let mods = keyboard.modifier_state();
