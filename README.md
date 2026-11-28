@@ -43,7 +43,9 @@ cargo test --workspace
 ```
 
 `oriel-proto` builds the SmartTile encoder's GPU compute paths (wgpu, Vulkan) only with its
-`gpu-encoder` feature, which the server enables; the client is built without them.
+`gpu-encoder` feature, which the server enables. Built on its own
+(`cargo build -p oriel-client`, as the Flatpak does), the client leaves them out; a
+workspace build shares one `oriel-proto`, so its client includes them.
 
 ### Cross-compiling for `aarch64-unknown-linux-gnu`
 

@@ -6839,7 +6839,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gpu-encoder")]
     #[test]
     fn simd_kernels_match_scalar_bit_for_bit() {
         let mut rng = 0x853c_49e6_748f_ea9bu64;
@@ -7493,6 +7492,8 @@ mod tests {
             "end-to-end 1080p half-res must be bit-identical"
         );
 
+        // Without the GPU encoder, the "GPU" run above takes the SIMD path.
+        #[cfg(feature = "gpu-encoder")]
         if let Some(eng) = gpu::global_gpu_engine() {
             if let Ok(lt) = eng.last_timing.lock() {
                 println!(
