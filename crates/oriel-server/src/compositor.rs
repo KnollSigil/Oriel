@@ -1345,7 +1345,11 @@ impl AppState {
         };
         drag.outside = true;
         let offer_id = drag.offer_id;
+        let x11 = matches!(drag.data, DragData::X11(_));
         self.pointer_to_nowhere(serial, time_ms);
+        if !x11 {
+            return;
+        }
         self.after_xdnd_retarget(offer_id, |state, serial, time_ms| {
             if state.outgoing_drag.as_ref().is_some_and(|d| d.outside) {
                 state.pointer_to_nowhere_moved(serial, time_ms, (1.0, 0.0));
@@ -1361,11 +1365,13 @@ impl AppState {
     /// connection, which XWayland can handle before the move, and an app that never saw
     /// the proxy as its target drops on its own window.
     fn end_outgoing_drag(&mut self, serial: Serial, time_ms: u32) {
-        let Some(offer_id) = self.outgoing_drag.as_ref().map(|d| d.offer_id) else {
+        let Some(drag) = self.outgoing_drag.as_mut().filter(|d| !d.ending) else {
             return;
         };
-        self.pointer_to_nowhere_moved(serial, time_ms, (-1.0, 0.0));
-        self.after_xdnd_retarget(offer_id, |state, serial, time_ms| {
+        drag.ending = true;
+        let offer_id = drag.offer_id;
+        let x11 = matches!(drag.data, DragData::X11(_));
+        let release = |state: &mut Self, serial: Serial, time_ms: u32| {
             state.pressed_buttons.remove(&BTN_LEFT);
             if let Some(pointer) = state.seat.get_pointer() {
                 pointer.button(
@@ -1379,7 +1385,20 @@ impl AppState {
                 );
                 pointer.frame(state);
             }
-        });
+        };
+        if x11 {
+            self.pointer_to_nowhere_moved(serial, time_ms, (-1.0, 0.0));
+            self.after_xdnd_retarget(offer_id, release);
+        } else {
+            self.pointer_to_nowhere(serial, time_ms);
+            release(self, serial, time_ms);
+        }
+    }
+
+    /// Whether the client's pointer input must not reach the session's apps: a drag that
+    /// ended outside the remote windows has yet to end in the session.
+    fn outgoing_drag_ending(&self) -> bool {
+        self.outgoing_drag.as_ref().is_some_and(|d| d.ending)
     }
 
     /// Run `step` after [`XDND_RETARGET_DELAY`], if the outgoing drag `offer_id` is still
@@ -1469,31 +1488,48 @@ impl AppState {
         if !oriel_proto::selection::has_interchange_mime(&mime_types) {
             return;
         }
-        let uri_pipe = if mime_types
+        let has_uri_list = mime_types
             .iter()
-            .any(|m| m == oriel_proto::xfer::URI_LIST_MIME)
-        {
-            std::io::pipe().ok().map(|(read_pipe, write_pipe)| {
+            .any(|m| m == oriel_proto::xfer::URI_LIST_MIME);
+        let x11 = self
+            .xwm
+            .as_ref()
+            .is_some_and(|xwm| source.is_client_local(&xwm.id()));
+        let source: Arc<dyn Source> = source.clone();
+        let uri_pipe = std::io::pipe().ok().filter(|_| has_uri_list);
+        let (data, uri_list) = if x11 {
+            let (requests, queue) = std::sync::mpsc::channel();
+            let x11_source = Arc::clone(&source);
+            std::thread::spawn(move || serve_x11_drag(x11_source, queue));
+            let uri_list = uri_pipe.map(|(read_pipe, write_pipe)| {
+                let _ = requests.send((
+                    oriel_proto::xfer::URI_LIST_MIME.to_string(),
+                    write_pipe.into(),
+                ));
+                read_pipe
+            });
+            (DragData::X11(requests), uri_list)
+        } else {
+            let uri_list = uri_pipe.map(|(read_pipe, write_pipe)| {
                 source.send(oriel_proto::xfer::URI_LIST_MIME, write_pipe.into());
                 read_pipe
-            })
-        } else {
-            None
+            });
+            let _ = self.display_handle.flush_clients();
+            (DragData::Source(source), uri_list)
         };
-        let _ = self.display_handle.flush_clients();
         let offer_id = oriel_proto::xfer::random_u64();
-        let source: Arc<dyn Source> = source.clone();
         self.outgoing_drag = Some(OutgoingDrag {
             offer_id,
-            source,
+            data,
             outside: false,
+            ending: false,
         });
         let window_id = self.focused_window_id;
         let mimes = oriel_proto::selection::proxyable_mimes(&mime_types);
         let event_tx = self.event_tx.clone();
         debug!(window_id, ?mimes, "a session drag can leave the session");
         std::thread::spawn(move || {
-            let paths = uri_pipe
+            let paths = uri_list
                 .and_then(|pipe| read_selection_fd_complete(pipe.into()))
                 .and_then(|body| oriel_proto::xfer::parse_file_uri_list(&body));
             let _ = event_tx.send(CompositorEvent::DragOffer {
@@ -1987,6 +2023,10 @@ impl AppState {
                     let _ = xpop.surface.close();
                 }
             }
+            CompositorCommand::PointerMotion { .. }
+            | CompositorCommand::PointerButton { .. }
+            | CompositorCommand::PointerAxis { .. }
+                if self.outgoing_drag_ending() => {}
             CompositorCommand::PointerMotion { window_id, x, y } => {
                 self.focused_window_id = window_id;
                 if let Some(drag) = self.outgoing_drag.as_mut() {
@@ -2179,7 +2219,12 @@ impl AppState {
                     .filter(|d| d.offer_id == offer_id)
                 {
                     let _ = found.send(true);
-                    drag.source.send(&mime, fd);
+                    match &drag.data {
+                        DragData::Source(source) => source.send(&mime, fd),
+                        DragData::X11(requests) => {
+                            let _ = requests.send((mime, fd));
+                        }
+                    }
                     let _ = self.display_handle.flush_clients();
                 } else {
                     let _ = found.send(false);
@@ -4124,9 +4169,68 @@ pub(crate) const SELECTION_IO_TIMEOUT: Duration = Duration::from_secs(3);
 /// A session app's drag continued on the client's desktop, see `AppState::note_drag_source`.
 struct OutgoingDrag {
     offer_id: u64,
-    source: Arc<dyn Source>,
+    data: DragData,
     /// The client's drag is outside the remote windows (`OutgoingDragLeave`).
     outside: bool,
+    /// It ended there (`OutgoingDragEnd`): the session's drag ends without a drop once the
+    /// held button is released, after a delay for an X11 app (see `end_outgoing_drag`).
+    /// Until then the client's pointer input must not reach the session.
+    ending: bool,
+}
+
+/// Where the data of an [`OutgoingDrag`] comes from.
+enum DragData {
+    /// A Wayland app's drag: its source.
+    Source(Arc<dyn Source>),
+    /// An X11 app's drag (smithay's XDND source): reads queued for `serve_x11_drag`.
+    X11(std::sync::mpsc::Sender<(String, OwnedFd)>),
+}
+
+/// How long a read of an X11 app's drag may go without data before it is given up.
+const X11_DRAG_READ_IDLE: Duration = Duration::from_secs(15);
+
+/// Serve the reads of an X11 app's drag one at a time, until the drag is over (the queue
+/// closes). Smithay's XDND source converts into one property of its proxy window, so a
+/// second read in flight would take over the first one's. Smithay closes its end of the
+/// pipe when the data is all written or the app refused, which starts the next read.
+///
+/// The reads go through smithay rather than our own X11 connection (`x11_selection`)
+/// because Qt only answers a conversion stamped with the time of its latest XdndPosition,
+/// which only the drag's target (smithay's proxy) sees.
+fn serve_x11_drag(source: Arc<dyn Source>, queue: std::sync::mpsc::Receiver<(String, OwnedFd)>) {
+    for (mime, fd) in queue {
+        let Ok((read_pipe, write_pipe)) = std::io::pipe() else {
+            continue;
+        };
+        source.send(&mime, write_pipe.into());
+        relay_fd(read_pipe.into(), &fd, X11_DRAG_READ_IDLE);
+    }
+}
+
+/// Copy `from` into `to` until `from` ends, or either side stalls for `idle`.
+fn relay_fd(from: OwnedFd, to: &OwnedFd, idle: Duration) {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: from.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, idle.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if rc <= 0 {
+            return;
+        }
+        let n = unsafe { libc::read(from.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if n <= 0 || !write_fd_idle(to.as_raw_fd(), &buf[..n as usize], idle) {
+            return;
+        }
+    }
 }
 
 /// How long an X11 app gets to see a pointer move, and pick smithay's XDND proxy as its
@@ -4943,6 +5047,11 @@ impl XwmHandler for AppState {
             let _ = window.set_mapped(true);
             return;
         }
+        if window.window_type() == Some(WmWindowType::Dnd) {
+            // A drag icon, not shown (see `mapped_override_redirect_window`).
+            let _ = window.set_mapped(true);
+            return;
+        }
         let mut geo = window.last_configure();
         let is_popup_type = matches!(
             window.window_type(),
@@ -5493,8 +5602,24 @@ impl WaylandDndGrabHandler for AppState {
                 let Some(start_data) = pointer.grab_start_data() else {
                     return source.cancel();
                 };
+                let focus = start_data.focus.clone();
                 let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
                 pointer.set_grab(self, grab, serial, Focus::Keep);
+                // Enter the drag's own surface now, rather than on the next move: a move off
+                // the window right away would enter no surface, and `note_drag_source`
+                // (which offers the drag to the client) runs on enter.
+                let location = pointer.current_location();
+                let time = InputTime::from_millis(self.start_time.elapsed().as_millis() as u32);
+                pointer.motion(
+                    self,
+                    focus,
+                    &MotionEvent {
+                        location,
+                        serial,
+                        time,
+                    },
+                );
+                pointer.frame(self);
             }
             GrabType::Touch => {
                 let Some(touch) = seat.get_touch() else {
