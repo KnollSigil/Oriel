@@ -4,24 +4,7 @@
 //! renders rootless remote windows & native `xdg_popup`s via `smithay-client-toolkit`,
 //! bridges local PipeWire audio, and supports remote PTYs + GTK4/libadwaita launcher.
 
-#[cfg(feature = "gtk4")]
-mod adw_launcher;
-mod audio;
-mod hosts;
-mod icon;
-mod launcher;
-mod media;
-mod pty;
-mod quic;
-#[cfg(any(feature = "gtk4", test))]
-mod search;
-#[cfg(any(feature = "gtk4", test))]
-mod session;
-#[cfg(feature = "gtk4")]
-mod symbolic_icon;
-mod traffic;
-mod window;
-mod xfer;
+use oriel_client::{audio, launcher, pty, quic, window, xfer};
 
 use std::net::SocketAddr;
 
@@ -32,11 +15,11 @@ use tokio::sync::mpsc;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use crate::hosts::{
+use oriel_client::hosts::{
     load_client_settings, parse_uri, resolve_uri, ssh_bootstrap, take_env_secret, RenderScaleCap,
     TOKEN_ENV, URI_ENV,
 };
-use crate::window::ClientUiEvent;
+use oriel_client::window::ClientUiEvent;
 
 #[derive(Debug, Parser)]
 #[command(name = "oriel-client", about = "Oriel client")]

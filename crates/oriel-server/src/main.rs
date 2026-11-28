@@ -4,20 +4,7 @@
 //! PipeWire/WirePlumber audio bridge inside a private session `XDG_RUNTIME_DIR`
 //! and streams rootless windows, audio, and remote PTYs over QUIC.
 
-mod apps;
-mod audio;
-mod compositor;
-mod damage;
-mod downscale;
-mod flatpak_bwrap;
-mod gpu;
-mod media;
-mod pty;
-mod quic;
-mod session;
-mod settings_portal;
-mod shell_env;
-mod x11_selection;
+use oriel_server::{audio, compositor, flatpak_bwrap, gpu, quic, session, shell_env};
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
